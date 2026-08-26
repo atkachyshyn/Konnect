@@ -195,7 +195,8 @@ in `konnect.toml` in the working directory, or a `settings.json` beside the bina
 startup, so `tools/list` carries all 212 tools from the first call.
 
 It is off by default because it costs what the router exists to save: roughly
-25K tokens per listing instead of ~2K. Turn it on only if your client needs it.
+34K tokens of tool schemas in every request for the whole task, against ~2.2K.
+Turn it on only if your client needs it.
 
 Note that `auto_load_toolsets` does **not** solve this. It loads a toolset when
 a tool from it is *called*, which helps only a client that already knows the
