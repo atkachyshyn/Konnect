@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **19 toolsets** organized into 10 categories
-- **206 registered tools** + **6 always-visible meta-tools** = **212 total**
+- **208 registered tools** + **6 always-visible meta-tools** = **214 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2.2K tokens instead of ~34K. (Clients that cache the first listing instead of refreshing on `tools/list_changed` — Codex among them — additionally get three dispatcher tools, `list_available_tools` / `get_tool_schema` / `execute_konnect_tool`, which reach every tool below on demand for ~3.0K total. For them the discovery pattern described next cannot work.) The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -290,7 +290,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 
 ## Library
 
-### `library` · 17 tools
+### `library` · 19 tools
 **Purpose:** Search, register, and author symbol and footprint libraries — create symbols and footprints, edit pads, graphics, metadata and 3D models.
 **Source:** [`crates/konnect-core/src/tools/library.rs`](crates/konnect-core/src/tools/library.rs)
 
@@ -302,11 +302,13 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `set_footprint_metadata` | Atomically replace a footprint description, tags, or supported attributes while preserving unrelated source. Empty tags or attributes remove their block. |
 | `set_footprint_models` | Atomically append, replace, or delete one or more top-level 3D model blocks with optional offset, scale, and rotation transforms. |
 | `register_footprint_library` | Register a local footprint library directory in the KiCAD global or project library table. Set `replace_existing` to update a stale URI in place while preserving entry metadata. |
+| `unregister_footprint_library` | Remove one footprint library entry from the global or project `fp-lib-table`. Removes only the named nickname in the named scope and preserves every other entry; reports `removed`/`absent`. Does not touch the `.pretty` directory. |
 | `list_footprint_libraries` | List all registered footprint libraries (global and/or project). |
 | `create_symbol` | Create a new KiCAD schematic symbol and append it to a `.kicad_sym` library. |
 | `delete_symbol` | Delete a symbol definition from a `.kicad_sym` library. |
 | `list_symbols_in_library` | List all symbol names defined in a `.kicad_sym` library file. |
 | `register_symbol_library` | Register a `.kicad_sym` library file in the KiCAD global or project symbol table. Reports `inserted`/`unchanged`/`updated`; set `replace_existing` to update a stale URI in place while preserving entry metadata. |
+| `unregister_symbol_library` | Remove one symbol library entry from the global or project `sym-lib-table`. Removes only the named nickname in the named scope and preserves every other entry; reports `removed`/`absent`. Does not touch the `.kicad_sym` file. |
 | `list_symbol_libraries` | List all registered symbol libraries (global and/or project). |
 | `search_symbols` | Search for symbols across all registered libraries by name or keyword. |
 | `list_library_footprints` | List all footprints in a specific registered library (`.pretty` directory). |

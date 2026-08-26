@@ -173,6 +173,28 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_register_footprint_library(args, ctx).await }
         ),
         tool!(
+            "unregister_footprint_library",
+            "Remove one footprint library entry from the KiCAD global or project fp-lib-table. \
+             Only the named nickname in the named scope is removed; every other registered \
+             library is preserved byte-for-byte. Reports whether the entry was removed or was \
+             already absent. This edits the library table only — the .pretty directory itself \
+             is never touched.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "nickname": { "type": "string", "description": "Nickname of the library entry to remove" },
+                    "scope": {
+                        "type": "string",
+                        "description": "Scope: 'global' or 'project'",
+                        "default": "project"
+                    },
+                    "project": { "type": "string", "description": "Path to the .kicad_pro file, or to the project directory that holds it (required for project scope)" }
+                },
+                "required": ["nickname"]
+            }),
+            |args, ctx| async move { handle_unregister_footprint_library(args, ctx).await }
+        ),
+        tool!(
             "list_footprint_libraries",
             "List all registered footprint libraries (global and optionally project-level).",
             json!({
@@ -299,6 +321,28 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["library_path", "nickname"]
             }),
             |args, ctx| async move { handle_register_symbol_library(args, ctx).await }
+        ),
+        tool!(
+            "unregister_symbol_library",
+            "Remove one symbol library entry from the KiCAD global or project sym-lib-table. \
+             Only the named nickname in the named scope is removed; every other registered \
+             library is preserved byte-for-byte. Reports whether the entry was removed or was \
+             already absent. This edits the library table only — the .kicad_sym file itself is \
+             never touched.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "nickname": { "type": "string", "description": "Nickname of the library entry to remove" },
+                    "scope": {
+                        "type": "string",
+                        "description": "Scope: 'global' or 'project'",
+                        "default": "project"
+                    },
+                    "project": { "type": "string", "description": "Path to the .kicad_pro file, or to the project directory that holds it (required for project scope)" }
+                },
+                "required": ["nickname"]
+            }),
+            |args, ctx| async move { handle_unregister_symbol_library(args, ctx).await }
         ),
         tool!(
             "list_symbol_libraries",
@@ -2177,6 +2221,230 @@ async fn register_in_lib_table_with_policy(
         }
     }
     Ok(Ok(prepared.registration))
+}
+
+// ─── Library table removal ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LibTableRemovalState {
+    Removed,
+    Absent,
+}
+
+impl LibTableRemovalState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Removed => "removed",
+            Self::Absent => "absent",
+        }
+    }
+}
+
+/// Resolve which library table a scope refers to, without needing a library
+/// path. Removal identifies an entry by nickname alone, so unlike
+/// [`lib_table_target`] there is no URI to derive.
+fn lib_table_for_scope(
+    scope: &str,
+    project: Option<&str>,
+    global_table: PathBuf,
+    table_filename: &str,
+) -> Result<PathBuf, CallToolResult> {
+    match scope {
+        "global" => Ok(global_table),
+        "project" => {
+            let Some(proj) = project else {
+                return Err(CallToolResult::error(
+                    "For project scope, provide 'project' path to .kicad_pro file",
+                ));
+            };
+            Ok(project_table_dir(proj)?.join(table_filename))
+        }
+        other => Err(invalid_library_argument(
+            "scope",
+            format!("must be 'global' or 'project', got '{other}'"),
+        )),
+    }
+}
+
+/// Remove the single `(lib (name "<nickname>") ...)` entry from a library
+/// table, leaving every other entry untouched.
+///
+/// The edit is a byte-range deletion of exactly that one block, so unrelated
+/// libraries keep their original text — formatting, comments and ordering
+/// included. A nickname that is not present is not an error: removal is
+/// idempotent, which is what makes it safe to call in cleanup paths that may
+/// run twice.
+///
+/// The write goes through [`write_atomic_if_unchanged`], the same
+/// compare-and-swap path registration uses, so a table KiCad or another process
+/// changed underneath us is refused rather than clobbered.
+async fn remove_from_lib_table(
+    table_path: &Path,
+    nickname: &str,
+) -> anyhow::Result<Result<LibTableRemovalState, LibTableRegistrationError>> {
+    if !table_path.exists() {
+        return Ok(Ok(LibTableRemovalState::Absent));
+    }
+    let source = read_consistent(table_path)?;
+    let root = table_root_element(table_path);
+
+    let prepared = match prepare_lib_table_removal(&source, root, nickname) {
+        Ok(prepared) => prepared,
+        Err(error) => return Ok(Err(error)),
+    };
+
+    if let Some(content) = prepared {
+        persist_lib_table_registration(table_path, &source, &content)?;
+        Ok(Ok(LibTableRemovalState::Removed))
+    } else {
+        Ok(Ok(LibTableRemovalState::Absent))
+    }
+}
+
+/// The pure half of [`remove_from_lib_table`]: given the table text, return the
+/// text with `nickname` removed, or `None` when the nickname is not there.
+///
+/// Unlike registration this never repairs a mistyped root element. Repair
+/// rewrites the file, and rewriting a table to delete an entry that a
+/// wrong-rooted table was never exposing would be a surprising side effect of
+/// a cleanup call.
+fn prepare_lib_table_removal(
+    source: &str,
+    expected_root: &str,
+    nickname: &str,
+) -> Result<Option<String>, LibTableRegistrationError> {
+    let parsed = parse_sexp(source).map_err(|error| LibTableRegistrationError {
+        field: "table".to_string(),
+        reason: format!("invalid library table S-expression: {error}"),
+    })?;
+    if parsed.head() != Some(expected_root) {
+        return Err(LibTableRegistrationError {
+            field: "table".to_string(),
+            reason: format!("root must be {expected_root}"),
+        });
+    }
+
+    let mut matches = Vec::new();
+    for (start, end) in find_direct_child_blocks(source, expected_root) {
+        let block = &source[start..end];
+        let node = parse_sexp(block).map_err(|_| LibTableRegistrationError {
+            field: "table".to_string(),
+            reason: "contains a malformed direct child".to_string(),
+        })?;
+        if node.head() == Some("lib") && node.find_str("name") == Some(nickname) {
+            matches.push((start, end));
+        }
+    }
+
+    // Refuse rather than guess. A duplicate nickname means the table is already
+    // inconsistent, and picking one of the two to delete would silently leave
+    // the other behind under a name the caller believes they just removed.
+    if matches.len() > 1 {
+        return Err(LibTableRegistrationError {
+            field: "nickname".to_string(),
+            reason: format!("library table contains duplicate nickname '{nickname}'"),
+        });
+    }
+
+    let Some((start, end)) = matches.first().copied() else {
+        return Ok(None);
+    };
+
+    let (start, end) = expand_removal_to_whole_lines(source, start, end);
+    Ok(Some(apply_edits(
+        source.to_string(),
+        vec![SexpEdit {
+            start,
+            end,
+            replacement: String::new(),
+        }],
+    )))
+}
+
+/// Widen a block's byte range to swallow the indentation in front of it and the
+/// newline behind it, so deleting the block does not leave a blank, indented
+/// line where the entry used to be.
+///
+/// The leading widening only applies when everything between the start of the
+/// line and the block really is whitespace — otherwise the entry shares a line
+/// with something else, and eating backwards would take that with it.
+fn expand_removal_to_whole_lines(source: &str, start: usize, end: usize) -> (usize, usize) {
+    let line_start = source[..start].rfind('\n').map_or(0, |idx| idx + 1);
+    let start = if source[line_start..start]
+        .chars()
+        .all(|c| c == ' ' || c == '\t')
+    {
+        line_start
+    } else {
+        start
+    };
+
+    let mut end = end;
+    let rest = &source[end..];
+    let trailing: usize = rest
+        .chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .map(char::len_utf8)
+        .sum();
+    if rest[trailing..].starts_with('\n') {
+        end += trailing + 1;
+    } else if rest[trailing..].starts_with("\r\n") {
+        end += trailing + 2;
+    }
+    (start, end)
+}
+
+async fn handle_unregister_symbol_library(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    handle_unregister_library(args, global_sym_lib_table(), "sym-lib-table").await
+}
+
+async fn handle_unregister_footprint_library(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    handle_unregister_library(args, global_fp_lib_table(), "fp-lib-table").await
+}
+
+async fn handle_unregister_library(
+    args: &serde_json::Value,
+    global_table: PathBuf,
+    table_filename: &str,
+) -> anyhow::Result<CallToolResult> {
+    let nickname = match require_str(args, "nickname") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let scope = args["scope"].as_str().unwrap_or("project");
+
+    let table_path = match lib_table_for_scope(
+        scope,
+        args["project"].as_str(),
+        global_table,
+        table_filename,
+    ) {
+        Ok(path) => path,
+        Err(e) => return Ok(e),
+    };
+
+    let state = match remove_from_lib_table(&table_path, nickname).await? {
+        Ok(state) => state,
+        Err(error) => return Ok(invalid_library_argument(&error.field, error.reason)),
+    };
+
+    Ok(CallToolResult::text(
+        serde_json::to_string(&json!({
+            "success": true,
+            "nickname": nickname,
+            "scope": scope,
+            "table": table_path.to_str().unwrap_or(""),
+            "state": state.as_str(),
+            "removed": state == LibTableRemovalState::Removed
+        }))
+        .unwrap(),
+    ))
 }
 
 fn prepare_lib_table_registration(
@@ -4641,6 +4909,171 @@ mod tests {
             1,
             "an already-registered nickname must not be duplicated: {content}"
         );
+    }
+
+    // ─── Library table removal ──────────────────────────────────────────────
+    //
+    // The contract these protect: removing one nickname must leave every other
+    // registered library exactly as it was. A cleanup tool that quietly drops a
+    // neighbouring entry is worse than no cleanup tool at all, because the loss
+    // only surfaces later as unresolvable symbols in an unrelated project.
+
+    const THREE_LIB_TABLE: &str = "(sym_lib_table\n  (version 7)\n  (lib (name \"Alpha\")(type \"KiCad\")(uri \"/a.kicad_sym\")(options \"\")(descr \"first\"))\n  (lib (name \"Beta\")(type \"KiCad\")(uri \"/b.kicad_sym\")(options \"\")(descr \"second\"))\n  (lib (name \"Gamma\")(type \"KiCad\")(uri \"/c.kicad_sym\")(options \"\")(descr \"third\"))\n)\n";
+
+    #[test]
+    fn removing_a_library_preserves_every_other_entry() {
+        let out = prepare_lib_table_removal(THREE_LIB_TABLE, "sym_lib_table", "Beta")
+            .expect("removal must succeed")
+            .expect("Beta is present, so the table must change");
+
+        assert!(!out.contains("Beta"), "the named entry must be gone");
+        assert!(out.contains("(name \"Alpha\")"), "Alpha must survive");
+        assert!(out.contains("(name \"Gamma\")"), "Gamma must survive");
+        // Neighbours keep their full text, not just their names.
+        assert!(out.contains("(uri \"/a.kicad_sym\")"));
+        assert!(out.contains("(descr \"third\")"));
+        assert!(out.contains("(version 7)"), "table header must survive");
+        // And the result is still a valid table.
+        assert_eq!(parse_sexp(&out).unwrap().head(), Some("sym_lib_table"));
+    }
+
+    /// Deleting the entry must not leave the blank indented line behind, or
+    /// repeated register/unregister cycles slowly pad the file with whitespace.
+    #[test]
+    fn removal_takes_the_whole_line_with_it() {
+        let out = prepare_lib_table_removal(THREE_LIB_TABLE, "sym_lib_table", "Beta")
+            .unwrap()
+            .unwrap();
+        assert!(
+            !out.contains("\n  \n") && !out.contains("\n\n"),
+            "removal left a blank line: {out:?}"
+        );
+        assert_eq!(out.matches("(lib ").count(), 2);
+    }
+
+    /// Idempotent by design: a nickname that is not there is not an error, so a
+    /// cleanup path can run twice without special-casing the second run.
+    #[test]
+    fn removing_an_absent_nickname_changes_nothing() {
+        let out = prepare_lib_table_removal(THREE_LIB_TABLE, "sym_lib_table", "Delta").unwrap();
+        assert!(out.is_none(), "an absent nickname must report no change");
+    }
+
+    /// Nicknames are matched exactly. A prefix match would let `unregister("A")`
+    /// take out `Alpha`.
+    #[test]
+    fn removal_matches_the_nickname_exactly() {
+        for near_miss in ["Alph", "alpha", "Alphas", "Alpha "] {
+            assert!(
+                prepare_lib_table_removal(THREE_LIB_TABLE, "sym_lib_table", near_miss)
+                    .unwrap()
+                    .is_none(),
+                "'{near_miss}' must not match 'Alpha'"
+            );
+        }
+    }
+
+    /// A table holding the same nickname twice is already broken. Deleting one
+    /// of the pair would report success while leaving the name still resolvable,
+    /// so the caller has to be told instead.
+    #[test]
+    fn duplicate_nicknames_are_refused_rather_than_guessed() {
+        let table = "(sym_lib_table\n  (lib (name \"Dup\")(type \"KiCad\")(uri \"/1.kicad_sym\"))\n  (lib (name \"Dup\")(type \"KiCad\")(uri \"/2.kicad_sym\"))\n)\n";
+        let error = prepare_lib_table_removal(table, "sym_lib_table", "Dup")
+            .expect_err("duplicates must be refused");
+        assert_eq!(error.field, "nickname");
+        assert!(error.reason.contains("duplicate"));
+    }
+
+    /// The fp and sym tables have different roots. Removing from one must not
+    /// accept the other, or a project-scope call could edit the wrong file.
+    #[test]
+    fn removal_refuses_a_table_with_the_wrong_root() {
+        let error = prepare_lib_table_removal(THREE_LIB_TABLE, "fp_lib_table", "Alpha")
+            .expect_err("a sym table must not be accepted as an fp table");
+        assert_eq!(error.field, "table");
+        assert!(error.reason.contains("fp_lib_table"));
+    }
+
+    #[test]
+    fn removal_reports_a_malformed_table_instead_of_rewriting_it() {
+        let error =
+            prepare_lib_table_removal("(sym_lib_table (lib (name \"A\")", "sym_lib_table", "A")
+                .expect_err("an unbalanced table must be refused");
+        assert_eq!(error.field, "table");
+    }
+
+    /// A table that does not exist yet has nothing to remove — and must not be
+    /// created as a side effect of trying.
+    #[tokio::test]
+    async fn removing_from_a_missing_table_is_absent_and_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = dir.path().join("sym-lib-table");
+        let state = remove_from_lib_table(&table, "Anything")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state, LibTableRemovalState::Absent);
+        assert!(!table.exists(), "removal must not create the table");
+    }
+
+    /// End to end against a real file, through the same compare-and-swap write
+    /// registration uses.
+    #[tokio::test]
+    async fn remove_from_lib_table_rewrites_the_file_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = dir.path().join("sym-lib-table");
+        std::fs::write(&table, THREE_LIB_TABLE).unwrap();
+
+        let state = remove_from_lib_table(&table, "Alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state, LibTableRemovalState::Removed);
+
+        let after = std::fs::read_to_string(&table).unwrap();
+        assert!(!after.contains("Alpha"));
+        assert!(after.contains("Beta") && after.contains("Gamma"));
+
+        // Second run is a no-op, not an error.
+        let again = remove_from_lib_table(&table, "Alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(again, LibTableRemovalState::Absent);
+        assert_eq!(std::fs::read_to_string(&table).unwrap(), after);
+    }
+
+    /// Project scope needs a project path; global scope does not. Getting this
+    /// wrong would send a project-scoped removal at the global table.
+    #[test]
+    fn scope_resolution_requires_a_project_only_for_project_scope() {
+        let global = PathBuf::from("/global/sym-lib-table");
+        assert_eq!(
+            lib_table_for_scope("global", None, global.clone(), "sym-lib-table").unwrap(),
+            global
+        );
+        assert!(lib_table_for_scope("project", None, global.clone(), "sym-lib-table").is_err());
+        assert!(lib_table_for_scope("nonsense", None, global, "sym-lib-table").is_err());
+    }
+
+    /// Both unregister tools must be exposed, take nickname alone as required,
+    /// and default to project scope — matching their register counterparts.
+    #[test]
+    fn unregister_tools_are_exposed_with_a_matching_schema() {
+        let all = tools();
+        for name in ["unregister_symbol_library", "unregister_footprint_library"] {
+            let tool = all
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("library must expose {name}"));
+            assert_eq!(tool.input_schema["required"], json!(["nickname"]));
+            assert_eq!(
+                tool.input_schema["properties"]["scope"]["default"],
+                "project"
+            );
+            assert!(tool.input_schema["properties"]["project"].is_object());
+        }
     }
 
     #[test]
