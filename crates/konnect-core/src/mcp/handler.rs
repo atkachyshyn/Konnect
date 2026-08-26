@@ -132,6 +132,9 @@ impl McpHandler {
             "tools/list" => {
                 // Meta-tools (always visible) + all domain tools (pre-loaded at startup)
                 let mut tools = meta_tools::meta_tool_descriptions();
+                if self.ctx.config.dispatcher_tools {
+                    tools.extend(meta_tools::dispatcher_tool_descriptions());
+                }
                 for def in self.ctx.router.active_tools().await {
                     tools.push(def.to_mcp_description());
                 }
@@ -221,6 +224,32 @@ impl McpHandler {
         name: &str,
         args: &Value,
     ) -> (CallToolResult, CallStatus, Option<String>) {
+        // `execute_konnect_tool` is indirection, not a tool: unwrap it to the
+        // call it names and let everything below run exactly as it would for a
+        // direct call. Doing it here rather than in a handler of its own is the
+        // point — the required-argument check, the toolset resolution and the
+        // handler invocation stay single-sourced, so a dispatched call cannot
+        // drift from a direct one.
+        let unwrapped;
+        let dispatched = name == "execute_konnect_tool";
+        let (name, args) = if dispatched {
+            match unwrap_dispatched_call(args) {
+                Ok((inner_name, inner_args)) => {
+                    unwrapped = (inner_name, inner_args);
+                    (unwrapped.0.as_str(), &unwrapped.1)
+                }
+                Err(result) => {
+                    return (
+                        result,
+                        CallStatus::Error,
+                        Some("invalid_argument".to_string()),
+                    )
+                }
+            }
+        } else {
+            (name, args)
+        };
+
         // Meta-tools always win.
         if let Some(result) = meta_tools::handle_meta_tool(name, args, &self.ctx).await {
             if name == "load_toolset" || name == "unload_toolset" {
@@ -321,6 +350,68 @@ impl McpHandler {
             };
         }
 
+        // Not loaded. A dispatched call must still run — reaching an unloaded
+        // tool without growing `tools/list` is the whole reason the dispatcher
+        // exists — so resolve the definition straight from the registry and run
+        // it, leaving the loaded set untouched.
+        if dispatched {
+            if let Some(tool_def) = self.ctx.router.find_tool_def(name) {
+                if let Some(missing) = first_missing_required(&tool_def.input_schema, args) {
+                    let reason = "missing".to_string();
+                    return (
+                        CallToolResult::error_kind(
+                            ToolErrorKind::InvalidArgument {
+                                field: missing.clone(),
+                                reason: reason.clone(),
+                            },
+                            format!("Argument '{missing}' is invalid: {reason}"),
+                        ),
+                        CallStatus::Error,
+                        Some("invalid_argument".to_string()),
+                    );
+                }
+                return match (tool_def.handler)(args, self.ctx.clone()).await {
+                    Ok(result) => {
+                        let status = if result.is_error {
+                            CallStatus::Error
+                        } else {
+                            CallStatus::Ok
+                        };
+                        let error_kind = extract_error_kind(&result);
+                        (result, status, error_kind)
+                    }
+                    Err(e) if crate::tools::MissingArgument::field_in(&e).is_some() => {
+                        let field = crate::tools::MissingArgument::field_in(&e)
+                            .expect("guard matched")
+                            .to_string();
+                        let reason = "missing or not a string".to_string();
+                        (
+                            CallToolResult::error_kind(
+                                ToolErrorKind::InvalidArgument {
+                                    field: field.clone(),
+                                    reason: reason.clone(),
+                                },
+                                format!("Argument '{field}' is invalid: {reason}"),
+                            ),
+                            CallStatus::Error,
+                            Some("invalid_argument".to_string()),
+                        )
+                    }
+                    Err(e) => {
+                        warn!(tool = %name, error = %e, "tool handler returned anyhow::Error");
+                        let kind = ToolErrorKind::HandlerError {
+                            reason: e.to_string(),
+                        };
+                        (
+                            CallToolResult::error_kind(kind, format!("Tool error: {}", e)),
+                            CallStatus::Error,
+                            Some("handler_error".to_string()),
+                        )
+                    }
+                };
+            }
+        }
+
         // Not loaded — try to give an actionable hint.
         match self.ctx.router.find_toolset_for_tool(name) {
             Some(toolset) => {
@@ -389,6 +480,51 @@ impl McpHandler {
 /// A JSON `null` counts as absent: `{"query": null}` is a caller who has not
 /// supplied a query, and every `as_str()`/`as_array()` read would treat it the
 /// same way.
+/// Unpack `execute_konnect_tool { tool_name, arguments }` into the call it
+/// names.
+///
+/// Refuses to unwrap into itself: a self-referential `tool_name` would recurse
+/// through this function forever, and there is no legitimate reason to write it.
+fn unwrap_dispatched_call(args: &Value) -> Result<(String, Value), CallToolResult> {
+    let Some(tool_name) = args["tool_name"].as_str() else {
+        return Err(CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "tool_name".to_string(),
+                reason: "missing or not a string".to_string(),
+            },
+            "Argument 'tool_name' is invalid: missing or not a string",
+        ));
+    };
+
+    if tool_name == "execute_konnect_tool" {
+        return Err(CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "tool_name".to_string(),
+                reason: "cannot dispatch execute_konnect_tool to itself".to_string(),
+            },
+            "Argument 'tool_name' is invalid: cannot dispatch execute_konnect_tool to itself",
+        ));
+    }
+
+    // Absent arguments means "no arguments", which is valid for the several
+    // tools that take none. A non-object is a mistake worth naming.
+    let inner = match args.get("arguments") {
+        None | Some(Value::Null) => Value::Object(Default::default()),
+        Some(v @ Value::Object(_)) => v.clone(),
+        Some(_) => {
+            return Err(CallToolResult::error_kind(
+                ToolErrorKind::InvalidArgument {
+                    field: "arguments".to_string(),
+                    reason: "must be an object".to_string(),
+                },
+                "Argument 'arguments' is invalid: must be an object",
+            ))
+        }
+    };
+
+    Ok((tool_name.to_string(), inner))
+}
+
 fn first_missing_required(schema: &Value, args: &Value) -> Option<String> {
     schema
         .get("required")?
@@ -434,6 +570,7 @@ mod path_argument_taxonomy_tests {
             jlcpcb_db_path: None,
             auto_load_toolsets: true,
             eager_toolsets: true,
+            dispatcher_tools: false,
         })
         .await
         .expect("handler builds")
@@ -525,6 +662,7 @@ mod required_argument_dispatch_tests {
             jlcpcb_db_path: None,
             auto_load_toolsets: true,
             eager_toolsets: true,
+            dispatcher_tools: false,
         })
         .await
         .expect("handler builds")
@@ -658,6 +796,7 @@ mod every_tool_enforces_its_required_arguments {
             jlcpcb_db_path: None,
             auto_load_toolsets: true,
             eager_toolsets: true,
+            dispatcher_tools: false,
         })
         .await
         .expect("handler builds");

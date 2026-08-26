@@ -91,6 +91,39 @@ impl ToolRouter {
         None
     }
 
+    /// Resolve a tool's definition from the registry whether or not its toolset
+    /// is loaded.
+    ///
+    /// This is what lets `execute_konnect_tool` reach every tool without
+    /// mutating the session: loading the toolset would work too, but it would
+    /// grow `tools/list` for the rest of the session, which is exactly the
+    /// context cost the dispatcher exists to avoid. Resolution is a registry
+    /// lookup with no side effects.
+    pub fn find_tool_def(&self, tool_name: &str) -> Option<ToolDef> {
+        for ts in self.registry {
+            if let Some(defs) = registry::tools_for(ts.name) {
+                if let Some(def) = defs.into_iter().find(|d| d.name == tool_name) {
+                    return Some(def);
+                }
+            }
+        }
+        None
+    }
+
+    /// Every registered tool as `(toolset, ToolDef)`, for catalogue queries that
+    /// must see the whole catalogue rather than the loaded subset.
+    pub fn all_tool_defs(&self) -> Vec<(&'static str, ToolDef)> {
+        let mut out = Vec::new();
+        for ts in self.registry {
+            if let Some(defs) = registry::tools_for(ts.name) {
+                for def in defs {
+                    out.push((ts.name, def));
+                }
+            }
+        }
+        out
+    }
+
     pub async fn unload(&self, name: &str) -> bool {
         let defs = match registry::tools_for(name) {
             Some(d) => d,

@@ -18,6 +18,30 @@ pub enum InstallClient {
 }
 
 impl InstallClient {
+    /// Whether this client caches the tool list from the first `tools/list` and
+    /// never re-fetches it on `notifications/tools/list_changed`.
+    ///
+    /// For such a client the router's lazy loading is not a context saving but
+    /// a wall: `load_toolset` activates the tools server-side and reports their
+    /// names, yet the client never receives their schemas, so it has nothing to
+    /// invoke and every tool outside the starter kit stays uncallable for the
+    /// whole session (#134, #169).
+    ///
+    /// These clients get the dispatcher tools by default, which reach the whole
+    /// catalogue without enlarging `tools/list`. Pre-loading every toolset
+    /// (`--eager-toolsets`) also cures it but costs about ten times the context,
+    /// so it is opt-in rather than the default.
+    pub fn caches_initial_tool_list(self) -> bool {
+        match self {
+            // Codex reads tools/list once per task and ignores the change
+            // notification.
+            Self::Codex => true,
+            // Claude Code re-fetches on notifications/tools/list_changed, so it
+            // keeps the small ~2K baseline and expands on demand.
+            Self::Claude => false,
+        }
+    }
+
     fn marker_name(self) -> &'static str {
         match self {
             Self::Claude => ".installed-claude",
@@ -57,18 +81,73 @@ impl FromStr for InstallClient {
 /// documentation rewrote `~/.claude`. A misspelled flag has the same shape —
 /// it changes nothing the caller asked for and everything they did not.
 pub fn client_from_args(args: &[String]) -> Result<InstallClient> {
-    client_from_args_allowing(args, &[])
+    client_from_args_allowing(args, &[], &[])
 }
 
+/// Valueless flags the server invocation accepts alongside `--client`.
+const SERVER_FLAGS: &[&str] = &[
+    "--eager-toolsets",
+    "--no-eager-toolsets",
+    "--dispatcher-tools",
+    "--no-dispatcher-tools",
+];
+
 /// As [`client_from_args`], for the server invocation — which also carries
-/// `--config <path>`, parsed elsewhere in `main`.
+/// `--config <path>`, parsed elsewhere in `main`, and the eager-toolset
+/// switches parsed by [`eager_toolsets_from_server_args`].
 pub fn client_from_server_args(args: &[String]) -> Result<InstallClient> {
-    client_from_args_allowing(args, &["--config"])
+    client_from_args_allowing(args, &["--config"], SERVER_FLAGS)
+}
+
+/// Explicit `--eager-toolsets` / `--no-eager-toolsets` override, or `None` when
+/// neither was given so config and the client default decide.
+///
+/// This is the escape hatch in both directions: a Codex user on a tight context
+/// budget can force the small starter listing, and a Claude user whose client
+/// misses `notifications/tools/list_changed` can force the full one — without
+/// editing `konnect.toml`.
+pub fn eager_toolsets_from_server_args(args: &[String]) -> Result<Option<bool>> {
+    bool_flag(args, "eager-toolsets")
+}
+
+/// Explicit `--dispatcher-tools` / `--no-dispatcher-tools` override, or `None`
+/// when neither was given so config and the client default decide.
+pub fn dispatcher_tools_from_server_args(args: &[String]) -> Result<Option<bool>> {
+    bool_flag(args, "dispatcher-tools")
+}
+
+/// Read a `--<name>` / `--no-<name>` pair into an `Option<bool>`.
+///
+/// Repeating the same flag is harmless; asking for both directions is a
+/// contradiction, and honouring whichever came last would hand back the
+/// opposite of what half the command line asked for.
+fn bool_flag(args: &[String], name: &str) -> Result<Option<bool>> {
+    let on = format!("--{name}");
+    let off = format!("--no-{name}");
+    let mut selected = None;
+    for arg in args {
+        let value = if *arg == on {
+            true
+        } else if *arg == off {
+            false
+        } else {
+            continue;
+        };
+        if selected.is_some_and(|prev| prev != value) {
+            bail!("--{name} and --no-{name} are mutually exclusive");
+        }
+        selected = Some(value);
+    }
+    Ok(selected)
 }
 
 /// `also` names options that take a value and that this parser should step
-/// over rather than reject.
-fn client_from_args_allowing(args: &[String], also: &[&str]) -> Result<InstallClient> {
+/// over rather than reject; `flags` names valueless options to skip.
+fn client_from_args_allowing(
+    args: &[String],
+    also: &[&str],
+    flags: &[&str],
+) -> Result<InstallClient> {
     let mut selected = None;
     let mut index = 0;
     while index < args.len() {
@@ -84,6 +163,8 @@ fn client_from_args_allowing(args: &[String], also: &[&str]) -> Result<InstallCl
             index += 2;
         } else if also.contains(&arg) {
             index += 2;
+        } else if flags.contains(&arg) {
+            index += 1;
         } else {
             bail!("unrecognised argument '{arg}'; run 'konnect --help' for usage");
         }
@@ -633,6 +714,70 @@ mod tests {
             InstallClient::Claude
         );
         assert!(client_from_server_args(&["--nope".to_string()]).is_err());
+    }
+
+    /// Codex is the client the router's lazy loading cannot serve, and Claude
+    /// is the one it can. If this ever flips silently, Codex users get the
+    /// starter kit and a set of tools that report as loaded but cannot be
+    /// called (#134, #169).
+    #[test]
+    fn only_codex_caches_the_initial_tool_list() {
+        assert!(InstallClient::Codex.caches_initial_tool_list());
+        assert!(!InstallClient::Claude.caches_initial_tool_list());
+    }
+
+    #[test]
+    fn eager_toolset_flags_parse_in_both_directions() {
+        assert_eq!(eager_toolsets_from_server_args(&[]).unwrap(), None);
+        assert_eq!(
+            eager_toolsets_from_server_args(&["--eager-toolsets".to_string()]).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            eager_toolsets_from_server_args(&["--no-eager-toolsets".to_string()]).unwrap(),
+            Some(false)
+        );
+    }
+
+    /// Asking for both is a contradiction, and silently honouring the last one
+    /// would hand back the opposite of what half the command line asked for.
+    #[test]
+    fn contradictory_eager_toolset_flags_are_rejected() {
+        let both = vec![
+            "--eager-toolsets".to_string(),
+            "--no-eager-toolsets".to_string(),
+        ];
+        assert!(eager_toolsets_from_server_args(&both).is_err());
+
+        // Repeating the same flag is harmless, not a contradiction.
+        let twice = vec![
+            "--eager-toolsets".to_string(),
+            "--eager-toolsets".to_string(),
+        ];
+        assert_eq!(eager_toolsets_from_server_args(&twice).unwrap(), Some(true));
+    }
+
+    /// The server arg parser rejects anything it does not know, so the new
+    /// flags have to be declared there too — otherwise adding them to a client
+    /// config turns every launch into a startup error.
+    #[test]
+    fn server_args_accept_the_eager_toolset_flags_alongside_client() {
+        let args = vec![
+            "--client".to_string(),
+            "codex".to_string(),
+            "--no-eager-toolsets".to_string(),
+            "--config".to_string(),
+            "C:/konnect.json".to_string(),
+        ];
+        assert_eq!(
+            client_from_server_args(&args).unwrap(),
+            InstallClient::Codex
+        );
+        assert_eq!(eager_toolsets_from_server_args(&args).unwrap(), Some(false));
+
+        // And they remain rejected where they are not valid — `init` and
+        // friends take no such flag.
+        assert!(client_from_args(&["--eager-toolsets".to_string()]).is_err());
     }
 
     #[test]

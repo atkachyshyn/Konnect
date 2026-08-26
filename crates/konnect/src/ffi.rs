@@ -49,7 +49,11 @@ pub unsafe extern "C" fn kicad_plugin_init(config_path: *const c_char) -> c_int 
             project_dir: config.project_dir.clone(),
             jlcpcb_db_path: config.jlcpcb_db_path.clone(),
             auto_load_toolsets: config.auto_load_toolsets,
-            eager_toolsets: config.eager_toolsets,
+            // The cdylib is loaded by KiCad's plugin host, which has no
+            // `--client` and no CLI flags, so only an explicit config value can
+            // turn either of these on here.
+            eager_toolsets: config.eager_toolsets_for(None),
+            dispatcher_tools: config.dispatcher_tools_for(false, None),
         };
         match McpHandler::new(server_config).await {
             Ok(handler) => match config.transport {

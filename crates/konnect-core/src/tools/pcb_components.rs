@@ -4076,6 +4076,7 @@ mod tests {
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
                 eager_toolsets: false,
+                dispatcher_tools: false,
             },
             std::sync::Arc::new(crate::router::ToolRouter::new()),
         )
@@ -4765,6 +4766,7 @@ mod tests {
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
                 eager_toolsets: false,
+                dispatcher_tools: false,
             },
             std::sync::Arc::new(crate::router::ToolRouter::new()),
         );
@@ -5069,6 +5071,7 @@ mod tests {
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
                 eager_toolsets: false,
+                dispatcher_tools: false,
             },
             std::sync::Arc::new(crate::router::ToolRouter::new()),
         );
@@ -5570,6 +5573,7 @@ mod tests {
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
                 eager_toolsets: false,
+                dispatcher_tools: false,
             },
             std::sync::Arc::new(crate::router::ToolRouter::new()),
         );
@@ -5730,6 +5734,7 @@ mod tests {
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
                 eager_toolsets: false,
+                dispatcher_tools: false,
             },
             std::sync::Arc::new(crate::router::ToolRouter::new()),
         )
@@ -6146,6 +6151,7 @@ mod pad_net_shape_tests {
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
                 eager_toolsets: false,
+                dispatcher_tools: false,
             },
             Arc::new(ToolRouter::new()),
         )
@@ -6353,6 +6359,7 @@ mod required_count_tests {
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
                 eager_toolsets: false,
+                dispatcher_tools: false,
             },
             std::sync::Arc::new(crate::router::ToolRouter::new()),
         ))

@@ -1870,6 +1870,7 @@ mod svg_logo_tests {
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
                 eager_toolsets: false,
+                dispatcher_tools: false,
             },
             Arc::new(ToolRouter::new()),
         )
@@ -1986,6 +1987,7 @@ mod net_count_tests {
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
                 eager_toolsets: false,
+                dispatcher_tools: false,
             },
             Arc::new(ToolRouter::new()),
         )
@@ -2060,6 +2062,7 @@ mod mounting_hole_tests {
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
                 eager_toolsets: false,
+                dispatcher_tools: false,
             },
             Arc::new(ToolRouter::new()),
         )
@@ -2402,6 +2405,7 @@ mod zone_net_format_tests {
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
                 eager_toolsets: false,
+                dispatcher_tools: false,
             },
             Arc::new(ToolRouter::new()),
         )
@@ -2598,6 +2602,7 @@ mod board_size_tests {
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
                 eager_toolsets: false,
+                dispatcher_tools: false,
             },
             Arc::new(ToolRouter::new()),
         )
@@ -2791,6 +2796,7 @@ mod board_info_source_tests {
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
                 eager_toolsets: false,
+                dispatcher_tools: false,
             },
             Arc::new(ToolRouter::new()),
         )
@@ -2996,6 +3002,7 @@ mod board_info_paper_tests {
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
                 eager_toolsets: false,
+                dispatcher_tools: false,
             },
             Arc::new(ToolRouter::new()),
         )

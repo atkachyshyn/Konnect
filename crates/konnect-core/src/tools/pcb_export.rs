@@ -867,6 +867,7 @@ mod new_export_format_tests {
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
                 eager_toolsets: false,
+                dispatcher_tools: false,
             },
             Arc::new(ToolRouter::new()),
         )
@@ -1000,6 +1001,7 @@ mod required_layers_tests {
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
                 eager_toolsets: false,
+                dispatcher_tools: false,
             },
             Arc::new(crate::router::ToolRouter::new()),
         ))
@@ -1079,6 +1081,7 @@ mod fabrication_option_tests {
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
                 eager_toolsets: false,
+                dispatcher_tools: false,
             },
             Arc::new(ToolRouter::new()),
         )

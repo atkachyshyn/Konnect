@@ -1414,6 +1414,7 @@ mod batch_delete_tests {
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
                 eager_toolsets: false,
+                dispatcher_tools: false,
             },
             Arc::new(ToolRouter::new()),
         )
@@ -1500,6 +1501,7 @@ mod batch_place_and_connect_tests {
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
                 eager_toolsets: false,
+                dispatcher_tools: false,
             },
             Arc::new(ToolRouter::new()),
         )
@@ -1691,6 +1693,7 @@ mod midwire_pin_tests {
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
                 eager_toolsets: false,
+                dispatcher_tools: false,
             },
             Arc::new(ToolRouter::new()),
         )
@@ -1842,6 +1845,7 @@ mod connect_to_net_orientation_tests {
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
                 eager_toolsets: false,
+                dispatcher_tools: false,
             },
             Arc::new(ToolRouter::new()),
         )
@@ -2259,6 +2263,7 @@ mod add_text_placement_tests {
             jlcpcb_db_path: None,
             auto_load_toolsets: false,
             eager_toolsets: false,
+            dispatcher_tools: false,
         };
         let router = Arc::new(crate::router::ToolRouter::new());
         let ctx = Arc::new(ToolContext::new(cfg, router));
@@ -2462,6 +2467,7 @@ mod bulk_move_field_tests {
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
                 eager_toolsets: false,
+                dispatcher_tools: false,
             },
             Arc::new(ToolRouter::new()),
         )
@@ -2673,6 +2679,7 @@ mod layout_bounds_tests {
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
                 eager_toolsets: false,
+                dispatcher_tools: false,
             },
             Arc::new(ToolRouter::new()),
         )

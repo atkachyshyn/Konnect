@@ -182,6 +182,16 @@ pub struct ServerConfig {
     /// Pre-load every toolset at startup so the first `tools/list` is
     /// complete. Off by default (see `konnect::Config::eager_toolsets`).
     pub eager_toolsets: bool,
+    /// Expose the three dispatcher tools (`list_available_tools`,
+    /// `get_tool_schema`, `execute_konnect_tool`) in `tools/list`.
+    ///
+    /// They let a client reach every registered tool without the tool ever
+    /// appearing in `tools/list`, which is what makes the catalogue usable from
+    /// a client that caches its first listing — at roughly a tenth the context
+    /// of pre-loading everything. Defaults on for such clients (see
+    /// `konnect::Config::dispatcher_tools`), off elsewhere, where they would be
+    /// redundant with `load_toolset`.
+    pub dispatcher_tools: bool,
 }
 
 /// Serialises tests that set `KICAD*_DIR`. Those are process-wide and read at

@@ -185,18 +185,38 @@ call it. That is the symptom in
 [#169](https://github.com/mixelpixx/Konnect/issues/169) — reported against
 Claude Desktop.
 
-The fix for those clients is to make the *first* listing complete:
+The fix is to give those clients a route to the catalogue that does not depend
+on the listing ever refreshing.
+
+**On Codex this is already the default.** The server is launched as
+`--client codex`, which adds three dispatcher tools to `tools/list`:
+
+| tool | purpose |
+|---|---|
+| `list_available_tools` | browse all 206 tools, including unloaded ones |
+| `get_tool_schema` | fetch a tool's real input schema on demand |
+| `execute_konnect_tool` | run any tool by name, whether or not its toolset is loaded |
+
+They are always present, so every tool is reachable from the first call onward.
+Nothing to configure. Baseline cost is ~3.0K tokens against ~2.2K without them.
+
+For any other client that caches its first listing, pass `--dispatcher-tools`,
+or set:
 
 ```json
-{ "eager_toolsets": true }
+{ "dispatcher_tools": true }
 ```
 
-in `konnect.toml` in the working directory, or a `settings.json` beside the binary. Every toolset is then loaded at
-startup, so `tools/list` carries all 212 tools from the first call.
+in `konnect.toml` in the working directory, or a `settings.json` beside the binary.
 
-It is off by default because it costs what the router exists to save: roughly
-34K tokens of tool schemas in every request for the whole task, against ~2.2K.
-Turn it on only if your client needs it.
+**The heavyweight alternative** is `eager_toolsets` (or `--eager-toolsets`),
+which pre-loads every toolset so `tools/list` carries all 212 tools natively.
+That also works, and gives the model native schemas rather than a dispatcher
+call — but it costs roughly 34K tokens of tool schemas in *every* request for
+the whole task, against ~2.2K. It is off by default for every client.
+
+`--no-dispatcher-tools` turns the dispatcher back off for a Codex session that
+does not want it.
 
 Note that `auto_load_toolsets` does **not** solve this. It loads a toolset when
 a tool from it is *called*, which helps only a client that already knows the

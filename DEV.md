@@ -303,15 +303,41 @@ Source: [`crates/konnect-core/src/observability.rs`](crates/konnect-core/src/obs
 
 ## Tool Routing (Starter Kit + On-Demand Loading)
 
-The server does NOT expose all 206 tools (212 total with the 6 meta-tools) in `tools/list` by default. Measured against the current catalogue that is ~34K tokens of tool schemas — and they sit in the tool block of *every* request for the whole task, not once per listing as an earlier version of this line claimed. Prompt caching makes that cheap in money and does nothing for window occupancy. Instead:
+`tools/list` never carries all 206 tools (212 with the 6 meta-tools) by default. Measured against the current catalogue that listing is ~34K tokens of tool schemas, and they sit in every request for the whole task — not once per listing, which is what an earlier version of this section claimed. The starter baseline is ~2.2K.
 
-- **Startup**: only `STARTER_KIT` toolsets are pre-loaded (see `router/registry.rs::STARTER_KIT`). Currently: `project`, `config`. Combined with the 6 meta-tools, baseline `tools/list` is 20 tools ≈ 2.2K tokens.
+The lazy path works like this:
+
+- **Startup**: only `STARTER_KIT` toolsets are pre-loaded (see `router/registry.rs::STARTER_KIT`). Currently: `project`, `config`. Combined with the 6 meta-tools, baseline `tools/list` is 20 tools ≈ 2.2K tokens. (Under `eager_toolsets` this step loads every toolset instead; the rest of the section still applies, it just starts from a full toolbelt.)
 - **On demand**: the LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose a toolset's tools in subsequent `tools/list` responses. `unload_toolset(name)` prunes them when the task shifts.
 - **`tools/list_changed` notification**: sent on every load/unload so MCP clients refresh their local tool cache.
 - **Error recovery**: if the LLM calls an unloaded tool, `handler.rs` returns an actionable error naming the toolset that owns it (so the LLM can load it and retry in one hop — no extra `list_toolboxes` round-trip).
 - **`auto_load_toolsets` (config key, default `false`)**: when set, a miss in `dispatch_tool` loads the owning toolset and executes the call in the same hop instead of returning `toolset_not_loaded` -- fewer round trips, at the cost of toolsets accumulating monotonically for the rest of the session (`unload_toolset` still prunes, but a tool call reloads its toolset right back). Off by default because the router's whole point is keeping `tools/list` small; turn it on only if your client would rather eat the context growth than handle one recoverable error per miss. Set via `konnect.toml`/`settings.json` (`auto_load_toolsets = true`) or the equivalent `ServerConfig` field when embedding.
 
-- **`eager_toolsets` (config key, default `false`)**: pre-loads every toolset at startup via `ToolRouter::load_all`, so the *first* `tools/list` is the full catalogue. This is for MCP clients that cache the initial tool list and never act on `notifications/tools/list_changed` — for those, a tool absent from the first listing can never be called at all, because `load_toolset` reports the names it loaded but returns no schemas and the client has nothing to invoke (#134, #169). Note `auto_load_toolsets` does **not** cover this case: it fires on a tool *call*, so it only helps a caller that already knows the tool name. Costs ~34K tokens against the ~2.2K baseline, which is the router's entire reason for existing — hence off by default.
+- **`eager_toolsets` (config key, default `false` everywhere)**: pre-loads every toolset at startup via `ToolRouter::load_all`, so the *first* `tools/list` is the full catalogue. Measured cost: ~34K tokens against the ~2.2K baseline. No client gets this by default — `dispatcher_tools` reaches the same tools for about a tenth of it. Kept for a caller who wants native schemas for everything and has the budget.
+
+- **`dispatcher_tools` (config key; default `true` for Codex, `false` for Claude)**: adds three always-visible tools that reach the whole catalogue without enlarging `tools/list`:
+
+  | tool | purpose |
+  |---|---|
+  | `list_available_tools` | browse all 206, names-only by default; `toolset=` or `search=` for descriptions |
+  | `get_tool_schema` | fetch one tool's real input schema on demand (also resolves meta-tools) |
+  | `execute_konnect_tool` | run any registered tool by name, loaded or not |
+
+  This is the cure for a client that caches its first listing and never acts on `notifications/tools/list_changed`. For such a client the `load_toolset` loop cannot work at all: it reports the tools it activated, but the client never receives their schemas, so it has nothing to invoke (#134, #169). `auto_load_toolsets` does **not** cover this either — it fires on a tool *call*, so it only helps a caller that already knows the name and can emit it.
+
+  Measured baseline: ~3.0K tokens (23 tools), against ~2.2K without and ~34K for `eager_toolsets`. Schemas are pulled into the conversation only for tools actually used.
+
+  `execute_konnect_tool` is unwrapped in `McpHandler::dispatch_tool` rather than handled in `meta_tools.rs`, so a dispatched call runs through the same required-argument check and the same handler invocation as a direct one — the result shape, the error taxonomy, the lock-file protections and the safe S-expression/IPC write path are identical by construction, not by parallel implementation. Tool-specific options like `dry_run` belong inside `arguments`, because they are the target tool's parameters; the dispatcher adds none of its own. Resolution uses `ToolRouter::find_tool_def`, a side-effect-free registry lookup, so dispatching never grows the loaded set.
+
+- **Client defaults and CLI overrides**: both settings are resolved at startup by `Config::resolve`, and both config keys are `Option<bool>` so that "unset" is distinguishable from "explicitly off". Precedence, highest first:
+
+  1. `--dispatcher-tools` / `--no-dispatcher-tools`, `--eager-toolsets` / `--no-eager-toolsets` on the server command line.
+  2. `dispatcher_tools` / `eager_toolsets` stated in `konnect.toml` / `settings.json`.
+  3. The launching client's default, from `InstallClient::caches_initial_tool_list` (dispatcher only; eager has no client default).
+
+  The cdylib (KiCad plugin host) has no client or CLI, so only the config keys apply there.
+
+  When adding a client to `InstallClient`, decide `caches_initial_tool_list` deliberately: getting it wrong in the false direction is the silent failure this whole section exists to prevent — tools that `load_toolset` reports as loaded but the model cannot call.
 
 The router is defined in `crates/konnect-core/src/router/mod.rs`.
 
@@ -379,8 +405,9 @@ convention for other `kicad-cli`-calling code.
 ## Current Stats
 
 - **19 toolsets, 206 tools** + 6 meta-tools (4 routing + 2 observability — see `tool-directory.md`)
-- Baseline `tools/list`: 20 tools / ~2.2K tokens (starter kit + meta-tools)
-- Full-catalog `tools/list` (all loaded): 212 tools (206 registered + 6 meta) / ~34K tokens
+- Baseline `tools/list`: 20 tools / ~2.2K tokens (starter kit + meta-tools) — the Claude default
+- Codex default: 23 tools / ~3.0K tokens (starter kit + meta-tools + 3 dispatcher tools, all 206 reachable on demand)
+- Full-catalog `tools/list` (`eager_toolsets`): 212 tools (206 registered + 6 meta) / ~34K tokens
 - **0 IPC stubs** (all protobuf methods implemented)
 - **0 unimplemented tools**
 - **Specctra DSN/SES are PCB-editor operations**, not `kicad-cli` commands. Konnect

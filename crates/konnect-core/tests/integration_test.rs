@@ -236,6 +236,7 @@ async fn observability_meta_tools_surface_recorded_calls() {
             jlcpcb_db_path: None,
             auto_load_toolsets: false,
             eager_toolsets: false,
+            dispatcher_tools: false,
         },
         router,
         observer.clone(),

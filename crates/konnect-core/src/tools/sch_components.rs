@@ -2096,6 +2096,7 @@ mod tests {
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
                 eager_toolsets: false,
+                dispatcher_tools: false,
             },
             Arc::new(ToolRouter::new()),
         )
@@ -3580,6 +3581,7 @@ mod edit_component_tests {
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
                 eager_toolsets: false,
+                dispatcher_tools: false,
             },
             Arc::new(ToolRouter::new()),
         ));
@@ -3707,6 +3709,7 @@ mod page_tests {
             jlcpcb_db_path: None,
             auto_load_toolsets: false,
             eager_toolsets: false,
+            dispatcher_tools: false,
         };
         let ctx = Arc::new(ToolContext::new(
             cfg,
@@ -3823,6 +3826,7 @@ mod schematic_view_tests {
             jlcpcb_db_path: None,
             auto_load_toolsets: false,
             eager_toolsets: false,
+            dispatcher_tools: false,
         };
         let ctx = ToolContext::new(cfg, std::sync::Arc::new(crate::router::ToolRouter::new()));
         let args = json!({ "schematic": sheet.display().to_string() });
@@ -3889,6 +3893,7 @@ mod move_connected_tests {
                     jlcpcb_db_path: None,
                     auto_load_toolsets: false,
                     eager_toolsets: false,
+                    dispatcher_tools: false,
                 },
                 std::sync::Arc::new(crate::router::ToolRouter::new()),
             ),
@@ -3986,6 +3991,7 @@ mod multi_unit_component_tests {
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
                 eager_toolsets: false,
+                dispatcher_tools: false,
             },
             Arc::new(crate::router::ToolRouter::new()),
         )

@@ -831,6 +831,7 @@ mod net_track_count_tests {
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
                 eager_toolsets: false,
+                dispatcher_tools: false,
             },
             std::sync::Arc::new(crate::router::ToolRouter::new()),
         )
@@ -909,6 +910,7 @@ mod readiness_evidence_tests {
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
                 eager_toolsets: false,
+                dispatcher_tools: false,
             },
             std::sync::Arc::new(crate::router::ToolRouter::new()),
         )

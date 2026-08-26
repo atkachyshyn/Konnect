@@ -783,6 +783,7 @@ mod tests {
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
                 eager_toolsets: false,
+                dispatcher_tools: false,
             },
             std::sync::Arc::new(crate::router::ToolRouter::new()),
         );

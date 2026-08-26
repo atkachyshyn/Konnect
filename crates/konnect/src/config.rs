@@ -54,8 +54,28 @@ pub struct Config {
     /// `load_toolset` reports the names it loaded but returns no schemas, so
     /// there is nothing for the client to invoke, and `auto_load_toolsets`
     /// cannot help because it only fires once a call is actually attempted.
+    ///
+    /// `None` means "not stated in config". Unlike `dispatcher_tools` this has
+    /// no client-specific default -- it is off everywhere unless asked for,
+    /// because 208 tool schemas is a cost no client should pay by surprise.
     #[serde(default)]
-    pub eager_toolsets: bool,
+    pub eager_toolsets: Option<bool>,
+
+    /// Expose the three dispatcher tools (`list_available_tools`,
+    /// `get_tool_schema`, `execute_konnect_tool`).
+    ///
+    /// This is the cheap answer to a client that caches its first `tools/list`
+    /// and never refreshes on `notifications/tools/list_changed`. For such a
+    /// client the `load_toolset` discovery loop cannot work -- the tools it
+    /// activates never reach the client as callable schemas (#134, #169) -- but
+    /// three always-present tools can reach all 208 on demand, for roughly a
+    /// tenth of the context that pre-loading them costs.
+    ///
+    /// `None` means "not stated", which defers to the launching client:
+    /// `--client codex` resolves it to `true`. See
+    /// [`Config::dispatcher_tools_for`].
+    #[serde(default)]
+    pub dispatcher_tools: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -97,6 +117,37 @@ fn default_log_level() -> String {
 }
 
 impl Config {
+    /// Resolve a three-way setting: CLI switch beats config, config beats the
+    /// launching client's default.
+    ///
+    /// Keeping "unset" distinct from "explicitly off" is the whole reason the
+    /// config fields are `Option<bool>`. Collapse them and a client default can
+    /// no longer be expressed, which is how Codex ended up on the lazy path it
+    /// cannot use.
+    fn resolve(cli: Option<bool>, config: Option<bool>, client_default: bool) -> bool {
+        cli.or(config).unwrap_or(client_default)
+    }
+
+    /// Whether every toolset is pre-loaded at startup.
+    ///
+    /// No client turns this on by default. It is the heavyweight option --
+    /// roughly 34K tokens of tool schemas in every request for the whole task --
+    /// and `dispatcher_tools` reaches the same tools for a fraction of it. Kept
+    /// because a caller who wants native schemas for everything, and has the
+    /// context budget, should be able to say so.
+    pub fn eager_toolsets_for(&self, cli_override: Option<bool>) -> bool {
+        Self::resolve(cli_override, self.eager_toolsets, false)
+    }
+
+    /// Whether the three dispatcher tools are exposed.
+    ///
+    /// `client_default` comes from `InstallClient::caches_initial_tool_list`;
+    /// it is passed as a plain bool because this module is also compiled into
+    /// the cdylib, where the installer's client enum does not exist.
+    pub fn dispatcher_tools_for(&self, client_default: bool, cli_override: Option<bool>) -> bool {
+        Self::resolve(cli_override, self.dispatcher_tools, client_default)
+    }
+
     /// Load config from the default search path.
     pub fn load() -> Result<Self> {
         let mut config_paths = vec![
@@ -163,7 +214,8 @@ impl Default for Config {
             jlcpcb_db_path: None,
             log_level: default_log_level(),
             auto_load_toolsets: false,
-            eager_toolsets: false,
+            eager_toolsets: None,
+            dispatcher_tools: None,
         }
     }
 }
@@ -346,5 +398,103 @@ mod tests {
         let f = write_temp("conf", "log_level = \"debug\"\n");
         let c = Config::load_from(f.path()).unwrap();
         assert_eq!(c.log_level, "debug");
+    }
+
+    // ─── exposure resolution ────────────────────────────────────────────────
+    //
+    // The whole point of the Option is telling "the user asked for off" apart
+    // from "the user said nothing". Collapsing those was the bug: a Codex user
+    // who never wrote a config got the starter kit and could not call any tool
+    // load_toolset claimed to have loaded (#134, #169).
+
+    /// An unstated dispatcher setting defers to the client. Codex caches the
+    /// first listing and needs the dispatcher; Claude refreshes and does not.
+    #[test]
+    fn unstated_dispatcher_tools_follows_the_client() {
+        let c = Config::default();
+        assert!(c.dispatcher_tools.is_none(), "default must stay unstated");
+        assert!(c.dispatcher_tools_for(true, None), "codex-shaped client");
+        assert!(!c.dispatcher_tools_for(false, None), "claude-shaped client");
+    }
+
+    /// Eager loading has no client default: it costs roughly ten times the
+    /// dispatcher for the same reach, so no client should get it by surprise.
+    #[test]
+    fn eager_toolsets_is_off_until_asked_for() {
+        let c = Config::default();
+        assert!(c.eager_toolsets.is_none());
+        assert!(!c.eager_toolsets_for(None));
+        assert!(c.eager_toolsets_for(Some(true)), "CLI can still turn it on");
+    }
+
+    /// A value written in config beats the client default in both directions --
+    /// including turning the dispatcher off for Codex.
+    #[test]
+    fn config_overrides_the_client_default() {
+        let on = Config {
+            dispatcher_tools: Some(true),
+            ..Config::default()
+        };
+        assert!(on.dispatcher_tools_for(false, None));
+
+        let off = Config {
+            dispatcher_tools: Some(false),
+            ..Config::default()
+        };
+        assert!(!off.dispatcher_tools_for(true, None));
+
+        let eager = Config {
+            eager_toolsets: Some(true),
+            ..Config::default()
+        };
+        assert!(eager.eager_toolsets_for(None));
+    }
+
+    /// And the CLI switch beats config, so a user can flip one launch without
+    /// editing a file that other launches share.
+    #[test]
+    fn cli_override_beats_config_and_client() {
+        let off = Config {
+            dispatcher_tools: Some(false),
+            ..Config::default()
+        };
+        assert!(off.dispatcher_tools_for(false, Some(true)));
+
+        let on = Config {
+            dispatcher_tools: Some(true),
+            ..Config::default()
+        };
+        assert!(!on.dispatcher_tools_for(true, Some(false)));
+
+        let eager = Config {
+            eager_toolsets: Some(true),
+            ..Config::default()
+        };
+        assert!(!eager.eager_toolsets_for(Some(false)));
+    }
+
+    #[test]
+    fn eager_toolsets_still_parses_from_a_config_file() {
+        let f = write_temp("toml", "eager_toolsets = true\n");
+        assert_eq!(
+            Config::load_from(f.path()).unwrap().eager_toolsets,
+            Some(true)
+        );
+
+        let f = write_temp("toml", "eager_toolsets = false\n");
+        assert_eq!(
+            Config::load_from(f.path()).unwrap().eager_toolsets,
+            Some(false)
+        );
+
+        let f = write_temp("toml", "log_level = \"debug\"\n");
+        assert_eq!(Config::load_from(f.path()).unwrap().eager_toolsets, None);
+        assert_eq!(Config::load_from(f.path()).unwrap().dispatcher_tools, None);
+
+        let f = write_temp("toml", "dispatcher_tools = true\n");
+        assert_eq!(
+            Config::load_from(f.path()).unwrap().dispatcher_tools,
+            Some(true)
+        );
     }
 }

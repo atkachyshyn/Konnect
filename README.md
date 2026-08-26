@@ -70,9 +70,12 @@ through its own S-expression engine with atomic writes (write, fsync, rename), U
 preservation, and round-trip tests — no third-party schematic library with known
 gaps, no text-manipulation workarounds.
 
-**Context economy is a feature.** Exposing all 206 tools to an LLM costs roughly 34K
-tokens of tool schemas in every request, for as long as the task runs. Konnect's
-router loads a starter kit (~2.2K tokens) and lets the model pull in toolsets on demand — plus built-in observability
+**Context economy is a feature.** Exposing all 206 tools to an LLM costs roughly
+34K tokens of tool schemas in every request, for the whole task. Konnect's router
+loads a starter kit (~2.2K) and lets the model pull in toolsets on demand. For
+clients that cache their first listing instead of refreshing it, such as Codex,
+that loop cannot work — so those get three dispatcher tools that reach the entire
+catalogue on demand, for ~3K rather than ~34K — plus built-in observability
 (`get_recent_calls`, `server_stats`, JSONL call logs) so the model can diagnose its
 own tool failures.
 

@@ -10,16 +10,29 @@
 //!   get_recent_calls(limit?)  — last N tool calls (newest first) with timing + status
 //!   server_stats()            — uptime, per-tool totals/errors, JSONL log path
 //!
+//! Dispatcher (exposed only when `ServerConfig::dispatcher_tools` is on):
+//!   list_available_tools(..)  — browse the whole catalogue without loading it
+//!   get_tool_schema(name)     — fetch one tool's input schema on demand
+//!   execute_konnect_tool(..)  — call any registered tool, loaded or not
+//!
 //! At server startup only the STARTER_KIT (`project`, `config`) is pre-loaded so
 //! baseline context stays small. The LLM reads `list_toolboxes` and calls
 //! `load_toolset(name)` to expose the tools it actually needs for the task.
+//!
+//! That discovery loop depends on the client re-fetching `tools/list` when it
+//! receives `notifications/tools/list_changed`. A client that caches the first
+//! listing instead cannot use it at all: `load_toolset` reports the tools it
+//! activated, but the client never learns their schemas, so it has nothing to
+//! invoke (#134, #169). The dispatcher is the answer for those clients — three
+//! tools that are always in the listing and can reach all of the rest, at a
+//! fraction of the context cost of pre-loading the full catalogue.
 
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::{CallToolResult, McpToolDescription};
 use crate::tools::ToolContext;
 use serde_json::{json, Value};
 
-/// Return the 6 meta-tool MCP descriptions (always in the tools/list response).
+/// The 6 core meta-tool MCP descriptions (always in the tools/list response).
 pub fn meta_tool_descriptions() -> Vec<McpToolDescription> {
     vec![
         McpToolDescription {
@@ -124,6 +137,107 @@ pub fn meta_tool_descriptions() -> Vec<McpToolDescription> {
 }
 
 /// Attempt to handle a meta-tool call. Returns `None` if the name is not a meta-tool.
+/// The 3 dispatcher tool descriptions, appended to the listing when
+/// `ServerConfig::dispatcher_tools` is on.
+///
+/// Kept separate from [`meta_tool_descriptions`] so a client that does not need
+/// them does not pay for them: they are pure overhead for a client whose tool
+/// list refreshes normally.
+pub fn dispatcher_tool_descriptions() -> Vec<McpToolDescription> {
+    vec![
+        McpToolDescription {
+            name: "list_available_tools".to_string(),
+            description:
+                "Browse every KiCAD tool this server has, including tools whose toolset is not \
+                 loaded. Call with no arguments for a cheap overview: tool names grouped by \
+                 toolset, no descriptions. Pass `toolset` to get full descriptions for one \
+                 toolset, or `search` to find tools by name or description across all of them. \
+                 Any tool listed here can be run with execute_konnect_tool(...) right away — \
+                 there is no need to load_toolset() first."
+                    .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "toolset": {
+                        "type": "string",
+                        "description": "Only list this toolset's tools, with descriptions (e.g. 'pcb_board')"
+                    },
+                    "search": {
+                        "type": "string",
+                        "description": "Case-insensitive substring matched against tool names and descriptions"
+                    },
+                    "with_descriptions": {
+                        "type": "boolean",
+                        "description": "Include descriptions in the no-argument overview. Costs considerably more context.",
+                        "default": false
+                    }
+                },
+                "required": []
+            }),
+        },
+        McpToolDescription {
+            name: "get_tool_schema".to_string(),
+            description:
+                "Get the full input schema for one or more tools by name, so you can build a \
+                 valid argument object for execute_konnect_tool. Works for any registered tool \
+                 whether or not its toolset is loaded. Pass an array to fetch several at once. \
+                 Fetch schemas only for tools you are about to call — this is the on-demand \
+                 half of the dispatcher, and each schema costs context."
+                    .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "tool_name": {
+                        "anyOf": [
+                            {"type": "string"},
+                            {"type": "array", "items": {"type": "string"}}
+                        ],
+                        "description": "Tool name (e.g. 'add_layer'), or an array of names"
+                    }
+                },
+                "required": ["tool_name"]
+            }),
+        },
+        McpToolDescription {
+            name: "execute_konnect_tool".to_string(),
+            description:
+                "Run any registered KiCAD tool by name, whether or not its toolset is loaded. \
+                 Arguments are validated against that tool's real schema and the call is \
+                 dispatched to the real handler, so the result, the error taxonomy, the \
+                 lock-file protections and the safe S-expression/IPC write path are all exactly \
+                 what a direct call would give you. Use get_tool_schema(tool_name) first to see \
+                 what `arguments` must contain. Tool-specific options such as `dry_run` go \
+                 inside `arguments`, because they belong to the tool being run, not to this \
+                 wrapper."
+                    .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "tool_name": {
+                        "type": "string",
+                        "description": "Name of the tool to run (e.g. 'add_layer', 'run_erc')"
+                    },
+                    "arguments": {
+                        "type": "object",
+                        "description": "The argument object for that tool, exactly as its own schema describes it",
+                        "default": {}
+                    }
+                },
+                "required": ["tool_name"]
+            }),
+        },
+    ]
+}
+
+/// Names the dispatcher owns. `execute_konnect_tool` is handled in the MCP
+/// handler rather than here, so that a dispatched call reuses the one real
+/// validation-and-dispatch path instead of a parallel copy of it.
+pub const DISPATCHER_TOOL_NAMES: &[&str] = &[
+    "list_available_tools",
+    "get_tool_schema",
+    "execute_konnect_tool",
+];
+
 pub async fn handle_meta_tool(
     name: &str,
     args: &Value,
@@ -136,8 +250,204 @@ pub async fn handle_meta_tool(
         "get_active_toolsets" => Some(handle_get_active_toolsets(ctx).await),
         "get_recent_calls" => Some(handle_get_recent_calls(args, ctx).await),
         "server_stats" => Some(handle_server_stats(ctx).await),
+        "list_available_tools" => Some(handle_list_available_tools(args, ctx).await),
+        "get_tool_schema" => Some(handle_get_tool_schema(args, ctx).await),
+        // `execute_konnect_tool` is deliberately absent: the handler unwraps it
+        // before dispatch so the inner call goes through the same required-
+        // argument check and the same handler invocation as a direct call.
         _ => None,
     }
+}
+
+/// Browse the catalogue without loading any of it.
+///
+/// The default shape is names-only, grouped by toolset, because the whole point
+/// of the dispatcher is that the caller does not pay for 208 descriptions it
+/// will not read. Descriptions arrive when the caller narrows to one toolset or
+/// searches, which is when they are actually useful.
+async fn handle_list_available_tools(
+    args: &Value,
+    ctx: &std::sync::Arc<ToolContext>,
+) -> CallToolResult {
+    let all = ctx.router.all_tool_defs();
+
+    if let Some(name) = args["toolset"].as_str() {
+        let tools: Vec<Value> = all
+            .iter()
+            .filter(|(ts, _)| *ts == name)
+            .map(|(_, d)| json!({ "name": d.name, "description": d.description }))
+            .collect();
+        if tools.is_empty() {
+            return CallToolResult::error(format!(
+                "Unknown toolset '{name}'. Call list_toolboxes() to see valid names."
+            ));
+        }
+        return CallToolResult::json(&json!({
+            "toolset": name,
+            "count": tools.len(),
+            "tools": tools,
+            "hint": "Run any of these with execute_konnect_tool(tool_name, arguments). \
+                     Call get_tool_schema(tool_name) first to see the argument shape."
+        }));
+    }
+
+    if let Some(query) = args["search"].as_str() {
+        let needle = query.to_lowercase();
+        let matches: Vec<Value> = all
+            .iter()
+            .filter(|(_, d)| {
+                d.name.to_lowercase().contains(&needle)
+                    || d.description.to_lowercase().contains(&needle)
+            })
+            .map(|(ts, d)| json!({ "name": d.name, "toolset": ts, "description": d.description }))
+            .collect();
+        let builtin_matches: Vec<Value> = meta_tool_descriptions()
+            .into_iter()
+            .chain(dispatcher_tool_descriptions())
+            .filter(|b| {
+                b.name.to_lowercase().contains(&needle)
+                    || b.description.to_lowercase().contains(&needle)
+            })
+            .map(|b| {
+                json!({ "name": b.name, "toolset": Value::Null, "always_available": true,
+                             "description": b.description })
+            })
+            .collect();
+        return CallToolResult::json(&json!({
+            "search": query,
+            "count": matches.len() + builtin_matches.len(),
+            "tools": matches,
+            "always_available": builtin_matches,
+            "hint": "Run any of these with execute_konnect_tool(tool_name, arguments). \
+                     Entries under `always_available` are already in tools/list and can also \
+                     be called directly."
+        }));
+    }
+
+    let with_descriptions = args["with_descriptions"].as_bool().unwrap_or(false);
+    let mut by_toolset: Vec<Value> = Vec::new();
+    for ts in ctx.router.all_toolsets() {
+        let tools: Vec<Value> = all
+            .iter()
+            .filter(|(name, _)| *name == ts.name)
+            .map(|(_, d)| {
+                if with_descriptions {
+                    json!({ "name": d.name, "description": d.description })
+                } else {
+                    json!(d.name)
+                }
+            })
+            .collect();
+        by_toolset.push(json!({
+            "toolset": ts.name,
+            "category": ts.category,
+            "description": ts.description,
+            "tools": tools,
+        }));
+    }
+
+    CallToolResult::json(&json!({
+        "total_tools": all.len(),
+        "toolsets": by_toolset,
+        "hint": "Names only, to keep this cheap. Narrow with list_available_tools(toolset=...) \
+                 or list_available_tools(search=...) for descriptions, then \
+                 get_tool_schema(tool_name) for the argument shape, then \
+                 execute_konnect_tool(tool_name, arguments) to run it. Loading a toolset is \
+                 not required."
+    }))
+}
+
+/// Fetch one or more real input schemas on demand.
+///
+/// This reads from the registry rather than the loaded set, so a schema is
+/// available for every tool at any time without changing what `tools/list`
+/// reports.
+async fn handle_get_tool_schema(args: &Value, ctx: &std::sync::Arc<ToolContext>) -> CallToolResult {
+    let names: Vec<String> = match &args["tool_name"] {
+        Value::String(name) => vec![name.clone()],
+        Value::Array(items) => {
+            match items
+                .iter()
+                .map(|v| v.as_str().map(str::to_string))
+                .collect::<Option<Vec<String>>>()
+            {
+                Some(names) => names,
+                None => {
+                    return CallToolResult::error_kind(
+                        ToolErrorKind::InvalidArgument {
+                            field: "tool_name".to_string(),
+                            reason: "array entries must be strings".to_string(),
+                        },
+                        "Argument 'tool_name' is invalid: array entries must be strings",
+                    )
+                }
+            }
+        }
+        _ => {
+            return CallToolResult::error_kind(
+                ToolErrorKind::InvalidArgument {
+                    field: "tool_name".to_string(),
+                    reason: "must be a string or an array of strings".to_string(),
+                },
+                "Argument 'tool_name' is invalid: must be a string or an array of strings",
+            )
+        }
+    };
+
+    // Meta-tools and dispatcher tools live outside the toolset registry but are
+    // real, callable names — `load_toolset` and `get_active_toolsets` among them.
+    // Reporting those as unknown would be a lie the caller then has to work
+    // around, so they resolve here too, marked with a null toolset because they
+    // belong to none.
+    let builtins: Vec<McpToolDescription> = meta_tool_descriptions()
+        .into_iter()
+        .chain(dispatcher_tool_descriptions())
+        .collect();
+
+    let mut found = Vec::new();
+    let mut unknown = Vec::new();
+    for name in &names {
+        if let Some(def) = ctx.router.find_tool_def(name) {
+            found.push(json!({
+                "name": def.name,
+                "toolset": ctx.router.find_toolset_for_tool(def.name),
+                "description": def.description,
+                "input_schema": def.input_schema,
+            }));
+        } else if let Some(b) = builtins.iter().find(|b| b.name == *name) {
+            found.push(json!({
+                "name": b.name,
+                "toolset": Value::Null,
+                "always_available": true,
+                "description": b.description,
+                "input_schema": b.input_schema,
+            }));
+        } else {
+            unknown.push(name.clone());
+        }
+    }
+
+    // All names unknown is a typed error the caller can act on; a partial miss
+    // still returns the schemas that resolved, with the misses named.
+    if found.is_empty() {
+        let joined = unknown.join(", ");
+        return CallToolResult::error_kind(
+            ToolErrorKind::UnknownTool {
+                tool: joined.clone(),
+            },
+            format!(
+                "No registered tool named: {joined}. Call list_available_tools(search=...) \
+                 to find the right name."
+            ),
+        );
+    }
+
+    CallToolResult::json(&json!({
+        "schemas": found,
+        "unknown": unknown,
+        "hint": "Pass one of these names plus a matching argument object to \
+                 execute_konnect_tool(tool_name, arguments)."
+    }))
 }
 
 async fn handle_list_toolboxes(ctx: &std::sync::Arc<ToolContext>) -> CallToolResult {

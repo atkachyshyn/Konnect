@@ -2168,6 +2168,7 @@ mod unit_aware_wiring_tests {
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
                 eager_toolsets: false,
+                dispatcher_tools: false,
             },
             Arc::new(ToolRouter::new()),
         )
@@ -2758,6 +2759,7 @@ mod label_tests {
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
                 eager_toolsets: false,
+                dispatcher_tools: false,
             },
             Arc::new(ToolRouter::new()),
         )
@@ -3050,6 +3052,7 @@ mod wire_delete_tests {
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
                 eager_toolsets: false,
+                dispatcher_tools: false,
             },
             Arc::new(ToolRouter::new()),
         )
@@ -3297,6 +3300,7 @@ mod power_symbol_tests {
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
                 eager_toolsets: false,
+                dispatcher_tools: false,
             },
             Arc::new(ToolRouter::new()),
         )
@@ -3472,6 +3476,7 @@ mod no_connect_delete_tests {
                 jlcpcb_db_path: None,
                 auto_load_toolsets: false,
                 eager_toolsets: false,
+                dispatcher_tools: false,
             },
             Arc::new(ToolRouter::new()),
         )
@@ -3606,6 +3611,7 @@ mod batch_no_connect_tests {
             jlcpcb_db_path: None,
             auto_load_toolsets: false,
             eager_toolsets: false,
+            dispatcher_tools: false,
         };
         let ctx = Arc::new(ToolContext::new(
             cfg,

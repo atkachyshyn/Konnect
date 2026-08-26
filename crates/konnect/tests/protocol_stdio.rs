@@ -24,9 +24,28 @@ impl McpProcess {
     /// `Config::load()`'s first search path (`konnect.toml` in cwd) picks up
     /// a test config file placed there.
     fn spawn_in_dir(dir: Option<&std::path::Path>) -> Self {
+        Self::spawn_with(dir, &[], None)
+    }
+
+    /// Spawn with extra CLI arguments, and optionally a sandboxed `HOME`.
+    ///
+    /// `home` matters because the server auto-installs skills for its client on
+    /// first launch, and `dirs::home_dir()` honours `$HOME`. Pointing it at a
+    /// temp dir keeps a `--client codex` test from writing into the developer's
+    /// real `~/.agents`.
+    fn spawn_with(
+        dir: Option<&std::path::Path>,
+        args: &[&str],
+        home: Option<&std::path::Path>,
+    ) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_konnect"));
+        command.args(args);
         if let Some(dir) = dir {
             command.current_dir(dir);
+        }
+        if let Some(home) = home {
+            command.env("HOME", home);
+            command.env("USERPROFILE", home);
         }
         let mut child = command
             .stdin(Stdio::piped())
@@ -403,4 +422,300 @@ fn auto_load_toolsets_config_loads_and_executes_on_miss() {
         saw_notification,
         "expected notifications/tools/list_changed after auto-load; saw: {lines:#?}"
     );
+}
+
+// ─── Codex tool exposure (#134, #169) ────────────────────────────────────────
+//
+// Codex reads `tools/list` once per task and never acts on
+// `notifications/tools/list_changed`. Under the router's default lazy loading
+// that makes `load_toolset` a trap: it reports success and names the tools it
+// activated, but Codex never receives their schemas, so those exact names are
+// not callable and the model is left with the starter kit it began with.
+//
+// Pre-loading every toolset cures it but costs ~34K tokens of tool schemas in
+// every request for the whole task. The dispatcher cures it for ~3K: three
+// tools that are always in the listing and can reach all 208 on demand.
+//
+// These tests pin that at the protocol boundary — the same place the bug showed
+// up — rather than at the config layer, where it is easy to be right in
+// isolation and still ship a server that does the wrong thing.
+
+/// Every tool name the Codex acceptance criteria require to be reachable
+/// without a prior `load_toolset`.
+const CODEX_REQUIRED_TOOLS: &[&str] = &[
+    "get_active_toolsets",
+    "load_toolset",
+    "get_board_info",
+    "get_layer_list",
+    "add_layer",
+    "set_active_layer",
+    "get_netclasses",
+    "create_netclass",
+    "assign_net_to_class",
+    "get_design_rules",
+    "set_design_rules",
+    "set_layer_constraints",
+    "list_symbol_libraries",
+    "register_symbol_library",
+    "list_footprint_libraries",
+    "register_footprint_library",
+    "get_symbol_info",
+    "list_symbols_in_library",
+    "run_erc",
+    "run_drc",
+    "export_schematic_svg",
+    "generate_netlist",
+];
+
+const DISPATCHER_TOOLS: &[&str] = &[
+    "list_available_tools",
+    "get_tool_schema",
+    "execute_konnect_tool",
+];
+
+fn listed_tool_names(p: &mut McpProcess) -> Vec<String> {
+    let list = p.request("tools/list", json!({}));
+    list["result"]["tools"]
+        .as_array()
+        .expect("tools/list must return an array")
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+fn codex() -> McpProcess {
+    let home = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+    McpProcess::spawn_with(None, &["--client", "codex"], Some(home.path()))
+}
+
+/// The acceptance test: launched as `--client codex`, every required tool is
+/// reachable from the first listing onward — either directly present, or
+/// resolvable through `get_tool_schema` and runnable through
+/// `execute_konnect_tool`. No `load_toolset` round trip, so nothing depends on
+/// the client ever refreshing.
+#[test]
+fn codex_can_reach_every_required_tool_without_loading_a_toolset() {
+    let mut p = codex();
+    let listed = listed_tool_names(&mut p);
+
+    for want in DISPATCHER_TOOLS {
+        assert!(
+            listed.iter().any(|got| got == want),
+            "codex startup listing is missing dispatcher tool {want}"
+        );
+    }
+
+    // Ask for all 24 schemas in one call, with nothing loaded.
+    let body = McpProcess::tool_body(&p.call_tool(
+        "get_tool_schema",
+        json!({ "tool_name": CODEX_REQUIRED_TOOLS }),
+    ));
+    let resolved: Vec<&str> = body["schemas"]
+        .as_array()
+        .expect("get_tool_schema must return schemas")
+        .iter()
+        .map(|s| s["name"].as_str().unwrap())
+        .collect();
+
+    let missing: Vec<&&str> = CODEX_REQUIRED_TOOLS
+        .iter()
+        .filter(|want| !resolved.contains(*want))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "get_tool_schema could not resolve {missing:?} (unknown: {})",
+        body["unknown"]
+    );
+
+    // Every schema must actually be usable to build a call.
+    for schema in body["schemas"].as_array().unwrap() {
+        assert_eq!(
+            schema["input_schema"]["type"], "object",
+            "tool {} has no usable input schema",
+            schema["name"]
+        );
+    }
+}
+
+/// Resolving and running tools through the dispatcher must not enlarge
+/// `tools/list`. If it did, the dispatcher would slowly become the eager path
+/// it exists to avoid.
+#[test]
+fn dispatching_does_not_grow_the_tool_listing() {
+    let mut p = codex();
+    let before = listed_tool_names(&mut p).len();
+
+    let _ = p.call_tool("get_tool_schema", json!({"tool_name": "add_layer"}));
+    let _ = p.call_tool(
+        "execute_konnect_tool",
+        json!({"tool_name": "list_symbol_libraries", "arguments": {"scope": "global"}}),
+    );
+
+    assert_eq!(
+        listed_tool_names(&mut p).len(),
+        before,
+        "dispatching must leave the loaded set untouched"
+    );
+}
+
+/// A read-only tool whose toolset is not loaded must actually run. Listing a
+/// path to a tool the server then refuses to dispatch would just move the bug
+/// one step later.
+#[test]
+fn dispatcher_runs_an_unloaded_read_only_tool() {
+    let mut p = codex();
+    let result = p.call_tool(
+        "execute_konnect_tool",
+        json!({"tool_name": "list_symbol_libraries", "arguments": {"scope": "global"}}),
+    );
+    let body = McpProcess::tool_body(&result);
+    assert!(
+        body["error"]["kind"] != "toolset_not_loaded",
+        "dispatcher must not return toolset_not_loaded: {body}"
+    );
+    assert!(
+        body["error"]["kind"] != "unknown_tool",
+        "list_symbol_libraries must resolve: {body}"
+    );
+}
+
+/// Arguments are validated against the tool's real schema, not waved through.
+/// A dispatched call that skipped validation would be a hole straight past the
+/// check that direct calls get (#218).
+#[test]
+fn dispatcher_enforces_the_real_schema() {
+    let mut p = codex();
+    let body = McpProcess::tool_body(&p.call_tool(
+        "execute_konnect_tool",
+        json!({"tool_name": "add_layer", "arguments": {}}),
+    ));
+    assert_eq!(body["error"]["kind"], "invalid_argument");
+    assert_eq!(
+        body["error"]["field"], "board",
+        "the error must name the tool's own missing field: {body}"
+    );
+}
+
+/// The dispatcher's own argument errors are typed too, and it refuses to
+/// dispatch into itself — which would otherwise recurse forever.
+#[test]
+fn dispatcher_refuses_unknown_names_and_self_reference() {
+    let mut p = codex();
+
+    let unknown = McpProcess::tool_body(
+        &p.call_tool("execute_konnect_tool", json!({"tool_name": "no_such_tool"})),
+    );
+    assert_eq!(unknown["error"]["kind"], "unknown_tool");
+
+    let looped = McpProcess::tool_body(&p.call_tool(
+        "execute_konnect_tool",
+        json!({"tool_name": "execute_konnect_tool"}),
+    ));
+    assert_eq!(looped["error"]["kind"], "invalid_argument");
+    assert_eq!(looped["error"]["field"], "tool_name");
+
+    let bad_args = McpProcess::tool_body(&p.call_tool(
+        "execute_konnect_tool",
+        json!({"tool_name": "add_layer", "arguments": []}),
+    ));
+    assert_eq!(bad_args["error"]["kind"], "invalid_argument");
+    assert_eq!(bad_args["error"]["field"], "arguments");
+}
+
+/// `list_available_tools` must show the whole catalogue, not the loaded subset,
+/// and must default to the cheap names-only shape.
+#[test]
+fn list_available_tools_covers_the_whole_catalogue_cheaply() {
+    let mut p = codex();
+    let body = McpProcess::tool_body(&p.call_tool("list_available_tools", json!({})));
+
+    let total = body["total_tools"].as_u64().expect("total_tools");
+    let registered: u64 = konnect_core::router::registry::ALL_TOOLSETS
+        .iter()
+        .map(|t| t.tool_count as u64)
+        .sum();
+    assert_eq!(
+        total, registered,
+        "overview must span every registered tool"
+    );
+
+    // Names-only by default: no description keys in the default shape.
+    let first = &body["toolsets"][0]["tools"][0];
+    assert!(
+        first.is_string(),
+        "default overview must be names only, got {first}"
+    );
+
+    // Narrowing to one toolset brings descriptions.
+    let scoped = McpProcess::tool_body(
+        &p.call_tool("list_available_tools", json!({"toolset": "pcb_board"})),
+    );
+    assert!(scoped["tools"][0]["description"].is_string());
+}
+
+/// The default client keeps the small baseline and does NOT pay for dispatcher
+/// tools it does not need — its tool list refreshes, so `load_toolset` works.
+#[test]
+fn default_client_gets_neither_dispatcher_nor_eager_exposure() {
+    let home = tempfile::tempdir().unwrap();
+    let mut p = McpProcess::spawn_with(None, &[], Some(home.path()));
+    let names = listed_tool_names(&mut p);
+
+    assert!(
+        names.len() < 30,
+        "default listing should stay near the starter kit, got {}",
+        names.len()
+    );
+    assert!(names.iter().any(|n| n == "load_toolset"));
+    for d in DISPATCHER_TOOLS {
+        assert!(
+            !names.iter().any(|n| n == d),
+            "default client must not pay for {d}"
+        );
+    }
+    assert!(
+        !names.iter().any(|n| n == "add_layer"),
+        "pcb_board must not be pre-loaded for the default client"
+    );
+}
+
+/// Both switches work in both directions, for any client.
+#[test]
+fn exposure_switches_override_the_client_default() {
+    let home = tempfile::tempdir().unwrap();
+
+    let mut off = McpProcess::spawn_with(
+        None,
+        &["--client", "codex", "--no-dispatcher-tools"],
+        Some(home.path()),
+    );
+    let names = listed_tool_names(&mut off);
+    assert!(!names.iter().any(|n| n == "execute_konnect_tool"));
+
+    let mut on = McpProcess::spawn_with(None, &["--dispatcher-tools"], Some(home.path()));
+    assert!(listed_tool_names(&mut on)
+        .iter()
+        .any(|n| n == "execute_konnect_tool"));
+
+    // Eager stays available for anyone who wants native schemas and has the
+    // context budget for them.
+    let mut eager = McpProcess::spawn_with(None, &["--eager-toolsets"], Some(home.path()));
+    let names = listed_tool_names(&mut eager);
+    assert!(names.iter().any(|n| n == "add_layer"));
+    assert!(names.iter().any(|n| n == "create_netclass"));
+}
+
+/// Exposure must not depend on session state: a fresh process is what a new
+/// Codex task gets, and it must look the same every time.
+#[test]
+fn codex_exposure_survives_a_server_restart() {
+    let mut first = listed_tool_names(&mut codex());
+    let mut second = listed_tool_names(&mut codex());
+    first.sort();
+    second.sort();
+    assert_eq!(
+        first, second,
+        "a restarted server must expose the same tools"
+    );
+    assert!(first.iter().any(|n| n == "execute_konnect_tool"));
 }

@@ -99,6 +99,8 @@ async fn main() -> Result<()> {
     }
 
     let client = install::client_from_server_args(&args[1..])?;
+    let eager_override = install::eager_toolsets_from_server_args(&args[1..])?;
+    let dispatcher_override = install::dispatcher_tools_from_server_args(&args[1..])?;
 
     // ─── Auto-install on first MCP launch (safety net) ──────────────
     if install::needs_install(client) {
@@ -133,6 +135,27 @@ async fn main() -> Result<()> {
 
     info!("Konnect v{} starting", env!("CARGO_PKG_VERSION"));
 
+    // Codex caches the tool list from the first `tools/list` and never acts on
+    // `notifications/tools/list_changed`, so anything outside the starter kit
+    // would stay uncallable there for the whole session (#134, #169). The
+    // dispatcher tools cure that without enlarging the listing; eager loading
+    // cures it too but costs roughly ten times the context, so it stays opt-in.
+    // Config and the explicit CLI switches override both.
+    let eager_toolsets = config.eager_toolsets_for(eager_override);
+    let dispatcher_tools =
+        config.dispatcher_tools_for(client.caches_initial_tool_list(), dispatcher_override);
+    info!(
+        client = %client,
+        eager_toolsets,
+        dispatcher_tools,
+        "tool exposure: {}",
+        match (eager_toolsets, dispatcher_tools) {
+            (true, _) => "all toolsets pre-loaded at startup",
+            (false, true) => "starter kit + dispatcher tools (whole catalogue reachable on demand)",
+            (false, false) => "starter kit only, expand with load_toolset",
+        }
+    );
+
     let server_config = konnect_core::tools::ServerConfig {
         kicad_cli: config.kicad_cli.clone(),
         kicad_binary: config.kicad_binary.clone(),
@@ -140,7 +163,8 @@ async fn main() -> Result<()> {
         project_dir: config.project_dir.clone(),
         jlcpcb_db_path: config.jlcpcb_db_path.clone(),
         auto_load_toolsets: config.auto_load_toolsets,
-        eager_toolsets: config.eager_toolsets,
+        eager_toolsets,
+        dispatcher_tools,
     };
     let handler = McpHandler::new(server_config).await?;
 
@@ -220,6 +244,8 @@ fn print_help() {
     println!("USAGE:");
     println!("  konnect                  Start MCP server (pipe) or install (TTY)");
     println!("  konnect [--client <client>] [--config <path>]");
+    println!("           [--dispatcher-tools | --no-dispatcher-tools]");
+    println!("           [--eager-toolsets | --no-eager-toolsets]");
     println!("  konnect init [--client <client>]");
     println!("  konnect uninstall [--client <client>]");
     println!("  konnect status [--client <client>]");
@@ -229,6 +255,21 @@ fn print_help() {
     println!("  konnect transaction abandon <project-dir> <id> --force");
     println!("  konnect --version        Print version");
     println!("  konnect --help           This message");
+    println!("\nTOOL EXPOSURE:");
+    println!("  --dispatcher-tools       Expose list_available_tools,");
+    println!("                           get_tool_schema and execute_konnect_tool,");
+    println!("                           which reach every tool on demand (~1K)");
+    println!("  --no-dispatcher-tools    Omit them");
+    println!("  --eager-toolsets         Pre-load every toolset so the first");
+    println!("                           tools/list is complete (~34K tokens)");
+    println!("  --no-eager-toolsets      Starter kit only (~2K tokens); expand");
+    println!("                           on demand with load_toolset");
+    println!();
+    println!("  Dispatcher tools default on for codex, which caches its first");
+    println!("  tools/list and so cannot use load_toolset; off for claude, which");
+    println!("  refreshes and does not need them. Eager loading is off for both --");
+    println!("  it reaches the same tools for ~10x the context. Config keys");
+    println!("  override the defaults, and these flags override config.");
     println!("\nCLIENTS:");
     println!("  claude (default)         Skills, agents, and hooks under ~/.claude");
     println!("  codex                    Skills under ~/.agents/skills");
