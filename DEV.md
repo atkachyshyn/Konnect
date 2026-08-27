@@ -315,7 +315,7 @@ The lazy path works like this:
 
 - **`eager_toolsets` (config key, default `false` everywhere)**: pre-loads every toolset at startup via `ToolRouter::load_all`, so the *first* `tools/list` is the full catalogue. Measured cost: ~34K tokens against the ~2.2K baseline. No client gets this by default — `dispatcher_tools` reaches the same tools for about a tenth of it. Kept for a caller who wants native schemas for everything and has the budget.
 
-- **`dispatcher_tools` (config key; default `true` for Codex, `false` for Claude)**: adds three always-visible tools that reach the whole catalogue without enlarging `tools/list`:
+- **`dispatcher_tools` (config key, default `true` for every client)**: adds three always-visible tools that reach the whole catalogue without enlarging `tools/list`:
 
   | tool | purpose |
   |---|---|
@@ -327,17 +327,19 @@ The lazy path works like this:
 
   Measured baseline: ~3.0K tokens (23 tools), against ~2.2K without and ~34K for `eager_toolsets`. Schemas are pulled into the conversation only for tools actually used.
 
+  It is on for every client rather than only the ones known to cache, because the client cannot be identified at startup. #134 and #169 were reported against Claude *Desktop*, which shares `InstallClient::Claude` with Claude Code and passes no `--client` (see `examples/claude_desktop_config.example.json`) — so keying the default to the client left the reporting client as the one arrangement without the fix. The ~628-token overhead on a client that refreshes properly is a better trade than a client that silently cannot call most of the catalogue. `--no-dispatcher-tools` opts out.
+
+  For a client that does refresh, the dispatcher is not purely overhead: `load_toolset` pulls a whole toolset and the listing never shrinks unless the model prunes it, so a five-tool task on `pcb_board` measures ~4.9K through the lazy path against ~4.1K through the dispatcher.
+
   `execute_konnect_tool` is unwrapped in `McpHandler::dispatch_tool` rather than handled in `meta_tools.rs`, so a dispatched call runs through the same required-argument check and the same handler invocation as a direct one — the result shape, the error taxonomy, the lock-file protections and the safe S-expression/IPC write path are identical by construction, not by parallel implementation. Tool-specific options like `dry_run` belong inside `arguments`, because they are the target tool's parameters; the dispatcher adds none of its own. Resolution uses `ToolRouter::find_tool_def`, a side-effect-free registry lookup, so dispatching never grows the loaded set.
 
-- **Client defaults and CLI overrides**: both settings are resolved at startup by `Config::resolve`, and both config keys are `Option<bool>` so that "unset" is distinguishable from "explicitly off". Precedence, highest first:
+- **Defaults and CLI overrides**: both settings are resolved at startup by `Config::resolve`, and both config keys are `Option<bool>` so that "unset" is distinguishable from "explicitly off" — without that distinction a user who wants the dispatcher off cannot say so. Precedence, highest first:
 
   1. `--dispatcher-tools` / `--no-dispatcher-tools`, `--eager-toolsets` / `--no-eager-toolsets` on the server command line.
   2. `dispatcher_tools` / `eager_toolsets` stated in `konnect.toml` / `settings.json`.
-  3. The launching client's default, from `InstallClient::caches_initial_tool_list` (dispatcher only; eager has no client default).
+  3. The built-in default: dispatcher on, eager off.
 
-  The cdylib (KiCad plugin host) has no client or CLI, so only the config keys apply there.
-
-  When adding a client to `InstallClient`, decide `caches_initial_tool_list` deliberately: getting it wrong in the false direction is the silent failure this whole section exists to prevent — tools that `load_toolset` reports as loaded but the model cannot call.
+  The cdylib (KiCad plugin host) has no client or CLI, so only the config keys apply there — and its refresh behaviour is unknown, which is the case the dispatcher default exists for.
 
 The router is defined in `crates/konnect-core/src/router/mod.rs`.
 
@@ -405,8 +407,8 @@ convention for other `kicad-cli`-calling code.
 ## Current Stats
 
 - **19 toolsets, 208 tools** + 6 meta-tools (4 routing + 2 observability — see `tool-directory.md`)
-- Baseline `tools/list`: 20 tools / ~2.2K tokens (starter kit + meta-tools) — the Claude default
-- Codex default: 23 tools / ~3.0K tokens (starter kit + meta-tools + 3 dispatcher tools, all 208 reachable on demand)
+- With `--no-dispatcher-tools`: 20 tools / ~2.2K tokens (starter kit + meta-tools)
+- Default for every client: 23 tools / ~3.0K tokens (starter kit + meta-tools + 3 dispatcher tools, all 208 reachable on demand)
 - Full-catalog `tools/list` (`eager_toolsets`): 214 tools (208 registered + 6 meta) / ~34K tokens
 - **0 IPC stubs** (all protobuf methods implemented)
 - **0 unimplemented tools**

@@ -51,9 +51,11 @@ pub unsafe extern "C" fn kicad_plugin_init(config_path: *const c_char) -> c_int 
             auto_load_toolsets: config.auto_load_toolsets,
             // The cdylib is loaded by KiCad's plugin host, which has no
             // `--client` and no CLI flags, so only an explicit config value can
-            // turn either of these on here.
+            // change either of these here. The plugin host's refresh behaviour
+            // is unknown, which is exactly the case the dispatcher default is
+            // for.
             eager_toolsets: config.eager_toolsets_for(None),
-            dispatcher_tools: config.dispatcher_tools_for(false, None),
+            dispatcher_tools: config.dispatcher_tools_for(None),
         };
         match McpHandler::new(server_config).await {
             Ok(handler) => match config.transport {

@@ -188,8 +188,9 @@ Claude Desktop.
 The fix is to give those clients a route to the catalogue that does not depend
 on the listing ever refreshing.
 
-**On Codex this is already the default.** The server is launched as
-`--client codex`, which adds three dispatcher tools to `tools/list`:
+**This is already the default on every client**, Claude Desktop and Codex
+included — you do not need to configure anything. The server adds three
+dispatcher tools to `tools/list`:
 
 | tool | purpose |
 |---|---|
@@ -197,14 +198,15 @@ on the listing ever refreshing.
 | `get_tool_schema` | fetch a tool's real input schema on demand |
 | `execute_konnect_tool` | run any tool by name, whether or not its toolset is loaded |
 
-They are always present, so every tool is reachable from the first call onward.
-Nothing to configure. Baseline cost is ~3.0K tokens against ~2.2K without them.
+They are always present, so every tool is reachable from the first call onward,
+whether or not your client ever acts on `tools/list_changed`. Baseline cost is
+~3.0K tokens against ~2.2K without them.
 
-For any other client that caches its first listing, pass `--dispatcher-tools`,
-or set:
+To turn them off — for a client that refreshes properly and wants the smallest
+possible listing — pass `--no-dispatcher-tools`, or set:
 
 ```json
-{ "dispatcher_tools": true }
+{ "dispatcher_tools": false }
 ```
 
 in `konnect.toml` in the working directory, or a `settings.json` beside the binary.
@@ -215,8 +217,9 @@ That also works, and gives the model native schemas rather than a dispatcher
 call — but it costs roughly 34K tokens of tool schemas in *every* request for
 the whole task, against ~2.2K. It is off by default for every client.
 
-`--no-dispatcher-tools` turns the dispatcher back off for a Codex session that
-does not want it.
+If you are reading this because `load_toolset` appeared to work but the tools
+it named were not callable, that is the bug above and it should no longer
+reproduce on a current build.
 
 Note that `auto_load_toolsets` does **not** solve this. It loads a toolset when
 a tool from it is *called*, which helps only a client that already knows the

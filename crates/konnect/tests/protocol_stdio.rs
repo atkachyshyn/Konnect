@@ -655,29 +655,33 @@ fn list_available_tools_covers_the_whole_catalogue_cheaply() {
     assert!(scoped["tools"][0]["description"].is_string());
 }
 
-/// The default client keeps the small baseline and does NOT pay for dispatcher
-/// tools it does not need — its tool list refreshes, so `load_toolset` works.
+/// Every client gets the dispatcher, including the default one. Claude Desktop
+/// is what #134/#169 were reported against and it launches with no `--client`,
+/// so a default that omits the dispatcher leaves the original reporter broken.
+///
+/// The starter kit still stays small — the dispatcher adds three tools, not a
+/// catalogue.
 #[test]
-fn default_client_gets_neither_dispatcher_nor_eager_exposure() {
+fn default_client_gets_the_dispatcher_but_not_eager_exposure() {
     let home = tempfile::tempdir().unwrap();
     let mut p = McpProcess::spawn_with(None, &[], Some(home.path()));
     let names = listed_tool_names(&mut p);
 
+    for d in DISPATCHER_TOOLS {
+        assert!(
+            names.iter().any(|n| n == d),
+            "default client must get {d} — Claude Desktop passes no --client"
+        );
+    }
+    assert!(names.iter().any(|n| n == "load_toolset"));
     assert!(
         names.len() < 30,
         "default listing should stay near the starter kit, got {}",
         names.len()
     );
-    assert!(names.iter().any(|n| n == "load_toolset"));
-    for d in DISPATCHER_TOOLS {
-        assert!(
-            !names.iter().any(|n| n == d),
-            "default client must not pay for {d}"
-        );
-    }
     assert!(
         !names.iter().any(|n| n == "add_layer"),
-        "pcb_board must not be pre-loaded for the default client"
+        "eager exposure must stay off by default"
     );
 }
 

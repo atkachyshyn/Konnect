@@ -71,9 +71,8 @@ pub struct Config {
     /// three always-present tools can reach all 208 on demand, for roughly a
     /// tenth of the context that pre-loading them costs.
     ///
-    /// `None` means "not stated", which defers to the launching client:
-    /// `--client codex` resolves it to `true`. See
-    /// [`Config::dispatcher_tools_for`].
+    /// `None` means "not stated", which resolves to `true`: on by default for
+    /// every client. See [`Config::dispatcher_tools_for`] for why.
     #[serde(default)]
     pub dispatcher_tools: Option<bool>,
 }
@@ -139,13 +138,24 @@ impl Config {
         Self::resolve(cli_override, self.eager_toolsets, false)
     }
 
-    /// Whether the three dispatcher tools are exposed.
+    /// Whether the three dispatcher tools are exposed. On unless turned off.
     ///
-    /// `client_default` comes from `InstallClient::caches_initial_tool_list`;
-    /// it is passed as a plain bool because this module is also compiled into
-    /// the cdylib, where the installer's client enum does not exist.
-    pub fn dispatcher_tools_for(&self, client_default: bool, cli_override: Option<bool>) -> bool {
-        Self::resolve(cli_override, self.dispatcher_tools, client_default)
+    /// This was briefly keyed to the launching client, on the theory that only
+    /// Codex caches its first `tools/list` and Claude Code refreshes on
+    /// `notifications/tools/list_changed`. That theory does not survive
+    /// contact with how the server is actually launched: #134 and #169 were
+    /// reported against Claude *Desktop*, which shares `InstallClient::Claude`
+    /// with Claude Code and passes no `--client` at all (see
+    /// `examples/claude_desktop_config.example.json`). The client that the bug
+    /// was reported against was the one arrangement left without the fix.
+    ///
+    /// There is no reliable way to tell those two apart at startup, so the
+    /// dispatcher is on for everyone. It costs ~628 tokens against the ~2.2K
+    /// baseline — cheap enough that paying it on a client which does not need
+    /// it beats leaving a client that does need it broken by default.
+    /// `--no-dispatcher-tools` opts out.
+    pub fn dispatcher_tools_for(&self, cli_override: Option<bool>) -> bool {
+        Self::resolve(cli_override, self.dispatcher_tools, true)
     }
 
     /// Load config from the default search path.
@@ -407,14 +417,14 @@ mod tests {
     // who never wrote a config got the starter kit and could not call any tool
     // load_toolset claimed to have loaded (#134, #169).
 
-    /// An unstated dispatcher setting defers to the client. Codex caches the
-    /// first listing and needs the dispatcher; Claude refreshes and does not.
+    /// Unstated means on. Claude Desktop is the client #134/#169 were reported
+    /// against and it passes no `--client`, so anything that leaves the default
+    /// off leaves the original bug in place for the reporter.
     #[test]
-    fn unstated_dispatcher_tools_follows_the_client() {
+    fn dispatcher_tools_default_on_when_unstated() {
         let c = Config::default();
         assert!(c.dispatcher_tools.is_none(), "default must stay unstated");
-        assert!(c.dispatcher_tools_for(true, None), "codex-shaped client");
-        assert!(!c.dispatcher_tools_for(false, None), "claude-shaped client");
+        assert!(c.dispatcher_tools_for(None), "unstated must resolve to on");
     }
 
     /// Eager loading has no client default: it costs roughly ten times the
@@ -431,17 +441,14 @@ mod tests {
     /// including turning the dispatcher off for Codex.
     #[test]
     fn config_overrides_the_client_default() {
-        let on = Config {
-            dispatcher_tools: Some(true),
-            ..Config::default()
-        };
-        assert!(on.dispatcher_tools_for(false, None));
-
         let off = Config {
             dispatcher_tools: Some(false),
             ..Config::default()
         };
-        assert!(!off.dispatcher_tools_for(true, None));
+        assert!(
+            !off.dispatcher_tools_for(None),
+            "config must be able to turn it off"
+        );
 
         let eager = Config {
             eager_toolsets: Some(true),
@@ -458,13 +465,13 @@ mod tests {
             dispatcher_tools: Some(false),
             ..Config::default()
         };
-        assert!(off.dispatcher_tools_for(false, Some(true)));
+        assert!(off.dispatcher_tools_for(Some(true)));
 
         let on = Config {
             dispatcher_tools: Some(true),
             ..Config::default()
         };
-        assert!(!on.dispatcher_tools_for(true, Some(false)));
+        assert!(!on.dispatcher_tools_for(Some(false)));
 
         let eager = Config {
             eager_toolsets: Some(true),

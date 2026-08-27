@@ -135,15 +135,15 @@ async fn main() -> Result<()> {
 
     info!("Konnect v{} starting", env!("CARGO_PKG_VERSION"));
 
-    // Codex caches the tool list from the first `tools/list` and never acts on
-    // `notifications/tools/list_changed`, so anything outside the starter kit
-    // would stay uncallable there for the whole session (#134, #169). The
-    // dispatcher tools cure that without enlarging the listing; eager loading
-    // cures it too but costs roughly ten times the context, so it stays opt-in.
-    // Config and the explicit CLI switches override both.
+    // A client that caches its first `tools/list` and ignores
+    // `notifications/tools/list_changed` can never call anything outside the
+    // starter kit (#134, #169). We cannot tell such a client apart at startup —
+    // Claude Desktop, which the issues were reported against, is
+    // indistinguishable from Claude Code here — so the dispatcher is on for
+    // everyone. Eager loading cures the same thing at roughly ten times the
+    // context, so it stays opt-in. Config and the CLI switches override both.
     let eager_toolsets = config.eager_toolsets_for(eager_override);
-    let dispatcher_tools =
-        config.dispatcher_tools_for(client.caches_initial_tool_list(), dispatcher_override);
+    let dispatcher_tools = config.dispatcher_tools_for(dispatcher_override);
     info!(
         client = %client,
         eager_toolsets,

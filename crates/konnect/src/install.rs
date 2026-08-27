@@ -18,30 +18,6 @@ pub enum InstallClient {
 }
 
 impl InstallClient {
-    /// Whether this client caches the tool list from the first `tools/list` and
-    /// never re-fetches it on `notifications/tools/list_changed`.
-    ///
-    /// For such a client the router's lazy loading is not a context saving but
-    /// a wall: `load_toolset` activates the tools server-side and reports their
-    /// names, yet the client never receives their schemas, so it has nothing to
-    /// invoke and every tool outside the starter kit stays uncallable for the
-    /// whole session (#134, #169).
-    ///
-    /// These clients get the dispatcher tools by default, which reach the whole
-    /// catalogue without enlarging `tools/list`. Pre-loading every toolset
-    /// (`--eager-toolsets`) also cures it but costs about ten times the context,
-    /// so it is opt-in rather than the default.
-    pub fn caches_initial_tool_list(self) -> bool {
-        match self {
-            // Codex reads tools/list once per task and ignores the change
-            // notification.
-            Self::Codex => true,
-            // Claude Code re-fetches on notifications/tools/list_changed, so it
-            // keeps the small ~2K baseline and expands on demand.
-            Self::Claude => false,
-        }
-    }
-
     fn marker_name(self) -> &'static str {
         match self {
             Self::Claude => ".installed-claude",
@@ -714,16 +690,6 @@ mod tests {
             InstallClient::Claude
         );
         assert!(client_from_server_args(&["--nope".to_string()]).is_err());
-    }
-
-    /// Codex is the client the router's lazy loading cannot serve, and Claude
-    /// is the one it can. If this ever flips silently, Codex users get the
-    /// starter kit and a set of tools that report as loaded but cannot be
-    /// called (#134, #169).
-    #[test]
-    fn only_codex_caches_the_initial_tool_list() {
-        assert!(InstallClient::Codex.caches_initial_tool_list());
-        assert!(!InstallClient::Claude.caches_initial_tool_list());
     }
 
     #[test]
