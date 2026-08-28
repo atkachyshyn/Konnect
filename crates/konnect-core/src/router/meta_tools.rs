@@ -259,6 +259,34 @@ pub async fn handle_meta_tool(
     }
 }
 
+/// Split a search query into lowercase terms.
+fn search_terms(query: &str) -> Vec<String> {
+    query
+        .to_lowercase()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Whether a tool matches every term in the query.
+///
+/// Two details that a plain `contains` on the raw query gets wrong, and that
+/// a caller hits immediately:
+///
+/// - Tool names are snake_case, so a natural-language search like
+///   "symbol text" must still find `add_symbol_text`. Underscores are treated
+///   as spaces for matching.
+/// - Multi-word queries are AND-ed across name and description together,
+///   rather than required to appear as one contiguous phrase. "symbol text"
+///   should find a symbol-text tool whether the words are adjacent or not.
+fn matches_search(name: &str, description: &str, terms: &[String]) -> bool {
+    if terms.is_empty() {
+        return true;
+    }
+    let haystack = format!("{} {}", name.replace('_', " "), description).to_lowercase();
+    terms.iter().all(|term| haystack.contains(term.as_str()))
+}
+
 /// Browse the catalogue without loading any of it.
 ///
 /// The default shape is names-only, grouped by toolset, because the whole point
@@ -292,22 +320,16 @@ async fn handle_list_available_tools(
     }
 
     if let Some(query) = args["search"].as_str() {
-        let needle = query.to_lowercase();
+        let terms = search_terms(query);
         let matches: Vec<Value> = all
             .iter()
-            .filter(|(_, d)| {
-                d.name.to_lowercase().contains(&needle)
-                    || d.description.to_lowercase().contains(&needle)
-            })
+            .filter(|(_, d)| matches_search(d.name, d.description, &terms))
             .map(|(ts, d)| json!({ "name": d.name, "toolset": ts, "description": d.description }))
             .collect();
         let builtin_matches: Vec<Value> = meta_tool_descriptions()
             .into_iter()
             .chain(dispatcher_tool_descriptions())
-            .filter(|b| {
-                b.name.to_lowercase().contains(&needle)
-                    || b.description.to_lowercase().contains(&needle)
-            })
+            .filter(|b| matches_search(&b.name, &b.description, &terms))
             .map(|b| {
                 json!({ "name": b.name, "toolset": Value::Null, "always_available": true,
                              "description": b.description })

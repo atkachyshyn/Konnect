@@ -655,6 +655,33 @@ fn list_available_tools_covers_the_whole_catalogue_cheaply() {
     assert!(scoped["tools"][0]["description"].is_string());
 }
 
+/// A natural-language search must find snake_case tools. `search: "symbol text"`
+/// finding nothing was the first thing an end-to-end run hit: the query was
+/// substring-matched whole against `add_symbol_text`, so the space never
+/// matched the underscore.
+#[test]
+fn search_finds_snake_case_tools_from_natural_language() {
+    let mut p = codex();
+    for (query, expected) in [
+        ("symbol text", "add_symbol_text"),
+        ("symbol graphics", "set_symbol_graphics"),
+        ("net class", "create_netclass"),
+    ] {
+        let body =
+            McpProcess::tool_body(&p.call_tool("list_available_tools", json!({ "search": query })));
+        let names: Vec<&str> = body["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert!(
+            names.contains(&expected),
+            "search '{query}' should find {expected}, got {names:?}"
+        );
+    }
+}
+
 /// Every client gets the dispatcher, including the default one. Claude Desktop
 /// is what #134/#169 were reported against and it launches with no `--client`,
 /// so a default that omits the dispatcher leaves the original reporter broken.
