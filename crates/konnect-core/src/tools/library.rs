@@ -429,6 +429,8 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_get_symbol_info(args, ctx).await }
         ),
+        super::symbol_graphics::set_symbol_graphics_tool(),
+        super::symbol_graphics::add_symbol_text_tool(),
     ];
     // Grouped after `create_footprint` so the footprint-editing tools read as
     // one family in `tools/list`. Anchored on that tool's name rather than a

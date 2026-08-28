@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **19 toolsets** organized into 10 categories
-- **208 registered tools** + **6 always-visible meta-tools** = **214 total**
+- **210 registered tools** + **6 always-visible meta-tools** = **216 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2.2K tokens instead of ~34K. (Every client also gets three dispatcher tools — `list_available_tools` / `get_tool_schema` / `execute_konnect_tool` — which reach every tool below on demand, for ~3.0K total. They exist for clients that cache their first listing rather than refreshing on `tools/list_changed`, for which the discovery pattern described next cannot work at all.) The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -290,7 +290,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 
 ## Library
 
-### `library` · 19 tools
+### `library` · 21 tools
 **Purpose:** Search, register, and author symbol and footprint libraries — create symbols and footprints, edit pads, graphics, metadata and 3D models.
 **Source:** [`crates/konnect-core/src/tools/library.rs`](crates/konnect-core/src/tools/library.rs)
 
@@ -309,6 +309,8 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `list_symbols_in_library` | List all symbol names defined in a `.kicad_sym` library file. |
 | `register_symbol_library` | Register a `.kicad_sym` library file in the KiCAD global or project symbol table. Reports `inserted`/`unchanged`/`updated`; set `replace_existing` to update a stale URI in place while preserving entry metadata. |
 | `unregister_symbol_library` | Remove one symbol library entry from the global or project `sym-lib-table`. Removes only the named nickname in the named scope and preserves every other entry; reports `removed`/`absent`. Does not touch the `.kicad_sym` file. |
+| `set_symbol_graphics` | Append, replace or delete graphical text inside an existing `.kicad_sym` symbol or one of its unit sub-symbols. Byte-range S-expression edits, so pins, pin names/numbers, electrical types, unit membership, properties and untouched graphics are preserved structurally. Only `text` is writable; the selector matches text/rectangle/line/circle/arc for replace and delete. Zero matches on replace/delete is a non-mutating error unless `allow_empty`. |
+| `add_symbol_text` | Add one line of graphical text to a symbol or unit sub-symbol — the common `set_symbol_graphics(mode="append")` case, without the selector and graphics array. |
 | `list_symbol_libraries` | List all registered symbol libraries (global and/or project). |
 | `search_symbols` | Search for symbols across all registered libraries by name or keyword. |
 | `list_library_footprints` | List all footprints in a specific registered library (`.pretty` directory). |

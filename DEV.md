@@ -303,7 +303,7 @@ Source: [`crates/konnect-core/src/observability.rs`](crates/konnect-core/src/obs
 
 ## Tool Routing (Starter Kit + On-Demand Loading)
 
-`tools/list` never carries all 208 tools (214 with the 6 meta-tools) by default. Measured against the current catalogue that listing is ~34K tokens of tool schemas, and they sit in every request for the whole task — not once per listing, which is what an earlier version of this section claimed. The starter baseline is ~2.2K.
+`tools/list` never carries all 210 tools (216 with the 6 meta-tools) by default. Measured against the current catalogue that listing is ~34K tokens of tool schemas, and they sit in every request for the whole task — not once per listing, which is what an earlier version of this section claimed. The starter baseline is ~2.2K.
 
 The lazy path works like this:
 
@@ -319,7 +319,7 @@ The lazy path works like this:
 
   | tool | purpose |
   |---|---|
-  | `list_available_tools` | browse all 208, names-only by default; `toolset=` or `search=` for descriptions |
+  | `list_available_tools` | browse all 210, names-only by default; `toolset=` or `search=` for descriptions |
   | `get_tool_schema` | fetch one tool's real input schema on demand (also resolves meta-tools) |
   | `execute_konnect_tool` | run any registered tool by name, loaded or not |
 
@@ -406,10 +406,10 @@ convention for other `kicad-cli`-calling code.
 
 ## Current Stats
 
-- **19 toolsets, 208 tools** + 6 meta-tools (4 routing + 2 observability — see `tool-directory.md`)
+- **19 toolsets, 210 tools** + 6 meta-tools (4 routing + 2 observability — see `tool-directory.md`)
 - With `--no-dispatcher-tools`: 20 tools / ~2.2K tokens (starter kit + meta-tools)
-- Default for every client: 23 tools / ~3.0K tokens (starter kit + meta-tools + 3 dispatcher tools, all 208 reachable on demand)
-- Full-catalog `tools/list` (`eager_toolsets`): 214 tools (208 registered + 6 meta) / ~34K tokens
+- Default for every client: 23 tools / ~3.0K tokens (starter kit + meta-tools + 3 dispatcher tools, all 210 reachable on demand)
+- Full-catalog `tools/list` (`eager_toolsets`): 216 tools (210 registered + 6 meta) / ~34K tokens
 - **0 IPC stubs** (all protobuf methods implemented)
 - **0 unimplemented tools**
 - **Specctra DSN/SES are PCB-editor operations**, not `kicad-cli` commands. Konnect
