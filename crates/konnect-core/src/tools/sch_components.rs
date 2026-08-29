@@ -15,6 +15,7 @@ use konnect_sexp::{
     commit_command,
     geometry::snap_point,
     parse_sexp,
+    parser::SexpNode,
     schematic::{
         extract_lib_pins_for_unit, extract_symbol_instances, find_lib_symbol, pin_endpoint,
         pin_outward_direction, read_schematic,
@@ -113,7 +114,11 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "edit_schematic_component",
-            "Update fields (Reference, Value, Footprint, custom properties) consistently across every placed unit of a component.",
+            "Update fields (Reference, Value, Footprint, custom properties) and population metadata \
+             consistently across every placed unit of a component. Optional booleans preserve \
+             existing state when omitted: dnp writes KiCad's native (dnp yes/no), \
+             exclude_from_bom writes (in_bom no/yes), and exclude_from_board writes \
+             (on_board no/yes).",
             json!({
                 "type": "object",
                 "properties": {
@@ -126,6 +131,18 @@ pub fn tools() -> Vec<ToolDef> {
                     "fields": {
                         "type": "object",
                         "description": "Additional property fields to set as key:value pairs"
+                    },
+                    "dnp": {
+                        "type": "boolean",
+                        "description": "Set or clear KiCad's Do Not Populate state for every placed unit. Omit to preserve the existing (dnp yes/no) value."
+                    },
+                    "exclude_from_bom": {
+                        "type": "boolean",
+                        "description": "Set true to write KiCad (in_bom no); false writes (in_bom yes). Omit to preserve the existing BOM inclusion state."
+                    },
+                    "exclude_from_board": {
+                        "type": "boolean",
+                        "description": "Set true to write KiCad (on_board no); false writes (on_board yes). Omit to preserve the existing board inclusion state."
                     }
                 },
                 "required": ["schematic", "reference"]
@@ -858,6 +875,177 @@ fn set_property_value(
     ))
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct ComponentMetadataUpdate {
+    pub dnp: Option<bool>,
+    pub exclude_from_bom: Option<bool>,
+    pub exclude_from_board: Option<bool>,
+}
+
+impl ComponentMetadataUpdate {
+    fn is_empty(self) -> bool {
+        self.dnp.is_none() && self.exclude_from_bom.is_none() && self.exclude_from_board.is_none()
+    }
+}
+
+fn requested_bool(args: &serde_json::Value, field: &str) -> Result<Option<bool>, CallToolResult> {
+    match args.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => value.as_bool().map(Some).ok_or_else(|| {
+            CallToolResult::error(format!("'{field}' must be a boolean when provided"))
+        }),
+    }
+}
+
+pub(super) fn component_metadata_from_args(
+    args: &serde_json::Value,
+) -> Result<ComponentMetadataUpdate, CallToolResult> {
+    Ok(ComponentMetadataUpdate {
+        dnp: requested_bool(args, "dnp")?,
+        exclude_from_bom: requested_bool(args, "exclude_from_bom")?,
+        exclude_from_board: requested_bool(args, "exclude_from_board")?,
+    })
+}
+
+fn metadata_tokens(update: ComponentMetadataUpdate) -> Vec<(&'static str, bool, &'static str)> {
+    let mut tokens = Vec::new();
+    if let Some(dnp) = update.dnp {
+        tokens.push(("dnp", dnp, "dnp"));
+    }
+    if let Some(exclude) = update.exclude_from_bom {
+        tokens.push(("in_bom", !exclude, "exclude_from_bom"));
+    }
+    if let Some(exclude) = update.exclude_from_board {
+        tokens.push(("on_board", !exclude, "exclude_from_board"));
+    }
+    tokens
+}
+
+fn bool_kw(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+fn bool_child_value_range(
+    node: &SexpNode,
+    abs_start: usize,
+    content: &str,
+) -> Option<(usize, usize)> {
+    let value = node.get(1)?.as_str()?;
+    if value != "yes" && value != "no" {
+        return None;
+    }
+    let (_, block_end) = konnect_sexp::writer::find_balanced_block(content, abs_start)?;
+    let block = &content[abs_start..block_end];
+    let rel = block.find(value)?;
+    Some((abs_start + rel, abs_start + rel + value.len()))
+}
+
+fn line_indent_at(source: &str, offset: usize) -> String {
+    let line_start = source[..offset].rfind('\n').map_or(0, |i| i + 1);
+    source[line_start..offset]
+        .chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .collect()
+}
+
+fn direct_symbol_children(block: &str) -> Result<Vec<(usize, usize, String)>, String> {
+    let mut children = Vec::new();
+    for (start, stop) in konnect_sexp::writer::find_direct_child_blocks(block, "symbol") {
+        let node = parse_sexp(&block[start..stop]).map_err(|e| e.to_string())?;
+        if let Some(tag) = node.head() {
+            children.push((start, stop, tag.to_string()));
+        }
+    }
+    Ok(children)
+}
+
+fn metadata_insert_offset(
+    block_start: usize,
+    block_end: usize,
+    tag: &str,
+    children: &[(usize, usize, String)],
+) -> usize {
+    let anchors: &[&str] = match tag {
+        "dnp" => &["on_board", "in_bom", "exclude_from_sim"],
+        "on_board" => &["in_bom", "exclude_from_sim"],
+        "in_bom" => &["exclude_from_sim"],
+        _ => &[],
+    };
+    for anchor in anchors {
+        if let Some((_, stop, _)) = children.iter().rev().find(|(_, _, child)| child == anchor) {
+            return block_start + *stop;
+        }
+    }
+    if let Some((start, _, _)) = children
+        .iter()
+        .find(|(_, _, child)| matches!(child.as_str(), "fields_autoplaced" | "uuid" | "property"))
+    {
+        return block_start + *start;
+    }
+    block_end.saturating_sub(1)
+}
+
+pub(super) fn component_metadata_edits(
+    content: &str,
+    reference: &str,
+    update: ComponentMetadataUpdate,
+) -> Result<(Vec<SexpEdit>, Vec<String>), String> {
+    if update.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let blocks = find_all_symbol_instance_blocks(content, reference);
+    if blocks.is_empty() {
+        return Err(format!("Component '{reference}' not found"));
+    }
+
+    let nl = if content.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let mut edits = Vec::new();
+    let mut changes = Vec::new();
+    for (tag, ki_value, public_name) in metadata_tokens(update) {
+        let mut units = 0usize;
+        for (block_start, block_end) in &blocks {
+            let block = &content[*block_start..*block_end];
+            let children = direct_symbol_children(block)?;
+            if let Some((start, stop, _)) = children.iter().find(|(_, _, child)| child == tag) {
+                let node = parse_sexp(&block[*start..*stop]).map_err(|e| e.to_string())?;
+                let abs_start = *block_start + *start;
+                let Some((value_start, value_end)) =
+                    bool_child_value_range(&node, abs_start, content)
+                else {
+                    return Err(format!("Cannot parse ({tag} ...) on '{reference}'"));
+                };
+                edits.push(SexpEdit::replace(value_start, value_end, bool_kw(ki_value)));
+            } else {
+                let symbol_indent = line_indent_at(content, *block_start);
+                let child_indent = children
+                    .first()
+                    .map(|(start, _, _)| line_indent_at(content, *block_start + *start))
+                    .unwrap_or_else(|| format!("{symbol_indent}\t"));
+                let insert_at = metadata_insert_offset(*block_start, *block_end, tag, &children);
+                edits.push(SexpEdit::insert(
+                    insert_at,
+                    format!("{nl}{child_indent}({tag} {})", bool_kw(ki_value)),
+                ));
+            }
+            units += 1;
+        }
+        let public_value = match tag {
+            "in_bom" | "on_board" => !ki_value,
+            _ => ki_value,
+        };
+        changes.push(format!("{public_name} → {public_value} ({units} unit(s))"));
+    }
+    Ok((edits, changes))
+}
+
 /// Rewrite the `(reference "…")` inside every unit's `(instances …)` block.
 ///
 /// Returns the updated content and how many were rewritten. A multi-unit part
@@ -907,6 +1095,10 @@ async fn handle_edit_schematic_component(
     let sch_path = get_path(args, "schematic")?;
     let reference = match require_str(args, "reference") {
         Ok(r) => r.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let metadata_update = match component_metadata_from_args(args) {
+        Ok(update) => update,
         Err(e) => return Ok(e),
     };
 
@@ -987,6 +1179,16 @@ async fn handle_edit_schematic_component(
                 Err(why) => errors.push(format!("{name}: {why}")),
             }
         }
+    }
+
+    match component_metadata_edits(&content, &reference, metadata_update) {
+        Ok((edits, metadata_changes)) => {
+            if !edits.is_empty() {
+                content = apply_edits(content, edits);
+                changed.extend(metadata_changes);
+            }
+        }
+        Err(why) => errors.push(format!("metadata: {why}")),
     }
 
     // A request that changed nothing is a failure, not a success — silently
@@ -1074,6 +1276,11 @@ async fn handle_get_schematic_component(
         "reference": anchor.reference().unwrap_or("?"),
         "value": anchor.value_str().unwrap_or(""),
         "footprint": anchor.footprint().unwrap_or(""),
+        "dnp": anchor.dnp,
+        "exclude_from_bom": !anchor.in_bom,
+        "exclude_from_board": !anchor.on_board,
+        "in_bom": anchor.in_bom,
+        "on_board": anchor.on_board,
         "lib_id": anchor.lib_id,
         "x": x,
         "y": y,
@@ -1104,6 +1311,11 @@ async fn handle_list_schematic_components(
                 "reference": sym.reference().unwrap_or("?"),
                 "value": sym.value_str().unwrap_or(""),
                 "footprint": sym.footprint().unwrap_or(""),
+                "dnp": sym.dnp,
+                "exclude_from_bom": !sym.in_bom,
+                "exclude_from_board": !sym.on_board,
+                "in_bom": sym.in_bom,
+                "on_board": sym.on_board,
                 "lib_id": sym.lib_id,
                 "x": x,
                 "y": y,
@@ -3682,6 +3894,202 @@ mod edit_component_tests {
             reply.contains("Reference"),
             "the refusal is reported: {reply}"
         );
+    }
+
+    #[tokio::test]
+    async fn dnp_and_bom_metadata_are_written_as_native_kicad_flags() {
+        let (out, reply) = edit(json!({
+            "reference": "R1",
+            "dnp": true,
+            "exclude_from_bom": true,
+            "exclude_from_board": false
+        }))
+        .await;
+        assert!(out.contains("\n\t\t(dnp yes)"), "{out}");
+        assert!(out.contains("\n\t\t(in_bom no)"), "{out}");
+        assert!(out.contains("\n\t\t(on_board yes)"), "{out}");
+        assert!(
+            out.contains("(property \"Value\" \"10k\""),
+            "value preserved:\n{out}"
+        );
+        assert!(reply.contains("dnp"), "reply reports metadata: {reply}");
+        let mut f = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
+        f.write_all(out.as_bytes()).unwrap();
+        f.flush().unwrap();
+        let sch = cse::Schematic::load(f.path()).unwrap();
+        let r1 = sch.symbols.by_reference("R1").unwrap();
+        assert!(r1.dnp);
+        assert!(!r1.in_bom);
+        assert!(r1.on_board);
+    }
+
+    #[tokio::test]
+    async fn clearing_dnp_preserves_omitted_bom_and_board_flags() {
+        let (out, _) = edit(json!({
+            "reference": "R1",
+            "dnp": true,
+            "exclude_from_bom": true,
+            "exclude_from_board": true
+        }))
+        .await;
+        let mut f = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
+        f.write_all(out.as_bytes()).unwrap();
+        f.flush().unwrap();
+
+        let def = tools()
+            .into_iter()
+            .find(|t| t.name == "edit_schematic_component")
+            .unwrap();
+        let ctx = Arc::new(ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+                dispatcher_tools: false,
+            },
+            Arc::new(ToolRouter::new()),
+        ));
+        let res = (def.handler)(
+            &json!({
+                "schematic": f.path().to_str().unwrap(),
+                "reference": "R1",
+                "dnp": false
+            }),
+            ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!res.is_error, "{:?}", res.content);
+        let out = std::fs::read_to_string(f.path()).unwrap();
+        assert!(out.contains("\n\t\t(dnp no)"), "{out}");
+        assert!(
+            out.contains("\n\t\t(in_bom no)"),
+            "omitted BOM state preserved:\n{out}"
+        );
+        assert!(
+            out.contains("\n\t\t(on_board no)"),
+            "omitted board state preserved:\n{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_component_reports_population_metadata() {
+        let (out, _) = edit(json!({
+            "reference": "R1",
+            "dnp": true,
+            "exclude_from_bom": true
+        }))
+        .await;
+        let mut f = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
+        f.write_all(out.as_bytes()).unwrap();
+        f.flush().unwrap();
+        let res = handle_get_schematic_component(
+            &json!({
+                "schematic": f.path().to_str().unwrap(),
+                "reference": "R1"
+            }),
+            &ToolContext::new(
+                ServerConfig {
+                    kicad_cli: String::new(),
+                    kicad_binary: String::new(),
+                    ipc_address: String::new(),
+                    project_dir: None,
+                    jlcpcb_db_path: None,
+                    auto_load_toolsets: false,
+                    eager_toolsets: false,
+                    dispatcher_tools: false,
+                },
+                Arc::new(ToolRouter::new()),
+            ),
+        )
+        .await
+        .unwrap();
+        let text = match res.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text,
+            other => panic!("expected text, got {other:?}"),
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["dnp"], json!(true));
+        assert_eq!(body["exclude_from_bom"], json!(true));
+        assert_eq!(body["exclude_from_board"], json!(false));
+    }
+
+    #[tokio::test]
+    #[ignore = "manual smoke: requires kicad-cli"]
+    async fn dnp_round_trip_controls_kicad_bom_export() {
+        let kicad_cli = std::env::var("KICAD_CLI").unwrap_or_else(|_| {
+            "/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli".to_string()
+        });
+        assert!(
+            std::path::Path::new(&kicad_cli).exists(),
+            "kicad-cli not found at {kicad_cli}; set KICAD_CLI"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let schematic = dir.path().join("bom.kicad_sch");
+        std::fs::write(&schematic, SCH).unwrap();
+
+        let def = tools()
+            .into_iter()
+            .find(|t| t.name == "edit_schematic_component")
+            .unwrap();
+        let ctx = Arc::new(ToolContext::new(
+            ServerConfig {
+                kicad_cli: kicad_cli.clone(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+                dispatcher_tools: false,
+            },
+            Arc::new(ToolRouter::new()),
+        ));
+        let result = (def.handler)(
+            &json!({
+                "schematic": schematic,
+                "reference": "R1",
+                "dnp": true
+            }),
+            ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let reloaded = cse::Schematic::load(&schematic).unwrap();
+        assert!(reloaded.symbols.by_reference("R1").unwrap().dnp);
+
+        let included = dir.path().join("included.csv");
+        let excluded = dir.path().join("excluded.csv");
+        crate::tools::cli::export_bom(
+            &kicad_cli,
+            &schematic,
+            &included,
+            &crate::tools::cli::BomOptions {
+                exclude_dnp: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        crate::tools::cli::export_bom(
+            &kicad_cli,
+            &schematic,
+            &excluded,
+            &crate::tools::cli::BomOptions {
+                exclude_dnp: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(std::fs::read_to_string(included).unwrap().contains("R1"));
+        assert!(!std::fs::read_to_string(excluded).unwrap().contains("R1"));
     }
 }
 

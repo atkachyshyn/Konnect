@@ -30,6 +30,7 @@ use std::collections::HashSet;
 use super::sch_connectivity::{ConnectivityIndex, COINCIDENT_TOLERANCE};
 // Re-use the single-item component placer and pin-to-pin router.
 use super::sch_components::place_one_component;
+use super::sch_components::{component_metadata_edits, component_metadata_from_args};
 use super::sch_wiring::{resolve_pin_endpoint, resolve_placed_pin, route_between};
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
@@ -162,15 +163,17 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "batch_edit_schematic_components",
-            "Apply field updates (Value, Footprint, custom properties) to multiple components \
-             in a single atomic file write.",
+            "Apply field updates (Value, Footprint, custom properties) and population metadata \
+             to multiple components in a single atomic file write. Optional booleans preserve \
+             existing state when omitted: dnp writes KiCad (dnp yes/no), exclude_from_bom writes \
+             (in_bom no/yes), and exclude_from_board writes (on_board no/yes).",
             json!({
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
                     "edits": {
                         "type": "array",
-                        "description": "List of {reference, value?, footprint?, fields?} edit objects",
+                        "description": "List of {reference, value?, footprint?, fields?, dnp?, exclude_from_bom?, exclude_from_board?} edit objects",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -180,6 +183,18 @@ pub fn tools() -> Vec<ToolDef> {
                                 "fields": {
                                     "type": "object",
                                     "description": "Additional property fields as key:value pairs"
+                                },
+                                "dnp": {
+                                    "type": "boolean",
+                                    "description": "Set or clear KiCad's Do Not Populate state for every placed unit. Omit to preserve existing state."
+                                },
+                                "exclude_from_bom": {
+                                    "type": "boolean",
+                                    "description": "Set true to write KiCad (in_bom no); false writes (in_bom yes). Omit to preserve existing state."
+                                },
+                                "exclude_from_board": {
+                                    "type": "boolean",
+                                    "description": "Set true to write KiCad (on_board no); false writes (on_board yes). Omit to preserve existing state."
                                 }
                             },
                             "required": ["reference"]
@@ -967,6 +982,17 @@ async fn handle_batch_edit(
             } else {
                 format!("{} → {}", field, new_val)
             });
+        }
+
+        match component_metadata_from_args(edit_spec) {
+            Ok(update) => match component_metadata_edits(&content, reference, update) {
+                Ok((edits, metadata_changes)) => {
+                    file_edits.extend(edits);
+                    component_changes.extend(metadata_changes);
+                }
+                Err(why) => errors.push(format!("{reference}: metadata: {why}")),
+            },
+            Err(result) => errors.push(format!("{reference}: {}", error_text(&result))),
         }
 
         if !component_changes.is_empty() {
@@ -2441,6 +2467,63 @@ mod insert_order_tests {
             close > inst,
             "this test is meaningless if the last paren precedes the instances"
         );
+    }
+}
+
+#[cfg(test)]
+mod batch_edit_metadata_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::{ServerConfig, ToolContext};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+                dispatcher_tools: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    const SCH: &str = "(kicad_sch\n\t(version 20250610)\n\t(generator \"eeschema\")\n\t(uuid \"root\")\n\t(lib_symbols\n\t\t(symbol \"Device:C\"\n\t\t\t(property \"Reference\" \"C\" (at 0 0 0))\n\t\t)\n\t)\n\t(symbol\n\t\t(lib_id \"Device:C\")\n\t\t(at 10 10 0)\n\t\t(unit 1)\n\t\t(in_bom yes)\n\t\t(on_board yes)\n\t\t(dnp no)\n\t\t(uuid \"c1\")\n\t\t(property \"Reference\" \"C1\" (at 10 8 0))\n\t\t(property \"Value\" \"100n\" (at 10 12 0))\n\t)\n\t(symbol\n\t\t(lib_id \"Device:C\")\n\t\t(at 20 10 0)\n\t\t(unit 1)\n\t\t(in_bom yes)\n\t\t(on_board yes)\n\t\t(dnp no)\n\t\t(uuid \"c2\")\n\t\t(property \"Reference\" \"C2\" (at 20 8 0))\n\t\t(property \"Value\" \"1u\" (at 20 12 0))\n\t)\n)\n";
+
+    #[tokio::test]
+    async fn batch_edit_writes_population_metadata_per_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("batch.kicad_sch");
+        std::fs::write(&path, SCH).unwrap();
+
+        let result = handle_batch_edit(
+            &json!({
+                "schematic": path.to_str().unwrap(),
+                "edits": [
+                    { "reference": "C1", "dnp": true, "exclude_from_bom": true },
+                    { "reference": "C2", "dnp": false, "exclude_from_board": true }
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let out = std::fs::read_to_string(&path).unwrap();
+        let c1_start = out.find("(property \"Reference\" \"C1\"").unwrap();
+        let c2_start = out.find("(property \"Reference\" \"C2\"").unwrap();
+        let c1 = &out[..c2_start];
+        let c2 = &out[c1_start..];
+        assert!(c1.contains("(dnp yes)"), "{out}");
+        assert!(c1.contains("(in_bom no)"), "{out}");
+        assert!(c2.contains("(dnp no)"), "{out}");
+        assert!(c2.contains("(on_board no)"), "{out}");
     }
 }
 
