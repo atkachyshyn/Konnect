@@ -1,9 +1,9 @@
-//! Graphical text editing inside an existing `.kicad_sym` symbol definition.
+//! Graphical primitive editing inside an existing `.kicad_sym` symbol definition.
 //!
 //! `create_symbol` writes a whole symbol; there was no way to add a caption to
 //! one already on disk without editing the file by hand, which is exactly what
-//! Konnect exists to prevent. These tools close that gap for the one primitive
-//! a caller actually needs to author after the fact: `(text …)`.
+//! Konnect exists to prevent. These tools close that gap for project-local
+//! text, line/polyline, rectangle, circle and arc edits.
 //!
 //! Everything here is a byte-range edit against untouched source, never a
 //! re-serialization of the symbol. That is what makes the preservation
@@ -285,6 +285,188 @@ impl SymbolText {
     }
 }
 
+#[derive(Debug, Clone)]
+struct StrokeFill {
+    stroke_width_mm: f64,
+    stroke_type: String,
+    fill: String,
+}
+
+impl StrokeFill {
+    fn parse(value: &serde_json::Value, index: usize) -> Result<Self, Error> {
+        let at = |field: &str| format!("graphics[{index}].{field}");
+        let stroke_width_mm = match value
+            .get("stroke_width_mm")
+            .or_else(|| value.get("stroke_width"))
+        {
+            None | Some(serde_json::Value::Null) => 0.254,
+            Some(v) => v
+                .as_f64()
+                .filter(|n| n.is_finite() && *n >= 0.0)
+                .ok_or_else(|| {
+                    invalid(
+                        at("stroke_width_mm"),
+                        "must be a finite non-negative number",
+                    )
+                })?,
+        };
+        let stroke_type = value["stroke_type"].as_str().unwrap_or("default");
+        if !matches!(
+            stroke_type,
+            "default" | "solid" | "dash" | "dot" | "dash_dot" | "dash_dot_dot"
+        ) {
+            return Err(invalid(
+                at("stroke_type"),
+                "must be default, solid, dash, dot, dash_dot or dash_dot_dot",
+            ));
+        }
+        let fill = value["fill"].as_str().unwrap_or("none");
+        if !matches!(fill, "none" | "background" | "outline") {
+            return Err(invalid(
+                at("fill"),
+                "must be none, background or outline for KiCad symbol graphics",
+            ));
+        }
+        if stroke_width_mm == 0.0 && fill == "none" {
+            return Err(invalid(
+                at("stroke_width_mm"),
+                "must be positive when fill is none",
+            ));
+        }
+        Ok(Self {
+            stroke_width_mm,
+            stroke_type: stroke_type.to_string(),
+            fill: fill.to_string(),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SymbolPolyline {
+    points: Vec<(f64, f64)>,
+    style: StrokeFill,
+}
+
+#[derive(Debug, Clone)]
+struct SymbolRectangle {
+    start: (f64, f64),
+    end: (f64, f64),
+    style: StrokeFill,
+}
+
+#[derive(Debug, Clone)]
+struct SymbolCircle {
+    center: (f64, f64),
+    radius_mm: f64,
+    style: StrokeFill,
+}
+
+#[derive(Debug, Clone)]
+struct SymbolArc {
+    start: (f64, f64),
+    mid: (f64, f64),
+    end: (f64, f64),
+    style: StrokeFill,
+}
+
+#[derive(Debug, Clone)]
+enum SymbolGraphic {
+    Text(SymbolText),
+    Polyline(SymbolPolyline),
+    Rectangle(SymbolRectangle),
+    Circle(SymbolCircle),
+    Arc(SymbolArc),
+}
+
+impl SymbolGraphic {
+    fn parse(value: &serde_json::Value, index: usize) -> Result<Self, Error> {
+        let at = |field: &str| format!("graphics[{index}].{field}");
+        match value["kind"].as_str().unwrap_or("text") {
+            "text" => Ok(Self::Text(SymbolText::parse(value, index)?)),
+            "line" | "polyline" => {
+                let points = if let Some(items) = value["points"].as_array() {
+                    let points: Result<Vec<_>, _> = items
+                        .iter()
+                        .enumerate()
+                        .map(|(point_index, point)| {
+                            parse_point(point, &format!("graphics[{index}].points[{point_index}]"))
+                        })
+                        .collect();
+                    points?
+                } else {
+                    vec![
+                        parse_point(&value["start"], &at("start"))?,
+                        parse_point(&value["end"], &at("end"))?,
+                    ]
+                };
+                if points.len() < 2 {
+                    return Err(invalid(at("points"), "must contain at least two points"));
+                }
+                Ok(Self::Polyline(SymbolPolyline {
+                    points,
+                    style: StrokeFill::parse(value, index)?,
+                }))
+            }
+            "rectangle" => Ok(Self::Rectangle(SymbolRectangle {
+                start: parse_point(&value["start"], &at("start"))?,
+                end: parse_point(&value["end"], &at("end"))?,
+                style: StrokeFill::parse(value, index)?,
+            })),
+            "circle" => {
+                let radius_mm = match value.get("radius_mm").or_else(|| value.get("radius")) {
+                    Some(v) => v
+                        .as_f64()
+                        .filter(|n| n.is_finite() && *n > 0.0)
+                        .ok_or_else(|| invalid(at("radius_mm"), "must be a finite number greater than zero"))?,
+                    None => return Err(invalid(at("radius_mm"), "missing")),
+                };
+                Ok(Self::Circle(SymbolCircle {
+                    center: parse_point(&value["center"], &at("center"))?,
+                    radius_mm,
+                    style: StrokeFill::parse(value, index)?,
+                }))
+            }
+            "arc" => Ok(Self::Arc(SymbolArc {
+                start: parse_point(&value["start"], &at("start"))?,
+                mid: parse_point(&value["mid"], &at("mid"))?,
+                end: parse_point(&value["end"], &at("end"))?,
+                style: StrokeFill::parse(value, index)?,
+            })),
+            other => Err(invalid(
+                at("kind"),
+                format!("unsupported primitive '{other}'; expected text, line, polyline, rectangle, circle or arc"),
+            )),
+        }
+    }
+}
+
+fn parse_point(value: &serde_json::Value, field: &str) -> Result<(f64, f64), Error> {
+    let finite = |v: &serde_json::Value, axis: &str| {
+        v.as_f64()
+            .filter(|n| n.is_finite())
+            .ok_or_else(|| invalid(format!("{field}.{axis}"), "must be a finite number"))
+    };
+    if let Some(items) = value.as_array() {
+        if items.len() != 2 {
+            return Err(invalid(field, "point arrays must be [x, y]"));
+        }
+        return Ok((finite(&items[0], "x")?, finite(&items[1], "y")?));
+    }
+    if let Some(obj) = value.as_object() {
+        let Some(x) = obj.get("x") else {
+            return Err(invalid(format!("{field}.x"), "missing"));
+        };
+        let Some(y) = obj.get("y") else {
+            return Err(invalid(format!("{field}.y"), "missing"));
+        };
+        return Ok((finite(x, "x")?, finite(y, "y")?));
+    }
+    Err(invalid(
+        field,
+        "must be a point object {x,y} or [x,y] array",
+    ))
+}
+
 // ─── Errors ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -440,19 +622,102 @@ fn serialize_text(item: &SymbolText, indent: &str, unit: &str, nl: &str) -> Stri
     out
 }
 
-/// Count `(pin …)` nodes anywhere beneath `node`.
-fn count_pins(node: &SexpNode) -> usize {
-    fn walk(node: &SexpNode, count: &mut usize) {
-        for child in node.children().unwrap_or(&[]) {
-            if child.head() == Some("pin") {
-                *count += 1;
+fn serialize_style(style: &StrokeFill, i1: &str, i2: &str, nl: &str, out: &mut String) {
+    out.push_str(nl);
+    out.push_str(&format!("{i1}(stroke"));
+    out.push_str(nl);
+    out.push_str(&format!("{i2}(width {})", fmt_f64(style.stroke_width_mm)));
+    out.push_str(nl);
+    out.push_str(&format!("{i2}(type {})", style.stroke_type));
+    out.push_str(nl);
+    out.push_str(&format!("{i1})"));
+    out.push_str(nl);
+    out.push_str(&format!("{i1}(fill"));
+    out.push_str(nl);
+    out.push_str(&format!("{i2}(type {})", style.fill));
+    out.push_str(nl);
+    out.push_str(&format!("{i1})"));
+}
+
+fn serialize_graphic(item: &SymbolGraphic, indent: &str, unit: &str, nl: &str) -> String {
+    if let SymbolGraphic::Text(text) = item {
+        return serialize_text(text, indent, unit, nl);
+    }
+
+    let i1 = format!("{indent}{unit}");
+    let i2 = format!("{i1}{unit}");
+    let mut out = String::new();
+    out.push_str(nl);
+    out.push_str(indent);
+    match item {
+        SymbolGraphic::Text(_) => unreachable!(),
+        SymbolGraphic::Polyline(polyline) => {
+            out.push_str("(polyline");
+            out.push_str(nl);
+            out.push_str(&format!("{i1}(pts"));
+            for (x, y) in &polyline.points {
+                out.push_str(nl);
+                out.push_str(&format!("{i2}(xy {} {})", fmt_f64(*x), fmt_f64(*y)));
             }
-            walk(child, count);
+            out.push_str(nl);
+            out.push_str(&format!("{i1})"));
+            serialize_style(&polyline.style, &i1, &i2, nl, &mut out);
+        }
+        SymbolGraphic::Rectangle(rectangle) => {
+            out.push_str("(rectangle");
+            out.push_str(nl);
+            out.push_str(&format!(
+                "{i1}(start {} {})",
+                fmt_f64(rectangle.start.0),
+                fmt_f64(rectangle.start.1)
+            ));
+            out.push_str(nl);
+            out.push_str(&format!(
+                "{i1}(end {} {})",
+                fmt_f64(rectangle.end.0),
+                fmt_f64(rectangle.end.1)
+            ));
+            serialize_style(&rectangle.style, &i1, &i2, nl, &mut out);
+        }
+        SymbolGraphic::Circle(circle) => {
+            out.push_str("(circle");
+            out.push_str(nl);
+            out.push_str(&format!(
+                "{i1}(center {} {})",
+                fmt_f64(circle.center.0),
+                fmt_f64(circle.center.1)
+            ));
+            out.push_str(nl);
+            out.push_str(&format!("{i1}(radius {})", fmt_f64(circle.radius_mm)));
+            serialize_style(&circle.style, &i1, &i2, nl, &mut out);
+        }
+        SymbolGraphic::Arc(arc) => {
+            out.push_str("(arc");
+            out.push_str(nl);
+            out.push_str(&format!(
+                "{i1}(start {} {})",
+                fmt_f64(arc.start.0),
+                fmt_f64(arc.start.1)
+            ));
+            out.push_str(nl);
+            out.push_str(&format!(
+                "{i1}(mid {} {})",
+                fmt_f64(arc.mid.0),
+                fmt_f64(arc.mid.1)
+            ));
+            out.push_str(nl);
+            out.push_str(&format!(
+                "{i1}(end {} {})",
+                fmt_f64(arc.end.0),
+                fmt_f64(arc.end.1)
+            ));
+            serialize_style(&arc.style, &i1, &i2, nl, &mut out);
         }
     }
-    let mut count = 0;
-    walk(node, &mut count);
-    count
+    out.push_str(nl);
+    out.push_str(indent);
+    out.push(')');
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -462,7 +727,7 @@ fn prepare(
     unit_symbol: Option<&str>,
     selector: &Selector,
     mode: Mode,
-    graphics: &[SymbolText],
+    graphics: &[SymbolGraphic],
     allow_empty: bool,
 ) -> Result<Prepared, Error> {
     let root = parse_sexp(source)
@@ -575,7 +840,7 @@ fn prepare(
 
     let serialized: String = graphics
         .iter()
-        .map(|item| serialize_text(item, &child_indent, &unit_indent, nl))
+        .map(|item| serialize_graphic(item, &child_indent, &unit_indent, nl))
         .collect();
 
     let matched = selected.len();
@@ -703,46 +968,107 @@ fn summarize(names: &[String]) -> String {
 
 // ─── Tool definitions ────────────────────────────────────────────────────────
 
-fn text_item_schema() -> serde_json::Value {
+fn graphic_item_schema() -> serde_json::Value {
     json!({
-        "type": "object",
-        "properties": {
-            "kind": {
-                "type": "string",
-                "enum": ["text"],
-                "description": "Only 'text' can be written. Other kinds can still be selected for replace/delete.",
-                "default": "text"
-            },
-            "text": { "type": "string", "description": "The literal to display" },
-            "x": { "type": "number", "description": "X position in mm", "default": 0 },
-            "y": { "type": "number", "description": "Y position in mm", "default": 0 },
-            "angle": { "type": "number", "description": "Rotation in degrees", "default": 0 },
-            "font_size": { "type": "number", "exclusiveMinimum": 0, "default": 1.27 },
-            "font_thickness": { "type": "number", "exclusiveMinimum": 0, "description": "Stroke thickness in mm; omitted if not given" },
-            "justify": {
-                "type": "array",
-                "items": { "type": "string", "enum": ["left", "right", "center", "top", "bottom", "mirror"] }
-            },
-            "effects": {
+        "oneOf": [
+            {
                 "type": "object",
-                "properties": { "hide": { "type": "boolean", "default": false } },
+                "description": "KiCad symbol graphical text. Coordinates and sizes are in millimeters.",
+                "properties": {
+                    "kind": { "type": "string", "enum": ["text"], "default": "text" },
+                    "text": { "type": "string", "description": "The literal to display" },
+                    "x": { "type": "number", "description": "X position in mm", "default": 0 },
+                    "y": { "type": "number", "description": "Y position in mm", "default": 0 },
+                    "angle": { "type": "number", "description": "Rotation in degrees", "default": 0 },
+                    "font_size": { "type": "number", "exclusiveMinimum": 0, "default": 1.27 },
+                    "font_thickness": { "type": "number", "exclusiveMinimum": 0, "description": "Stroke thickness in mm; omitted if not given" },
+                    "justify": {
+                        "type": "array",
+                        "items": { "type": "string", "enum": ["left", "right", "center", "top", "bottom", "mirror"] }
+                    },
+                    "effects": {
+                        "type": "object",
+                        "properties": { "hide": { "type": "boolean", "default": false } },
+                        "additionalProperties": false
+                    }
+                },
+                "required": ["text"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "description": "KiCad symbol polyline/line primitive. Coordinates are in millimeters.",
+                "properties": {
+                    "kind": { "type": "string", "enum": ["line", "polyline"] },
+                    "points": {
+                        "type": "array",
+                        "description": "Polyline vertices as {x,y} objects or [x,y] arrays; at least two points."
+                    },
+                    "start": { "description": "Start point for a two-point line, as {x,y} or [x,y]." },
+                    "end": { "description": "End point for a two-point line, as {x,y} or [x,y]." },
+                    "stroke_width_mm": { "type": "number", "minimum": 0, "default": 0.254 },
+                    "stroke_type": { "type": "string", "enum": ["default", "solid", "dash", "dot", "dash_dot", "dash_dot_dot"], "default": "default" },
+                    "fill": { "type": "string", "enum": ["none", "background", "outline"], "default": "none" }
+                },
+                "required": ["kind"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "description": "KiCad symbol rectangle primitive. Coordinates are in millimeters.",
+                "properties": {
+                    "kind": { "type": "string", "enum": ["rectangle"] },
+                    "start": { "description": "First corner as {x,y} or [x,y]." },
+                    "end": { "description": "Opposite corner as {x,y} or [x,y]." },
+                    "stroke_width_mm": { "type": "number", "minimum": 0, "default": 0.254 },
+                    "stroke_type": { "type": "string", "enum": ["default", "solid", "dash", "dot", "dash_dot", "dash_dot_dot"], "default": "default" },
+                    "fill": { "type": "string", "enum": ["none", "background", "outline"], "default": "none" }
+                },
+                "required": ["kind", "start", "end"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "description": "KiCad symbol circle primitive. Coordinates and radius are in millimeters.",
+                "properties": {
+                    "kind": { "type": "string", "enum": ["circle"] },
+                    "center": { "description": "Center point as {x,y} or [x,y]." },
+                    "radius_mm": { "type": "number", "exclusiveMinimum": 0 },
+                    "stroke_width_mm": { "type": "number", "minimum": 0, "default": 0.254 },
+                    "stroke_type": { "type": "string", "enum": ["default", "solid", "dash", "dot", "dash_dot", "dash_dot_dot"], "default": "default" },
+                    "fill": { "type": "string", "enum": ["none", "background", "outline"], "default": "none" }
+                },
+                "required": ["kind", "center", "radius_mm"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "description": "KiCad symbol arc primitive. Coordinates are in millimeters.",
+                "properties": {
+                    "kind": { "type": "string", "enum": ["arc"] },
+                    "start": { "description": "Arc start point as {x,y} or [x,y]." },
+                    "mid": { "description": "Arc midpoint as {x,y} or [x,y]." },
+                    "end": { "description": "Arc end point as {x,y} or [x,y]." },
+                    "stroke_width_mm": { "type": "number", "minimum": 0, "default": 0.254 },
+                    "stroke_type": { "type": "string", "enum": ["default", "solid", "dash", "dot", "dash_dot", "dash_dot_dot"], "default": "default" },
+                    "fill": { "type": "string", "enum": ["none", "background", "outline"], "default": "none" }
+                },
+                "required": ["kind", "start", "mid", "end"],
                 "additionalProperties": false
             }
-        },
-        "required": ["text"],
-        "additionalProperties": false
+        ]
     })
 }
 
 pub(super) fn set_symbol_graphics_tool() -> ToolDef {
     tool!(
         "set_symbol_graphics",
-        "Append, replace or delete graphical text inside an existing .kicad_sym symbol or one of \
+        "Append, replace or delete graphical primitives inside an existing .kicad_sym symbol or one of \
          its unit sub-symbols (e.g. 'Core3576_2_1'). Edits are byte-range operations on the \
          parsed S-expression, so pins, pin names and numbers, electrical types, unit membership, \
          properties and untouched graphics are preserved structurally rather than re-serialized. \
-         Only 'text' can be written; the selector can match text, rectangle, line, circle and arc \
-         for replace/delete. Omit unit_symbol to operate on the top-level symbol. A replace or \
+         Writable primitives are text, line/polyline, rectangle, circle and arc. Coordinates are \
+         in millimeters. Omit unit_symbol to operate on the top-level symbol. A replace or \
          delete that matches nothing is a non-mutating error unless allow_empty is set.",
         json!({
             "type": "object",
@@ -775,8 +1101,8 @@ pub(super) fn set_symbol_graphics_tool() -> ToolDef {
                 "mode": { "type": "string", "enum": ["append", "replace", "delete"] },
                 "graphics": {
                     "type": "array",
-                    "items": text_item_schema(),
-                    "description": "Text items to write. Required for append and replace; must be omitted or empty for delete."
+                    "items": graphic_item_schema(),
+                    "description": "Graphics to write. Required for append and replace; must be omitted or empty for delete. Omitted fields preserve nothing; each supplied primitive is serialized as a complete KiCad symbol graphic."
                 },
                 "allow_empty": {
                     "type": "boolean",
@@ -871,6 +1197,19 @@ async fn handle_set_symbol_graphics(
     if path.extension().and_then(|e| e.to_str()) != Some("kicad_sym") {
         return Ok(invalid("library_path", "must end in .kicad_sym").into_result(&path));
     }
+    if is_installed_kicad_symbol_library(&path) {
+        return Ok(invalid(
+            "library_path",
+            "refuses to modify a KiCad installed/system symbol library; copy the symbol into a project-local library first",
+        )
+        .into_result(&path));
+    }
+    if std::fs::metadata(&path)
+        .map(|metadata| metadata.permissions().readonly())
+        .unwrap_or(false)
+    {
+        return Ok(invalid("library_path", "symbol library is read-only").into_result(&path));
+    }
     let Some(symbol_name) = args["symbol_name"].as_str() else {
         return Ok(invalid("symbol_name", "missing or not a string").into_result(&path));
     };
@@ -912,7 +1251,7 @@ async fn handle_set_symbol_graphics(
         Err(error) => return Err(error.into()),
     };
 
-    let pins_before = pin_count(&source, symbol_name);
+    let pins_before = pin_fingerprint(&source, symbol_name);
 
     let prepared = match prepare(
         &source,
@@ -926,6 +1265,18 @@ async fn handle_set_symbol_graphics(
         Ok(prepared) => prepared,
         Err(error) => return Ok(error.into_result(&path)),
     };
+
+    if let (Some(before), Some(after)) = (
+        pins_before.as_ref(),
+        pin_fingerprint(&prepared.replacement, symbol_name).as_ref(),
+    ) {
+        if before != after {
+            return Ok(Error::Conflict(
+                "edit would change symbol pins; graphics edits may not alter pin number, name, type, style, position, orientation or length".to_string(),
+            )
+            .into_result(&path));
+        }
+    }
 
     let changed = prepared.replacement != source;
     if changed {
@@ -945,7 +1296,7 @@ async fn handle_set_symbol_graphics(
     let mut warnings = prepared.warnings;
     let pins_after = match read_consistent(&path) {
         Ok(after) => match parse_sexp(&after) {
-            Ok(_) => pin_count(&after, symbol_name),
+            Ok(_) => pin_fingerprint(&after, symbol_name),
             Err(e) => {
                 warnings.push(format!("library did not reparse after write: {e}"));
                 None
@@ -956,10 +1307,10 @@ async fn handle_set_symbol_graphics(
             None
         }
     };
-    if let (Some(before), Some(after)) = (pins_before, pins_after) {
+    if let (Some(before), Some(after)) = (pins_before.as_ref(), pins_after.as_ref()) {
         if before != after {
             warnings.push(format!(
-                "pin count changed from {before} to {after} — this should not happen; \
+                "pin fingerprint changed during write/reload — this should not happen; \
                  inspect the symbol"
             ));
         }
@@ -975,13 +1326,23 @@ async fn handle_set_symbol_graphics(
         "matched": prepared.matched,
         "added": prepared.added,
         "deleted": prepared.deleted,
-        "pin_count_before": pins_before,
-        "pin_count_after": pins_after,
+        "pin_count_before": pins_before.as_ref().map(Vec::len),
+        "pin_count_after": pins_after.as_ref().map(Vec::len),
         "warnings": warnings
     })))
 }
 
-fn parse_graphics(args: &serde_json::Value, mode: Mode) -> Result<Vec<SymbolText>, Error> {
+fn is_installed_kicad_symbol_library(path: &Path) -> bool {
+    let Ok(path) = path.canonicalize() else {
+        return false;
+    };
+    crate::tools::find_kicad_library_dirs("symbols")
+        .into_iter()
+        .filter_map(|dir| dir.canonicalize().ok())
+        .any(|dir| path.starts_with(dir))
+}
+
+fn parse_graphics(args: &serde_json::Value, mode: Mode) -> Result<Vec<SymbolGraphic>, Error> {
     match mode {
         Mode::Delete => match args.get("graphics") {
             None | Some(serde_json::Value::Null) => Ok(Vec::new()),
@@ -1004,19 +1365,61 @@ fn parse_graphics(args: &serde_json::Value, mode: Mode) -> Result<Vec<SymbolText
             items
                 .iter()
                 .enumerate()
-                .map(|(index, item)| SymbolText::parse(item, index))
+                .map(|(index, item)| SymbolGraphic::parse(item, index))
                 .collect()
         }
     }
 }
 
 /// Pins beneath the named top-level symbol, or `None` if it cannot be read.
-fn pin_count(source: &str, symbol_name: &str) -> Option<usize> {
+fn pin_fingerprint(source: &str, symbol_name: &str) -> Option<Vec<String>> {
     let root = parse_sexp(source).ok()?;
-    root.find_all("symbol")
+    let symbol = root
+        .find_all("symbol")
         .into_iter()
-        .find(|s| s.get(1).and_then(SexpNode::as_str) == Some(symbol_name))
-        .map(count_pins)
+        .find(|s| s.get(1).and_then(SexpNode::as_str) == Some(symbol_name))?;
+    let mut pins = Vec::new();
+    fn walk(node: &SexpNode, unit: &str, out: &mut Vec<String>) {
+        for child in node.children().unwrap_or(&[]) {
+            match child.head() {
+                Some("symbol") => {
+                    let name = child.get(1).and_then(SexpNode::as_str).unwrap_or(unit);
+                    walk(child, name, out);
+                }
+                Some("pin") => {
+                    let pin_type = child.get(1).and_then(SexpNode::as_str).unwrap_or("");
+                    let pin_style = child.get(2).and_then(SexpNode::as_str).unwrap_or("");
+                    let name = child.find_str("name").unwrap_or("");
+                    let number = child.find_str("number").unwrap_or("");
+                    let (x, y, angle) = child
+                        .find("at")
+                        .map(|at| {
+                            (
+                                at.get_f64(1).unwrap_or(0.0),
+                                at.get_f64(2).unwrap_or(0.0),
+                                at.get_f64(3).unwrap_or(0.0),
+                            )
+                        })
+                        .unwrap_or((0.0, 0.0, 0.0));
+                    let length = child
+                        .find("length")
+                        .and_then(|length| length.get_f64(1))
+                        .unwrap_or(0.0);
+                    out.push(format!(
+                        "{unit}|{number}|{name}|{pin_type}|{pin_style}|{}|{}|{}|{}",
+                        fmt_f64(x),
+                        fmt_f64(y),
+                        fmt_f64(angle),
+                        fmt_f64(length)
+                    ));
+                }
+                _ => walk(child, unit, out),
+            }
+        }
+    }
+    walk(symbol, symbol_name, &mut pins);
+    pins.sort();
+    Some(pins)
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -1155,8 +1558,8 @@ mod tests {
         count
     }
 
-    fn text_item(text: &str, y: f64) -> SymbolText {
-        SymbolText {
+    fn text_item(text: &str, y: f64) -> SymbolGraphic {
+        SymbolGraphic::Text(SymbolText {
             text: text.to_string(),
             x: 0.0,
             y,
@@ -1165,7 +1568,7 @@ mod tests {
             font_thickness: Some(0.15),
             justify: vec!["center".to_string()],
             hide: false,
-        }
+        })
     }
 
     fn append(source: &str, unit: Option<&str>, text: &str) -> String {
@@ -1184,6 +1587,39 @@ mod tests {
         )
         .expect("append succeeds")
         .replacement
+    }
+
+    fn style(fill: &str) -> StrokeFill {
+        StrokeFill {
+            stroke_width_mm: 0.254,
+            stroke_type: "default".to_string(),
+            fill: fill.to_string(),
+        }
+    }
+
+    fn primitive_set() -> Vec<SymbolGraphic> {
+        vec![
+            SymbolGraphic::Polyline(SymbolPolyline {
+                points: vec![(-5.08, 0.0), (0.0, 5.08), (5.08, 0.0)],
+                style: style("none"),
+            }),
+            SymbolGraphic::Rectangle(SymbolRectangle {
+                start: (-6.35, 6.35),
+                end: (6.35, -6.35),
+                style: style("background"),
+            }),
+            SymbolGraphic::Circle(SymbolCircle {
+                center: (0.0, 0.0),
+                radius_mm: 1.27,
+                style: style("none"),
+            }),
+            SymbolGraphic::Arc(SymbolArc {
+                start: (-2.54, -2.54),
+                mid: (0.0, -3.81),
+                end: (2.54, -2.54),
+                style: style("none"),
+            }),
+        ]
     }
 
     /// The acceptance scenario: caption all five units, then prove nothing else
@@ -1405,6 +1841,82 @@ mod tests {
             pin_fingerprint(&out.replacement),
             pin_fingerprint(&core3576())
         );
+    }
+
+    #[test]
+    fn append_writes_all_supported_geometry_without_disturbing_pins() {
+        let original = core3576();
+        let out = prepare(
+            &original,
+            "Core3576",
+            Some("Core3576_1_1"),
+            &Selector {
+                kind: SelectorKind::Any,
+                text: None,
+                uuid: None,
+            },
+            Mode::Append,
+            &primitive_set(),
+            false,
+        )
+        .expect("append succeeds")
+        .replacement;
+
+        assert!(out.contains("(polyline"), "{out}");
+        assert!(out.contains("(rectangle"), "{out}");
+        assert!(out.contains("(circle"), "{out}");
+        assert!(out.contains("(arc"), "{out}");
+        assert!(out.contains("(radius 1.27)"), "{out}");
+        assert_eq!(
+            super::pin_fingerprint(&out, "Core3576"),
+            super::pin_fingerprint(&original, "Core3576")
+        );
+        parse_sexp(&out).expect("edited library parses");
+    }
+
+    #[test]
+    fn replace_can_swap_a_rectangle_for_line_circle_and_arc_primitives() {
+        let original = core3576();
+        let out = prepare(
+            &original,
+            "Core3576",
+            Some("Core3576_1_1"),
+            &Selector {
+                kind: SelectorKind::Rectangle,
+                text: None,
+                uuid: None,
+            },
+            Mode::Replace,
+            &primitive_set(),
+            false,
+        )
+        .expect("replace succeeds");
+
+        assert_eq!(out.matched, 1);
+        assert_eq!(count_tag(&out.replacement, "polyline"), 1);
+        assert_eq!(count_tag(&out.replacement, "circle"), 1);
+        assert_eq!(count_tag(&out.replacement, "arc"), 1);
+        assert_eq!(
+            super::pin_fingerprint(&out.replacement, "Core3576"),
+            super::pin_fingerprint(&original, "Core3576")
+        );
+    }
+
+    #[test]
+    fn json_parsing_accepts_line_rectangle_circle_and_arc() {
+        let parsed = parse_graphics(
+            &json!({
+                "graphics": [
+                    { "kind": "line", "start": [0, 0], "end": [2.54, 0], "stroke_width_mm": 0.15 },
+                    { "kind": "rectangle", "start": {"x": -1.27, "y": 1.27}, "end": {"x": 1.27, "y": -1.27}, "fill": "background" },
+                    { "kind": "circle", "center": [0, 0], "radius_mm": 1.27 },
+                    { "kind": "arc", "start": [-1, 0], "mid": [0, 1], "end": [1, 0] }
+                ]
+            }),
+            Mode::Append,
+        )
+        .expect("graphics parse");
+        assert_eq!(parsed.len(), 4);
     }
 
     #[test]

@@ -69,9 +69,9 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `set_schematic_page` | Set the sheet's paper size (A0–A5, A–E, US Letter/Legal/Ledger) and orientation. Returns the size in mm — content outside the frame still exports and still nets up, so a too-small page is a silent defect. |
 | `add_schematic_component` | Add a symbol from a KiCAD library to the schematic. Snaps to the 1.27mm grid. |
 | `delete_schematic_component` | Remove a component and all of its placed units by reference designator. |
-| `edit_schematic_component` | Update shared fields consistently across every placed unit of a component. |
-| `get_schematic_component` | Get shared properties and every placed unit's position for a component. |
-| `list_schematic_components` | List all symbol instances with positions, values, footprints, and pin locations. |
+| `edit_schematic_component` | Update shared fields and population metadata consistently across every placed unit of a component. Optional `dnp`, `exclude_from_bom`, and `exclude_from_board` booleans write KiCad's native `(dnp yes/no)`, `(in_bom yes/no)`, and `(on_board yes/no)` flags; omitted values preserve existing state. |
+| `get_schematic_component` | Get shared properties, population metadata, and every placed unit's position for a component. |
+| `list_schematic_components` | List all symbol instances with positions, values, footprints, and DNP/BOM/board metadata. |
 | `move_schematic_component` | Move the lowest-numbered unit to a new position and translate every other unit by the same delta. Does NOT adjust connected wires. |
 | `rotate_schematic_component` | Set the lowest-numbered unit's absolute rotation and rotate every other unit by the same delta. |
 | `move_connected` | Move a symbol and stretch/shrink connected wire stubs to preserve connections. |
@@ -85,6 +85,21 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `update_symbols_from_library` | Re-embed placed symbols' definitions from their libraries, like KiCad's "Update Symbols from Library". Refuses a symbol whose pins moved or disappeared (wires attach at pin coordinates) unless `allow_pin_moves` is set. |
 | `reset_schematic_field_positions` | Move each symbol's Reference and Value text back to its library anchor, through the symbol's rotation — KiCad's "Reset field text positions". Repairs sheets whose fields sit at a uniform offset. |
 | `get_schematic_view` | Render a sheet with kicad-cli and return the path to the SVG it wrote. There is no PNG — KiCad has no schematic rasteriser. The file lands in a temp directory; use `export_schematic_svg` to choose the location. |
+
+Component population metadata example:
+
+```json
+{
+  "schematic": "/path/to/project/root.kicad_sch",
+  "reference": "C14",
+  "dnp": true,
+  "exclude_from_bom": true
+}
+```
+
+`dnp` maps to KiCad's `(dnp yes/no)`. `exclude_from_bom` maps to
+`(in_bom no/yes)`, and `exclude_from_board` maps to `(on_board no/yes)`.
+Omitted metadata fields preserve their existing values.
 
 ### `sch_wiring` · 20 tools
 **Purpose:** Wires, net labels, power symbols, junctions, no-connects, pin-to-pin connections.
@@ -155,7 +170,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `batch_connect_to_net` | Connect many pins to a named net by adding labels at each endpoint, oriented away from the symbol body. Single read → all labels inserted → single write. |
 | `batch_delete` | Delete multiple schematic items (wires, labels, junctions, components) by UUID or reference — single file write. |
 | `bulk_move_schematic_components` | Move multiple components by a uniform dx/dy offset in a single atomic write. |
-| `batch_edit_schematic_components` | Apply field updates (Value, Footprint, custom properties) to multiple components in a single atomic write. |
+| `batch_edit_schematic_components` | Apply field updates and optional `dnp`, `exclude_from_bom`, and `exclude_from_board` metadata to multiple components in a single atomic write. |
 | `batch_delete_schematic_components` | Delete multiple components by reference designator in a single atomic write. |
 | `connect_passthrough` | Add a wire stub and matching net label at a point to route a signal through a region without drawing a full path. Direction defaults to `auto`. |
 | `add_schematic_text` | Add a text annotation (non-net label) to the schematic at a given position. Aligns the text against that position with `justify`, per axis and defaulting to `left bottom` as KiCad does; an omitted axis is centred, and `center` centres both. |
@@ -309,14 +324,35 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `list_symbols_in_library` | List all symbol names defined in a `.kicad_sym` library file. |
 | `register_symbol_library` | Register a `.kicad_sym` library file in the KiCAD global or project symbol table. Reports `inserted`/`unchanged`/`updated`; set `replace_existing` to update a stale URI in place while preserving entry metadata. |
 | `unregister_symbol_library` | Remove one symbol library entry from the global or project `sym-lib-table`. Removes only the named nickname in the named scope and preserves every other entry; reports `removed`/`absent`. Does not touch the `.kicad_sym` file. |
-| `set_symbol_graphics` | Append, replace or delete graphical text inside an existing `.kicad_sym` symbol or one of its unit sub-symbols. Byte-range S-expression edits, so pins, pin names/numbers, electrical types, unit membership, properties and untouched graphics are preserved structurally. Only `text` is writable; the selector matches text/rectangle/line/circle/arc for replace and delete. Zero matches on replace/delete is a non-mutating error unless `allow_empty`. |
+| `set_symbol_graphics` | Append, replace or delete graphical primitives inside an existing `.kicad_sym` symbol or one of its unit sub-symbols. Writable primitives are `text`, `line`/`polyline`, `rectangle`, `circle`, and `arc`; coordinates, radii, and stroke widths are in millimeters. Byte-range S-expression edits preserve pins, properties, symbol identity, unit membership, and untouched graphics structurally. Detected KiCad installed/system symbol libraries and read-only libraries are refused; use project-local writable libraries. Zero matches on replace/delete is a non-mutating error unless `allow_empty`. |
 | `add_symbol_text` | Add one line of graphical text to a symbol or unit sub-symbol — the common `set_symbol_graphics(mode="append")` case, without the selector and graphics array. |
 | `list_symbol_libraries` | List all registered symbol libraries (global and/or project). |
 | `search_symbols` | Search for symbols across all registered libraries by name or keyword. |
 | `list_library_footprints` | List all footprints in a specific registered library (`.pretty` directory). |
 | `get_footprint_info` | Return detailed information about a footprint. Set `include_graphics` (and optionally `graphics_layer`) to inspect supported top-level primitives, geometry, stroke, fill, and item IDs. |
 | `search_footprints` | Search for footprints across all registered libraries by name or keyword. |
-| `get_symbol_info` | Return detailed information about a schematic symbol: pins, properties, description. |
+| `get_symbol_info` | Return detailed information about a schematic symbol: pins, properties, description, and optional `include_graphics` readback for text, line/polyline, rectangle, circle, and arc primitives. |
+
+Symbol graphics replacement example:
+
+```json
+{
+  "library_path": "/path/to/project/local.kicad_sym",
+  "symbol_name": "MyMosfet",
+  "unit_symbol": "MyMosfet_1_1",
+  "mode": "replace",
+  "selector": { "kind": "rectangle" },
+  "graphics": [
+    { "kind": "line", "points": [[-5.08, 0], [0, 2.54], [5.08, 0]], "stroke_width_mm": 0.254 },
+    { "kind": "circle", "center": [0, 0], "radius_mm": 1.27, "stroke_width_mm": 0.254 },
+    { "kind": "arc", "start": [-2.54, -2.54], "mid": [0, -3.81], "end": [2.54, -2.54] }
+  ]
+}
+```
+
+Coordinates, radii, and stroke widths are millimeters. Graphics edits operate
+only on direct graphics of the selected top-level symbol or unit sub-symbol and
+reject pin mutations by comparing the symbol pin fingerprint before and after.
 
 ---
 

@@ -418,12 +418,18 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_symbol_info",
-            "Return detailed information about a schematic symbol: pins, properties, description.",
+            "Return detailed information about a schematic symbol: pins, properties, description, \
+             and optionally symbol graphical primitives.",
             json!({
                 "type": "object",
                 "properties": {
                     "lib_id": { "type": "string", "description": "Library:Symbol identifier (e.g. 'Device:R')" },
-                    "project_dir": { "type": "string", "description": "Project directory to resolve project-scoped libraries. Defaults to the configured project_dir." }
+                    "project_dir": { "type": "string", "description": "Project directory to resolve project-scoped libraries. Defaults to the configured project_dir." },
+                    "include_graphics": {
+                        "type": "boolean",
+                        "description": "Include direct symbol graphics from the top-level symbol and unit sub-symbols: text, line/polyline, rectangle, circle and arc. Coordinates are in millimeters.",
+                        "default": false
+                    }
                 },
                 "required": ["lib_id"]
             }),
@@ -3987,6 +3993,124 @@ fn resolve_symbol_pins<'a>(root: &'a SexpNode, sym_node: &'a SexpNode) -> Vec<&'
     pins
 }
 
+fn point_json(node: &SexpNode, tag: &str) -> Option<serde_json::Value> {
+    let point = node.find(tag)?;
+    Some(json!({
+        "x": point.get_f64(1)?,
+        "y": point.get_f64(2)?
+    }))
+}
+
+fn stroke_width_mm(node: &SexpNode) -> Option<f64> {
+    node.find("stroke")
+        .and_then(|stroke| stroke.find("width"))
+        .and_then(|width| width.get_f64(1))
+}
+
+fn stroke_type(node: &SexpNode) -> Option<&str> {
+    node.find("stroke")
+        .and_then(|stroke| stroke.find("type"))
+        .and_then(|kind| kind.get(1))
+        .and_then(SexpNode::as_str)
+}
+
+fn symbol_fill(node: &SexpNode) -> Option<&str> {
+    node.find("fill")
+        .and_then(|fill| fill.find("type"))
+        .and_then(|kind| kind.get(1))
+        .and_then(SexpNode::as_str)
+}
+
+fn symbol_graphic_json(node: &SexpNode, unit_symbol: Option<&str>) -> Option<serde_json::Value> {
+    let tag = node.head()?;
+    let mut out = match tag {
+        "text" => {
+            let at = node.find("at");
+            json!({
+                "type": "text",
+                "kind": "text",
+                "unit_symbol": unit_symbol,
+                "text": node.get(1).and_then(SexpNode::as_str).unwrap_or(""),
+                "x": at.and_then(|at| at.get_f64(1)).unwrap_or(0.0),
+                "y": at.and_then(|at| at.get_f64(2)).unwrap_or(0.0),
+                "angle": at.and_then(|at| at.get_f64(3)).unwrap_or(0.0)
+            })
+        }
+        "polyline" => {
+            let points: Vec<_> = node
+                .find("pts")
+                .and_then(SexpNode::children)
+                .unwrap_or(&[])
+                .iter()
+                .filter(|point| point.head() == Some("xy"))
+                .filter_map(|point| {
+                    Some(json!({
+                        "x": point.get_f64(1)?,
+                        "y": point.get_f64(2)?
+                    }))
+                })
+                .collect();
+            json!({
+                "type": "polyline",
+                "kind": "polyline",
+                "unit_symbol": unit_symbol,
+                "points": points,
+                "point_count": points.len()
+            })
+        }
+        "rectangle" => json!({
+            "type": "rectangle",
+            "kind": "rectangle",
+            "unit_symbol": unit_symbol,
+            "start": point_json(node, "start")?,
+            "end": point_json(node, "end")?
+        }),
+        "circle" => json!({
+            "type": "circle",
+            "kind": "circle",
+            "unit_symbol": unit_symbol,
+            "center": point_json(node, "center")?,
+            "radius_mm": node.find("radius").and_then(|radius| radius.get_f64(1))?
+        }),
+        "arc" => json!({
+            "type": "arc",
+            "kind": "arc",
+            "unit_symbol": unit_symbol,
+            "start": point_json(node, "start")?,
+            "mid": point_json(node, "mid")?,
+            "end": point_json(node, "end")?
+        }),
+        _ => return None,
+    };
+    if let Some(width) = stroke_width_mm(node) {
+        out["stroke_width_mm"] = json!(width);
+    }
+    if let Some(kind) = stroke_type(node) {
+        out["stroke_type"] = json!(kind);
+    }
+    if let Some(fill) = symbol_fill(node) {
+        out["fill"] = json!(fill);
+    }
+    Some(out)
+}
+
+fn symbol_graphics(sym_node: &SexpNode) -> Vec<serde_json::Value> {
+    let mut graphics = Vec::new();
+    for child in sym_node.children().unwrap_or(&[]) {
+        if child.head() == Some("symbol") {
+            let unit = child.get(1).and_then(SexpNode::as_str);
+            for unit_child in child.children().unwrap_or(&[]) {
+                if let Some(graphic) = symbol_graphic_json(unit_child, unit) {
+                    graphics.push(graphic);
+                }
+            }
+        } else if let Some(graphic) = symbol_graphic_json(child, None) {
+            graphics.push(graphic);
+        }
+    }
+    graphics
+}
+
 /// Search one library body for top-level symbols whose name contains `query`
 /// (case-insensitive), returning result objects shaped like `search_symbols`.
 fn search_lib_symbols(nickname: &str, content: &str, query: &str) -> Vec<serde_json::Value> {
@@ -4350,16 +4474,23 @@ async fn handle_get_symbol_info(
         }
     }
 
+    let mut response = json!({
+        "lib_id": lib_id,
+        "name": sym_name,
+        "library": lib_nick,
+        "pin_count": pins.len(),
+        "pins": pins,
+        "properties": properties
+    });
+    if args["include_graphics"].as_bool().unwrap_or(false) {
+        let graphics = symbol_graphics(sym_node);
+        response["graphic_count"] = json!(graphics.len());
+        response["graphics"] = json!(graphics);
+        response["graphics_units"] = json!("mm");
+    }
+
     Ok(CallToolResult::text(
-        serde_json::to_string(&json!({
-            "lib_id": lib_id,
-            "name": sym_name,
-            "library": lib_nick,
-            "pin_count": pins.len(),
-            "pins": pins,
-            "properties": properties
-        }))
-        .unwrap(),
+        serde_json::to_string(&response).unwrap(),
     ))
 }
 
@@ -6603,6 +6734,55 @@ mod tests {
         assert_eq!(g_pin["name"], "G", "{g_pin}");
         assert_eq!(out["properties"]["Reference"], "Q", "{out}");
         assert_eq!(out["properties"]["Value"], "T1", "{out}");
+    }
+
+    #[tokio::test]
+    async fn get_symbol_info_can_include_symbol_graphics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = concat!(
+            "(kicad_symbol_lib\n",
+            "  (version 20251024)\n",
+            "  (generator \"test\")\n",
+            "  (symbol \"GFX\"\n",
+            "    (property \"Reference\" \"U\" (at 0 5.08 0))\n",
+            "    (symbol \"GFX_1_1\"\n",
+            "      (polyline (pts (xy -1 0) (xy 1 0)) (stroke (width 0.15) (type default)) (fill (type none)))\n",
+            "      (rectangle (start -2 2) (end 2 -2) (stroke (width 0.254) (type default)) (fill (type background)))\n",
+            "      (circle (center 0 0) (radius 1.27) (stroke (width 0.254) (type default)) (fill (type none)))\n",
+            "      (arc (start -1 -1) (mid 0 -2) (end 1 -1) (stroke (width 0.254) (type default)) (fill (type none)))\n",
+            "      (pin passive line (at -5.08 0 0) (length 2.54) (name \"A\") (number \"1\"))\n",
+            "    )\n",
+            "  )\n",
+            ")\n",
+        );
+        let project_dir = write_project_sym_lib(&tmp, "Local", body);
+        let res = handle_get_symbol_info(
+            &json!({
+                "lib_id": "Local:GFX",
+                "project_dir": project_dir,
+                "include_graphics": true
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let out: serde_json::Value = serde_json::from_str(&result_text(&res)).unwrap();
+        assert_eq!(out["graphic_count"], json!(4), "{out}");
+        assert_eq!(out["graphics_units"], json!("mm"));
+        let kinds: Vec<_> = out["graphics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|graphic| graphic["kind"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(kinds, vec!["polyline", "rectangle", "circle", "arc"]);
+        assert_eq!(out["graphics"][0]["points"][1]["x"], json!(1.0));
+        assert_eq!(out["graphics"][2]["radius_mm"], json!(1.27));
+        assert_eq!(
+            out["pin_count"],
+            json!(1),
+            "pins still read normally: {out}"
+        );
     }
 
     const EXTENDS_DERIVED_LIB: &str = "\
