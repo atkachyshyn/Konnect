@@ -62,9 +62,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "sch_hierarchy",
-        description: "Hierarchical sheets: add/edit/move/delete/duplicate a sheet, hierarchy and page-numbering queries, import/add/edit/delete sheet pins, pin/label sync validation",
+        description: "Hierarchical sheets: add/edit/move/delete/duplicate a sheet, move existing objects between sheets for hierarchy migration/restructure, safe cleanup of unlinked empty child schematics, hierarchy and page-numbering queries, import/add/edit/delete sheet pins, pin/label sync validation",
         category: "schematic",
-        tool_count: 12,
+        tool_count: 14,
     },
     ToolsetMeta {
         name: "pcb_board",

@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **19 toolsets** organized into 10 categories
-- **210 registered tools** + **6 always-visible meta-tools** = **216 total**
+- **212 registered tools** + **6 always-visible meta-tools** = **218 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2.2K tokens instead of ~34K. (Every client also gets three dispatcher tools — `list_available_tools` / `get_tool_schema` / `execute_konnect_tool` — which reach every tool below on demand, for ~3.0K total. They exist for clients that cache their first listing rather than refreshing on `tools/list_changed`, for which the discovery pattern described next cannot work at all.) The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -194,8 +194,8 @@ Omitted metadata fields preserve their existing values.
 | `fix_connectivity` | Scan for near-miss wire endpoints within `snap_tolerance` of a pin/label and snap them into place. Supports `dry_run`. |
 | `update_pcb_from_schematic` | Plan or atomically apply saved schematic hierarchy changes to the live KiCad PCB. Defaults to a non-mutating dry run; apply requires its exact plan revision. Preserves placement, routing, board-only footprints, and footprint artwork. |
 
-### `sch_hierarchy` · 12 tools
-**Purpose:** Hierarchical sheets: add/edit/move/delete/duplicate a sheet, hierarchy and page-numbering queries, import/add/edit/delete sheet pins, pin/label sync validation.
+### `sch_hierarchy` · 14 tools
+**Purpose:** Hierarchical sheets: add/edit/move/delete/duplicate a sheet, move existing objects between sheets for hierarchy migration/restructure, safe cleanup of unlinked empty child schematics, hierarchy and page-numbering queries, import/add/edit/delete sheet pins, pin/label sync validation.
 **Source:** [`crates/konnect-core/src/tools/sch_hierarchy.rs`](crates/konnect-core/src/tools/sch_hierarchy.rs)
 
 | Tool | Description |
@@ -204,7 +204,9 @@ Omitted metadata fields preserve their existing values.
 | `edit_sheet` | Rename, resize, reposition, or repoint (`Sheetfile`) an existing sheet. |
 | `move_sheet` | Reposition a sheet on the parent canvas without touching any other field. |
 | `delete_sheet` | Remove a sheet reference from the parent schematic. Does not delete the child file. |
+| `delete_unlinked_child_schematic` | Dry-run or apply safe cleanup of an unused child `.kicad_sch` file. The target must be under the root project directory, unlinked from the active root hierarchy, empty of movable schematic objects, and empty of child sheets. Apply requires the exact dry-run `plan_revision`. |
 | `duplicate_sheet` | Copy an existing sheet and its child file under a new name/file, offset from the source, with an independent internal UUID. |
+| `move_schematic_items_to_sheet` | Dry-run or atomically apply moving existing schematic objects between linked sheet files for hierarchical restructure. Select by component references, UUIDs, or bounding box; optionally include connected local wires, junctions, labels, power symbols, no-connects, text, and graphics. Apply requires the exact dry-run `plan_revision`. |
 | `get_sheet_hierarchy` | Recursively walk the sheet tree, returning nested JSON with each sheet's name/file/uuid/position/size/page/pins and its own children. |
 | `renumber_sheet_pages` | Walk the whole sheet tree and reassign sequential page numbers in depth-first order, fixing gaps left by delete/duplicate. |
 | `import_sheet_pins` | Scan the child sheet's hierarchical_labels and auto-generate matching pins on the parent sheet block, skipping names that already have a pin — the primary way pins get created. |

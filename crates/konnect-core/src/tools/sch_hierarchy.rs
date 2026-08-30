@@ -13,13 +13,15 @@ use crate::tools::{
     get_path, opt_f64, opt_str, project_name_for, require_f64, require_str, ToolContext, ToolDef,
 };
 use konnect_schematic_editor as cse;
+use konnect_schematic_editor::types::fmt_f64;
 use konnect_sexp::schematic::{format_hierarchical_sheet, HierarchicalSheetSpec};
 use konnect_sexp::{
     commit_command, commit_file_transaction, parse_sexp, prepare_command, read_consistent,
-    FileTransition, ItemAnchor, ItemId, SchematicCommand,
+    DocumentRevision, FileTransition, ItemAnchor, ItemChange, ItemId, SchematicCommand,
 };
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 pub fn tools() -> Vec<ToolDef> {
@@ -99,6 +101,25 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_delete_sheet(args, ctx).await }
         ),
         tool!(
+            "delete_unlinked_child_schematic",
+            "Dry-run or apply safe cleanup of an unused child .kicad_sch file. The target \
+             must be a regular .kicad_sch under the root schematic's project directory, must \
+             not be reachable from the root hierarchy, and must contain no symbols, wires, \
+             labels, graphics, no-connects, or child sheets. Apply mode requires dry_run=false \
+             plus the exact plan_revision returned by dry-run.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "root_schematic": { "type": "string", "description": "Root .kicad_sch used to prove the target file is not linked anywhere in the active hierarchy" },
+                    "target_schematic": { "type": "string", "description": "Unlinked empty child .kicad_sch file to delete" },
+                    "dry_run": { "type": "boolean", "description": "Default true. false deletes the already-reviewed file.", "default": true },
+                    "plan_revision": { "type": "string", "description": "Exact dry-run revision required when dry_run=false" }
+                },
+                "required": ["root_schematic", "target_schematic"]
+            }),
+            |args, ctx| async move { handle_delete_unlinked_child_schematic(args, ctx).await }
+        ),
+        tool!(
             "duplicate_sheet",
             "Copy an existing sheet and its child .kicad_sch file under a new name/file, \
              offset slightly so the new sheet box doesn't overlap the source. The copy gets \
@@ -117,6 +138,68 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["schematic", "source_sheet_name", "new_sheet_name", "new_file"]
             }),
             |args, ctx| async move { handle_duplicate_sheet(args, ctx).await }
+        ),
+        tool!(
+            "move_schematic_items_to_sheet",
+            "Dry-run or atomically apply a hierarchy migration by moving existing schematic \
+             objects between sheets: move existing objects between sheets, migrate hierarchy, \
+             hierarchical restructure. Select by component references, item UUIDs, or bounding \
+             box; optionally include connected local wires, junctions, labels, power symbols, \
+             no-connect markers, text, and graphics. Moving preserves exact item blocks, DNP/BOM \
+             metadata, symbol units, UUIDs where safe, embedded symbol definitions, and patches \
+             moved symbols' hierarchical instance paths for the target child sheet. Apply mode \
+             requires dry_run=false plus the exact plan_revision returned by dry-run.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "source_schematic": { "type": "string", "description": "Path to the source .kicad_sch file containing the existing objects" },
+                    "target_schematic": { "type": "string", "description": "Path to the linked child .kicad_sch file that will receive the objects" },
+                    "selection": {
+                        "type": "object",
+                        "description": "Objects to move. references selects every placed unit of each component reference; uuids selects explicit top-level schematic item UUIDs; bbox selects items intersecting a region in schematic millimeters.",
+                        "properties": {
+                            "references": { "type": "array", "items": { "type": "string" } },
+                            "uuids": { "type": "array", "items": { "type": "string" } },
+                            "bbox": { "description": "Either [min_x,min_y,max_x,max_y] or {min_x,min_y,max_x,max_y}; coordinates are schematic millimeters." }
+                        },
+                        "additionalProperties": false
+                    },
+                    "include_connected": {
+                        "type": "object",
+                        "description": "Optional local-neighborhood expansion for objects intersecting the selected region or selected component bodies.",
+                        "properties": {
+                            "wires": { "type": "boolean", "default": false },
+                            "junctions": { "type": "boolean", "default": false },
+                            "labels": { "type": "boolean", "default": false },
+                            "power_symbols": { "type": "boolean", "default": false },
+                            "no_connects": { "type": "boolean", "default": false },
+                            "text": { "type": "boolean", "default": false },
+                            "graphics": { "type": "boolean", "default": false }
+                        },
+                        "additionalProperties": false
+                    },
+                    "placement": {
+                        "type": "object",
+                        "description": "Where moved objects land in the target. preserve_coordinates keeps coordinates unchanged; offset adds dx/dy; normalize_origin moves the selected region's minimum corner to dx/dy.",
+                        "properties": {
+                            "mode": { "type": "string", "enum": ["preserve_coordinates", "offset", "normalize_origin"], "default": "preserve_coordinates" },
+                            "dx": { "type": "number", "default": 0 },
+                            "dy": { "type": "number", "default": 0 }
+                        },
+                        "additionalProperties": false
+                    },
+                    "allow_partial_multi_unit": {
+                        "type": "boolean",
+                        "description": "When false, selecting only some placed units of a multi-unit reference is refused.",
+                        "default": false
+                    },
+                    "dry_run": { "type": "boolean", "description": "Default true. false applies the already-reviewed plan.", "default": true },
+                    "plan_revision": { "type": "string", "description": "Exact dry-run revision required when dry_run=false" },
+                    "project_name": { "type": "string", "description": PROJECT_NAME_DESC }
+                },
+                "required": ["source_schematic", "target_schematic", "selection"]
+            }),
+            |args, ctx| async move { handle_move_schematic_items_to_sheet(args, ctx).await }
         ),
         tool!(
             "get_sheet_hierarchy",
@@ -467,6 +550,1700 @@ fn commit_edited_sheet_item(
         label,
     )?;
     Ok(commit_command(path, &command)?.changed)
+}
+
+// ─── Cross-sheet item migration ──────────────────────────────────────────────
+
+const MIGRATABLE_TAGS: &[&str] = &[
+    "symbol",
+    "wire",
+    "bus",
+    "bus_entry",
+    "junction",
+    "label",
+    "global_label",
+    "hierarchical_label",
+    "no_connect",
+    "text",
+    "text_box",
+    "polyline",
+    "rectangle",
+    "circle",
+    "arc",
+    "image",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Bounds {
+    min_x: f64,
+    min_y: f64,
+    max_x: f64,
+    max_y: f64,
+}
+
+impl Bounds {
+    fn from_point(x: f64, y: f64) -> Self {
+        Self {
+            min_x: x,
+            min_y: y,
+            max_x: x,
+            max_y: y,
+        }
+    }
+
+    fn include(&mut self, x: f64, y: f64) {
+        if !x.is_finite() || !y.is_finite() {
+            return;
+        }
+        self.min_x = self.min_x.min(x);
+        self.min_y = self.min_y.min(y);
+        self.max_x = self.max_x.max(x);
+        self.max_y = self.max_y.max(y);
+    }
+
+    fn union(self, other: Self) -> Self {
+        Self {
+            min_x: self.min_x.min(other.min_x),
+            min_y: self.min_y.min(other.min_y),
+            max_x: self.max_x.max(other.max_x),
+            max_y: self.max_y.max(other.max_y),
+        }
+    }
+
+    fn expanded(self, amount: f64) -> Self {
+        Self {
+            min_x: self.min_x - amount,
+            min_y: self.min_y - amount,
+            max_x: self.max_x + amount,
+            max_y: self.max_y + amount,
+        }
+    }
+
+    fn contains(self, x: f64, y: f64) -> bool {
+        x >= self.min_x && x <= self.max_x && y >= self.min_y && y <= self.max_y
+    }
+
+    fn intersects(self, other: Self) -> bool {
+        self.min_x <= other.max_x
+            && self.max_x >= other.min_x
+            && self.min_y <= other.max_y
+            && self.max_y >= other.min_y
+    }
+
+    fn json(self) -> Value {
+        json!({
+            "min_x": self.min_x,
+            "min_y": self.min_y,
+            "max_x": self.max_x,
+            "max_y": self.max_y
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SchematicItem {
+    uuid: String,
+    kind: String,
+    source: String,
+    reference: Option<String>,
+    value: Option<String>,
+    footprint: Option<String>,
+    lib_id: Option<String>,
+    lib_name: Option<String>,
+    unit: Option<u32>,
+    bounds: Option<Bounds>,
+}
+
+impl SchematicItem {
+    fn is_power_symbol(&self) -> bool {
+        self.kind == "symbol"
+            && self
+                .lib_id
+                .as_deref()
+                .is_some_and(|lib_id| lib_id.starts_with("power:"))
+    }
+
+    fn lib_symbol_key(&self) -> Option<&str> {
+        self.lib_name.as_deref().or(self.lib_id.as_deref())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IncludeConnected {
+    wires: bool,
+    junctions: bool,
+    labels: bool,
+    power_symbols: bool,
+    no_connects: bool,
+    text: bool,
+    graphics: bool,
+}
+
+impl IncludeConnected {
+    fn parse(args: &Value) -> Result<Self, CallToolResult> {
+        let include = args.get("include_connected").unwrap_or(&Value::Null);
+        if !include.is_null() && !include.is_object() {
+            return Err(CallToolResult::error(
+                "include_connected must be an object when supplied",
+            ));
+        }
+        let flag = |name: &str| include.get(name).and_then(Value::as_bool).unwrap_or(false);
+        Ok(Self {
+            wires: flag("wires"),
+            junctions: flag("junctions"),
+            labels: flag("labels"),
+            power_symbols: flag("power_symbols"),
+            no_connects: flag("no_connects"),
+            text: flag("text"),
+            graphics: flag("graphics"),
+        })
+    }
+
+    fn allows(self, item: &SchematicItem) -> bool {
+        match item.kind.as_str() {
+            "wire" | "bus" | "bus_entry" => self.wires,
+            "junction" => self.junctions,
+            "label" | "global_label" | "hierarchical_label" => self.labels,
+            "no_connect" => self.no_connects,
+            "text" | "text_box" => self.text,
+            "polyline" | "rectangle" | "circle" | "arc" | "image" => self.graphics,
+            "symbol" if item.is_power_symbol() => self.power_symbols,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlacementMode {
+    PreserveCoordinates,
+    Offset,
+    NormalizeOrigin,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Placement {
+    mode: PlacementMode,
+    dx: f64,
+    dy: f64,
+}
+
+impl Placement {
+    fn parse(args: &Value) -> Result<Self, CallToolResult> {
+        let placement = args.get("placement").unwrap_or(&Value::Null);
+        if !placement.is_null() && !placement.is_object() {
+            return Err(CallToolResult::error(
+                "placement must be an object when supplied",
+            ));
+        }
+        let mode = match placement
+            .get("mode")
+            .and_then(Value::as_str)
+            .unwrap_or("preserve_coordinates")
+        {
+            "preserve_coordinates" => PlacementMode::PreserveCoordinates,
+            "offset" => PlacementMode::Offset,
+            "normalize_origin" => PlacementMode::NormalizeOrigin,
+            other => {
+                return Err(CallToolResult::error(format!(
+                    "placement.mode '{other}' is invalid; expected preserve_coordinates, offset or normalize_origin"
+                )))
+            }
+        };
+        let number = |name: &str| -> Result<f64, CallToolResult> {
+            let value = placement.get(name).and_then(Value::as_f64).unwrap_or(0.0);
+            if value.is_finite() {
+                Ok(value)
+            } else {
+                Err(CallToolResult::error(format!(
+                    "placement.{name} must be a finite number"
+                )))
+            }
+        };
+        Ok(Self {
+            mode,
+            dx: number("dx")?,
+            dy: number("dy")?,
+        })
+    }
+
+    fn offset_for(self, bounds: Option<Bounds>) -> Result<(f64, f64), CallToolResult> {
+        match self.mode {
+            PlacementMode::PreserveCoordinates => Ok((0.0, 0.0)),
+            PlacementMode::Offset => Ok((self.dx, self.dy)),
+            PlacementMode::NormalizeOrigin => {
+                let Some(bounds) = bounds else {
+                    return Err(CallToolResult::error(
+                        "normalize_origin requires at least one selected item with coordinates",
+                    ));
+                };
+                Ok((self.dx - bounds.min_x, self.dy - bounds.min_y))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MovePlan {
+    source_path: PathBuf,
+    target_path: PathBuf,
+    source_before: String,
+    target_before: String,
+    project_name: String,
+    target_hierarchy_path: String,
+    selected_ids: Vec<String>,
+    selected_items: Vec<SchematicItem>,
+    moved_blocks: HashMap<String, String>,
+    required_lib_symbols: Vec<String>,
+    selection_bounds: Option<Bounds>,
+    offset: (f64, f64),
+    crossing_warnings: Vec<String>,
+    partial_multi_units: Vec<String>,
+    plan_revision: String,
+}
+
+impl MovePlan {
+    fn items_by_type(&self) -> Value {
+        let mut grouped: HashMap<String, Vec<Value>> = HashMap::new();
+        for item in &self.selected_items {
+            grouped.entry(item.kind.clone()).or_default().push(json!({
+                "uuid": item.uuid,
+                "reference": item.reference,
+                "value": item.value,
+                "footprint": item.footprint,
+                "lib_id": item.lib_id,
+                "unit": item.unit,
+                "bounds": item.bounds.map(Bounds::json)
+            }));
+        }
+        json!(grouped)
+    }
+
+    fn response(&self, dry_run: bool, applied: bool, transaction_id: Option<&str>) -> Value {
+        let labels = self
+            .selected_items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item.kind.as_str(),
+                    "label" | "global_label" | "hierarchical_label"
+                )
+            })
+            .filter_map(|item| first_string_payload(&item.source))
+            .collect::<Vec<_>>();
+        let power_symbols = self
+            .selected_items
+            .iter()
+            .filter(|item| item.is_power_symbol())
+            .filter_map(|item| item.value.clone())
+            .collect::<Vec<_>>();
+        json!({
+            "dry_run": dry_run,
+            "applied": applied,
+            "safe_to_apply": self.partial_multi_units.is_empty(),
+            "plan_revision": self.plan_revision,
+            "transaction_id": transaction_id,
+            "source_schematic": self.source_path.display().to_string(),
+            "target_schematic": self.target_path.display().to_string(),
+            "target_hierarchy_path": self.target_hierarchy_path,
+            "selection_bounds": self.selection_bounds.map(Bounds::json),
+            "placement_offset": { "dx": self.offset.0, "dy": self.offset.1 },
+            "items_to_move": self.items_by_type(),
+            "item_count": self.selected_items.len(),
+            "multi_unit_components_detected": multi_unit_summary(&self.selected_items),
+            "local_nets_affected": affected_nets(&self.selected_items),
+            "labels_included": labels,
+            "power_symbols_included": power_symbols,
+            "no_connects_included": self.selected_items.iter().filter(|item| item.kind == "no_connect").count(),
+            "items_crossing_selection_boundary": self.crossing_warnings,
+            "warnings": self.crossing_warnings,
+            "required_embedded_symbols": self.required_lib_symbols,
+        })
+    }
+}
+
+async fn handle_move_schematic_items_to_sheet(
+    args: &Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let source_path = get_path(args, "source_schematic")?;
+    let target_path = get_path(args, "target_schematic")?;
+    let dry_run = args.get("dry_run").and_then(Value::as_bool).unwrap_or(true);
+
+    let plan = match build_move_plan(args, source_path, target_path) {
+        Ok(plan) => plan,
+        Err(error) => return Ok(error),
+    };
+
+    if dry_run {
+        return Ok(CallToolResult::json(&plan.response(true, false, None)));
+    }
+
+    let supplied_revision = args
+        .get("plan_revision")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if supplied_revision != plan.plan_revision {
+        return Ok(CallToolResult::error(format!(
+            "plan_revision mismatch; rerun dry_run and apply exactly '{}'",
+            plan.plan_revision
+        )));
+    }
+
+    let source_delete = SchematicCommand::delete_items(
+        &plan.source_before,
+        plan.selected_ids
+            .iter()
+            .map(|id| ItemId::new(id.clone()))
+            .collect::<Result<Vec<_>, _>>()?,
+        "Move schematic items out of source sheet",
+    )?
+    .requiring_unchanged_document();
+    let (source_after, _) =
+        prepare_command(&plan.source_path, &plan.source_before, &source_delete)?;
+
+    let insert_changes = plan
+        .selected_ids
+        .iter()
+        .map(|id| {
+            Ok(ItemChange {
+                id: ItemId::new(id.clone())?,
+                before: None,
+                after: Some(
+                    plan.moved_blocks
+                        .get(id)
+                        .ok_or_else(|| {
+                            konnect_sexp::SexpError::MissingNode(format!(
+                                "prepared moved block {id}"
+                            ))
+                        })?
+                        .clone(),
+                ),
+                anchor: ItemAnchor::BeforeFooter,
+            })
+        })
+        .collect::<Result<Vec<_>, konnect_sexp::SexpError>>()?;
+    let target_insert = SchematicCommand::from_changes(
+        &plan.target_before,
+        "Move schematic items into target sheet",
+        insert_changes,
+    )?
+    .requiring_unchanged_document();
+    let (target_with_items, _) =
+        prepare_command(&plan.target_path, &plan.target_before, &target_insert)?;
+    let target_after = add_missing_lib_symbols(
+        &target_with_items,
+        &plan.source_before,
+        &plan.required_lib_symbols,
+    )?;
+
+    validate_migration_result(&plan, &source_after, &target_after)?;
+
+    let transaction = commit_file_transaction(
+        transaction_root(&plan.source_path, &plan.target_path)?,
+        vec![
+            FileTransition::replace(&plan.source_path, &plan.source_before, source_after),
+            FileTransition::replace(&plan.target_path, &plan.target_before, target_after),
+        ],
+    )?;
+
+    Ok(CallToolResult::json(&plan.response(
+        false,
+        true,
+        Some(&transaction.id),
+    )))
+}
+
+fn build_move_plan(
+    args: &Value,
+    source_path: PathBuf,
+    target_path: PathBuf,
+) -> Result<MovePlan, CallToolResult> {
+    if !source_path.is_file() {
+        return Err(CallToolResult::error("source_schematic is not a file"));
+    }
+    if !target_path.is_file() {
+        return Err(CallToolResult::error("target_schematic is not a file"));
+    }
+    if same_file(&source_path, &target_path) {
+        return Err(CallToolResult::error(
+            "source_schematic and target_schematic must be different files",
+        ));
+    }
+
+    let source_before = read_consistent(&source_path).map_err(|error| {
+        CallToolResult::error(format!("failed to read source_schematic: {error}"))
+    })?;
+    let target_before = read_consistent(&target_path).map_err(|error| {
+        CallToolResult::error(format!("failed to read target_schematic: {error}"))
+    })?;
+    parse_sexp(&source_before).map_err(|error| {
+        CallToolResult::error(format!("source_schematic does not parse: {error}"))
+    })?;
+    parse_sexp(&target_before).map_err(|error| {
+        CallToolResult::error(format!("target_schematic does not parse: {error}"))
+    })?;
+
+    let project_name = opt_str(args, "project_name")
+        .map(str::to_string)
+        .unwrap_or_else(|| project_name_for(&source_path));
+    let target_hierarchy_path = target_instance_path(&source_path, &target_path, &source_before)?;
+    let source_items = extract_migratable_items(&source_before)?;
+    let target_items = extract_migratable_items(&target_before)?;
+    let selector = args
+        .get("selection")
+        .ok_or_else(|| CallToolResult::error("selection is required"))?;
+    let include = IncludeConnected::parse(args)?;
+    let placement = Placement::parse(args)?;
+    let allow_partial_multi_unit = args
+        .get("allow_partial_multi_unit")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let mut selected = select_initial_items(selector, &source_items)?;
+    let base_bounds = selected_bounds(&source_items, &selected);
+    loop {
+        let Some(bounds) = selected_bounds(&source_items, &selected).map(|b| b.expanded(0.01))
+        else {
+            break;
+        };
+        let mut changed = false;
+        for item in &source_items {
+            if selected.contains(&item.uuid) || !include.allows(item) {
+                continue;
+            }
+            if item
+                .bounds
+                .is_some_and(|item_bounds| item_bounds.intersects(bounds))
+            {
+                changed |= selected.insert(item.uuid.clone());
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    if selected.is_empty() {
+        return Err(CallToolResult::error(
+            "selection matched no movable schematic items",
+        ));
+    }
+
+    let partial_multi_units = partial_multi_unit_refs(&source_items, &selected);
+    if !allow_partial_multi_unit && !partial_multi_units.is_empty() {
+        return Err(CallToolResult::error(format!(
+            "selection would move only part of multi-unit component(s): {}; rerun with references selecting the whole component or set allow_partial_multi_unit=true",
+            partial_multi_units.join(", ")
+        )));
+    }
+
+    let mut selected_items = source_items
+        .iter()
+        .filter(|item| selected.contains(&item.uuid))
+        .cloned()
+        .collect::<Vec<_>>();
+    selected_items.sort_by_key(|item| source_before.find(&item.source).unwrap_or(usize::MAX));
+    let selected_ids = selected_items
+        .iter()
+        .map(|item| item.uuid.clone())
+        .collect::<Vec<_>>();
+    let selection_bounds =
+        selected_bounds(&selected_items, &selected_ids.iter().cloned().collect());
+    let offset = placement.offset_for(selection_bounds)?;
+
+    for id in &selected_ids {
+        if target_items.iter().any(|item| item.uuid == *id) {
+            return Err(CallToolResult::error(format!(
+                "target_schematic already contains item UUID {id}"
+            )));
+        }
+    }
+    let mut target_preview_items = target_items.clone();
+    target_preview_items.extend(selected_items.clone());
+    validate_component_references(&target_preview_items).map_err(|error| {
+        CallToolResult::error(format!(
+            "target_schematic would fail component reference validation after migration: {error}"
+        ))
+    })?;
+
+    let mut moved_blocks = HashMap::new();
+    for item in &selected_items {
+        let mut block = item.source.clone();
+        if item.kind == "symbol" {
+            block = retarget_symbol_instance_path(&block, &project_name, &target_hierarchy_path)
+                .map_err(|error| {
+                    CallToolResult::error(format!(
+                        "failed to patch instance path for {}: {error}",
+                        item.uuid
+                    ))
+                })?;
+        }
+        if offset != (0.0, 0.0) {
+            block = translate_coordinate_clauses(&block, offset.0, offset.1);
+        }
+        moved_blocks.insert(item.uuid.clone(), block);
+    }
+
+    let mut required_lib_symbols = selected_items
+        .iter()
+        .filter(|item| item.kind == "symbol")
+        .filter_map(SchematicItem::lib_symbol_key)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    required_lib_symbols.sort();
+    required_lib_symbols.dedup();
+
+    let crossing_warnings = crossing_warnings(&selected_items, base_bounds);
+    let plan_revision = migration_plan_revision(
+        &source_before,
+        &target_before,
+        &selected_ids,
+        &target_hierarchy_path,
+        offset,
+    );
+
+    Ok(MovePlan {
+        source_path,
+        target_path,
+        source_before,
+        target_before,
+        project_name,
+        target_hierarchy_path,
+        selected_ids,
+        selected_items,
+        moved_blocks,
+        required_lib_symbols,
+        selection_bounds,
+        offset,
+        crossing_warnings,
+        partial_multi_units,
+        plan_revision,
+    })
+}
+
+fn extract_migratable_items(source: &str) -> Result<Vec<SchematicItem>, CallToolResult> {
+    let tree = parse_sexp(source)
+        .map_err(|error| CallToolResult::error(format!("schematic does not parse: {error}")))?;
+    let lib_syms = tree
+        .find("lib_symbols")
+        .map(|lib_symbols| lib_symbols.find_all("symbol"))
+        .unwrap_or_default();
+    let instances = konnect_sexp::schematic::extract_symbol_instances(&tree);
+    let mut items = Vec::new();
+    for (start, end) in konnect_sexp::writer::find_direct_child_blocks(source, "kicad_sch") {
+        let block = &source[start..end];
+        let node = parse_sexp(block).map_err(|error| {
+            CallToolResult::error(format!("failed to parse schematic item block: {error}"))
+        })?;
+        let Some(kind) = node.head() else { continue };
+        if !MIGRATABLE_TAGS.contains(&kind) {
+            continue;
+        }
+        let Some(uuid) = node.find_str("uuid") else {
+            continue;
+        };
+        let reference = property_value(&node, "Reference").map(str::to_string);
+        let value = property_value(&node, "Value").map(str::to_string);
+        let footprint = property_value(&node, "Footprint").map(str::to_string);
+        let lib_id = node.find_str("lib_id").map(str::to_string);
+        let lib_name = node.find_str("lib_name").map(str::to_string);
+        let unit = node.find_f64("unit").map(|unit| unit as u32);
+        let bounds = if kind == "symbol" {
+            instances
+                .iter()
+                .find(|instance| instance.uuid.as_deref() == Some(uuid))
+                .and_then(|instance| {
+                    konnect_sexp::schematic::find_lib_symbol(&lib_syms, instance).and_then(
+                        |symbol| {
+                            konnect_sexp::schematic::symbol_bounds_for_instance(symbol, instance)
+                        },
+                    )
+                })
+                .map(|bounds| Bounds {
+                    min_x: bounds.min_x,
+                    min_y: bounds.min_y,
+                    max_x: bounds.max_x,
+                    max_y: bounds.max_y,
+                })
+                .or_else(|| item_bounds(&node))
+        } else {
+            item_bounds(&node)
+        };
+        items.push(SchematicItem {
+            uuid: uuid.to_string(),
+            kind: kind.to_string(),
+            source: block.to_string(),
+            reference,
+            value,
+            footprint,
+            lib_id,
+            lib_name,
+            unit,
+            bounds,
+        });
+    }
+    Ok(items)
+}
+
+fn property_value<'a>(node: &'a konnect_sexp::SexpNode, name: &str) -> Option<&'a str> {
+    node.find_all("property")
+        .into_iter()
+        .find(|property| property.get(1).and_then(|n| n.as_str()) == Some(name))
+        .and_then(|property| property.get(2))
+        .and_then(|value| value.as_str())
+}
+
+fn item_bounds(node: &konnect_sexp::SexpNode) -> Option<Bounds> {
+    let mut bounds: Option<Bounds> = None;
+    let mut include = |x: f64, y: f64| match &mut bounds {
+        Some(bounds) => bounds.include(x, y),
+        None => bounds = Some(Bounds::from_point(x, y)),
+    };
+
+    if let Some(at) = node.find("at") {
+        if let (Some(x), Some(y)) = (at.get_f64(1), at.get_f64(2)) {
+            include(x, y);
+        }
+    }
+    for tag in ["start", "end", "center", "mid"] {
+        if let Some(point) = node.find(tag) {
+            if let (Some(x), Some(y)) = (point.get_f64(1), point.get_f64(2)) {
+                include(x, y);
+            }
+        }
+    }
+    if let Some(points) = node.find("pts") {
+        for point in points.find_all("xy") {
+            if let (Some(x), Some(y)) = (point.get_f64(1), point.get_f64(2)) {
+                include(x, y);
+            }
+        }
+    }
+    if node.head() == Some("circle") {
+        if let (Some(center), Some(radius)) = (node.find("center"), node.find_f64("radius")) {
+            if let (Some(x), Some(y)) = (center.get_f64(1), center.get_f64(2)) {
+                include(x - radius, y - radius);
+                include(x + radius, y + radius);
+            }
+        }
+    }
+    bounds
+}
+
+fn select_initial_items(
+    selector: &Value,
+    items: &[SchematicItem],
+) -> Result<HashSet<String>, CallToolResult> {
+    if !selector.is_object() {
+        return Err(CallToolResult::error("selection must be an object"));
+    }
+    let references = string_array(selector, "references")?;
+    let uuids = string_array(selector, "uuids")?;
+    let bbox = parse_selection_bbox(selector.get("bbox"))?;
+    if references.is_empty() && uuids.is_empty() && bbox.is_none() {
+        return Err(CallToolResult::error(
+            "selection must include references, uuids, or bbox",
+        ));
+    }
+
+    let known_refs = items
+        .iter()
+        .filter_map(|item| item.reference.as_deref())
+        .collect::<HashSet<_>>();
+    for reference in &references {
+        if !known_refs.contains(reference.as_str()) {
+            return Err(CallToolResult::error(format!(
+                "component reference '{reference}' was not found in source_schematic"
+            )));
+        }
+    }
+    let known_uuids = items
+        .iter()
+        .map(|item| item.uuid.as_str())
+        .collect::<HashSet<_>>();
+    for uuid in &uuids {
+        if !known_uuids.contains(uuid.as_str()) {
+            return Err(CallToolResult::error(format!(
+                "item UUID '{uuid}' was not found in source_schematic"
+            )));
+        }
+    }
+
+    let mut selected = HashSet::new();
+    for item in items {
+        if item
+            .reference
+            .as_ref()
+            .is_some_and(|reference| references.contains(reference))
+            || uuids.contains(&item.uuid)
+            || bbox.is_some_and(|bbox| item.bounds.is_some_and(|bounds| bounds.intersects(bbox)))
+        {
+            selected.insert(item.uuid.clone());
+        }
+    }
+    Ok(selected)
+}
+
+fn string_array(value: &Value, field: &str) -> Result<Vec<String>, CallToolResult> {
+    match value.get(field) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        CallToolResult::error(format!(
+                            "selection.{field} must contain only non-empty strings"
+                        ))
+                    })
+            })
+            .collect(),
+        Some(_) => Err(CallToolResult::error(format!(
+            "selection.{field} must be an array"
+        ))),
+    }
+}
+
+fn parse_selection_bbox(value: Option<&Value>) -> Result<Option<Bounds>, CallToolResult> {
+    let Some(value) = value else { return Ok(None) };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let numbers = if let Some(items) = value.as_array() {
+        if items.len() != 4 {
+            return Err(CallToolResult::error(
+                "selection.bbox array must be [min_x,min_y,max_x,max_y]",
+            ));
+        }
+        items
+            .iter()
+            .map(|value| value.as_f64())
+            .collect::<Option<Vec<_>>>()
+    } else if let Some(object) = value.as_object() {
+        let get = |names: &[&str]| {
+            names
+                .iter()
+                .find_map(|name| object.get(*name))
+                .and_then(Value::as_f64)
+        };
+        match (
+            get(&["min_x", "x_min", "x1"]),
+            get(&["min_y", "y_min", "y1"]),
+            get(&["max_x", "x_max", "x2"]),
+            get(&["max_y", "y_max", "y2"]),
+        ) {
+            (Some(min_x), Some(min_y), Some(max_x), Some(max_y)) => {
+                Some(vec![min_x, min_y, max_x, max_y])
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let Some(numbers) = numbers else {
+        return Err(CallToolResult::error(
+            "selection.bbox must be an array or object with finite numeric bounds",
+        ));
+    };
+    if numbers.iter().any(|number| !number.is_finite()) {
+        return Err(CallToolResult::error(
+            "selection.bbox coordinates must be finite numbers",
+        ));
+    }
+    let min_x = numbers[0].min(numbers[2]);
+    let max_x = numbers[0].max(numbers[2]);
+    let min_y = numbers[1].min(numbers[3]);
+    let max_y = numbers[1].max(numbers[3]);
+    Ok(Some(Bounds {
+        min_x,
+        min_y,
+        max_x,
+        max_y,
+    }))
+}
+
+fn selected_bounds(items: &[SchematicItem], selected: &HashSet<String>) -> Option<Bounds> {
+    items
+        .iter()
+        .filter(|item| selected.contains(&item.uuid))
+        .filter_map(|item| item.bounds)
+        .reduce(Bounds::union)
+}
+
+fn partial_multi_unit_refs(items: &[SchematicItem], selected: &HashSet<String>) -> Vec<String> {
+    let mut by_reference: HashMap<&str, Vec<&SchematicItem>> = HashMap::new();
+    for item in items
+        .iter()
+        .filter(|item| item.kind == "symbol")
+        .filter(|item| {
+            item.reference
+                .as_deref()
+                .is_some_and(|reference| !reference.is_empty())
+        })
+    {
+        by_reference
+            .entry(item.reference.as_deref().unwrap())
+            .or_default()
+            .push(item);
+    }
+    let mut partial = by_reference
+        .into_iter()
+        .filter_map(|(reference, symbols)| {
+            let selected_count = symbols
+                .iter()
+                .filter(|item| selected.contains(&item.uuid))
+                .count();
+            (symbols.len() > 1 && selected_count > 0 && selected_count < symbols.len())
+                .then(|| format!("{reference} ({selected_count}/{})", symbols.len()))
+        })
+        .collect::<Vec<_>>();
+    partial.sort();
+    partial
+}
+
+fn multi_unit_summary(items: &[SchematicItem]) -> Vec<Value> {
+    let mut by_reference: HashMap<&str, Vec<&SchematicItem>> = HashMap::new();
+    for item in items.iter().filter(|item| item.kind == "symbol") {
+        if let Some(reference) = item
+            .reference
+            .as_deref()
+            .filter(|reference| !reference.is_empty())
+        {
+            by_reference.entry(reference).or_default().push(item);
+        }
+    }
+    let mut out = by_reference
+        .into_iter()
+        .filter(|(_, symbols)| symbols.len() > 1)
+        .map(|(reference, symbols)| {
+            json!({
+                "reference": reference,
+                "units": symbols.iter().filter_map(|item| item.unit).collect::<Vec<_>>(),
+                "count": symbols.len()
+            })
+        })
+        .collect::<Vec<_>>();
+    out.sort_by(|a, b| a["reference"].as_str().cmp(&b["reference"].as_str()));
+    out
+}
+
+fn affected_nets(items: &[SchematicItem]) -> Vec<String> {
+    let mut nets = items
+        .iter()
+        .filter_map(|item| match item.kind.as_str() {
+            "label" | "global_label" | "hierarchical_label" => first_string_payload(&item.source),
+            "symbol" if item.is_power_symbol() => item.value.clone(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    nets.sort();
+    nets.dedup();
+    nets
+}
+
+fn first_string_payload(block: &str) -> Option<String> {
+    let node = parse_sexp(block).ok()?;
+    node.get(1)
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
+fn crossing_warnings(items: &[SchematicItem], base_bounds: Option<Bounds>) -> Vec<String> {
+    let Some(bounds) = base_bounds else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter(|item| matches!(item.kind.as_str(), "wire" | "bus"))
+        .filter_map(|item| {
+            let node = parse_sexp(&item.source).ok()?;
+            let points = point_list(&node);
+            if points.len() < 2 {
+                return None;
+            }
+            let inside = points
+                .iter()
+                .filter(|(x, y)| bounds.contains(*x, *y))
+                .count();
+            (inside > 0 && inside < points.len()).then(|| {
+                format!(
+                    "{} {} crosses the selected boundary; verify hierarchy pins/labels for the external net",
+                    item.kind, item.uuid
+                )
+            })
+        })
+        .collect()
+}
+
+fn point_list(node: &konnect_sexp::SexpNode) -> Vec<(f64, f64)> {
+    let mut points = Vec::new();
+    if let Some(at) = node.find("at") {
+        if let (Some(x), Some(y)) = (at.get_f64(1), at.get_f64(2)) {
+            points.push((x, y));
+        }
+    }
+    for tag in ["start", "mid", "end", "center"] {
+        if let Some(point) = node.find(tag) {
+            if let (Some(x), Some(y)) = (point.get_f64(1), point.get_f64(2)) {
+                points.push((x, y));
+            }
+        }
+    }
+    if let Some(pts) = node.find("pts") {
+        for point in pts.find_all("xy") {
+            if let (Some(x), Some(y)) = (point.get_f64(1), point.get_f64(2)) {
+                points.push((x, y));
+            }
+        }
+    }
+    points
+}
+
+fn target_instance_path(
+    source_path: &Path,
+    target_path: &Path,
+    source: &str,
+) -> Result<String, CallToolResult> {
+    let source_root_uuid = parse_sexp(source)
+        .ok()
+        .and_then(|root| root.find_str("uuid").map(str::to_string))
+        .ok_or_else(|| {
+            CallToolResult::error("source_schematic must have a root UUID to compute sheet paths")
+        })?;
+    let source_dir = parent_dir(source_path);
+    let target_canonical = target_path.canonicalize().map_err(|error| {
+        CallToolResult::error(format!("failed to canonicalize target_schematic: {error}"))
+    })?;
+    let source_sheet = cse::Schematic::load(source_path).map_err(|error| {
+        CallToolResult::error(format!("failed to load source_schematic: {error}"))
+    })?;
+    let sheet = source_sheet.sheets.iter().find(|sheet| {
+        let sheet_path = source_dir.join(sheet.file());
+        sheet_path
+            .canonicalize()
+            .is_ok_and(|path| path == target_canonical)
+    });
+    let Some(sheet) = sheet else {
+        return Err(CallToolResult::error(
+            "target_schematic must be linked by a hierarchical sheet in source_schematic",
+        ));
+    };
+    Ok(format!("/{source_root_uuid}/{}", sheet.uuid))
+}
+
+fn retarget_symbol_instance_path(
+    block: &str,
+    project_name: &str,
+    target_path: &str,
+) -> Result<String, konnect_sexp::SexpError> {
+    let node = parse_sexp(block)?;
+    if node.head() != Some("symbol") || node.find("lib_id").is_none() {
+        return Ok(block.to_string());
+    }
+    let replaced = replace_project_instance_paths(block, project_name, target_path)?;
+    let fake = format!("(kicad_sch\n{replaced}\n)");
+    let Some(command) = SchematicCommand::ensure_symbol_instance_path(
+        &fake,
+        project_name,
+        target_path,
+        "Patch moved symbol instance path",
+    )?
+    else {
+        return Ok(replaced);
+    };
+    let (patched, _) = prepare_command(Path::new("moved-symbol.kicad_sch"), &fake, &command)?;
+    let items = extract_migratable_items(&patched).map_err(|error| {
+        konnect_sexp::SexpError::InvalidValue(format!(
+            "patched symbol instance path produced invalid item: {:?}",
+            error.content
+        ))
+    })?;
+    items
+        .into_iter()
+        .find(|item| item.kind == "symbol")
+        .map(|item| item.source)
+        .ok_or_else(|| {
+            konnect_sexp::SexpError::MissingNode("patched moved symbol block".to_string())
+        })
+}
+
+fn replace_project_instance_paths(
+    block: &str,
+    project_name: &str,
+    target_path: &str,
+) -> Result<String, konnect_sexp::SexpError> {
+    let mut edits = Vec::new();
+    for (instances_start, instances_end) in
+        konnect_sexp::writer::find_direct_child_blocks(block, "symbol")
+    {
+        let instances_block = &block[instances_start..instances_end];
+        let instances_node = parse_sexp(instances_block)?;
+        if instances_node.head() != Some("instances") {
+            continue;
+        }
+        for (project_start, project_end) in
+            konnect_sexp::writer::find_direct_child_blocks(instances_block, "instances")
+        {
+            let project_block = &instances_block[project_start..project_end];
+            let project_node = parse_sexp(project_block)?;
+            if project_node.head() != Some("project")
+                || project_node.get(1).and_then(|value| value.as_str()) != Some(project_name)
+            {
+                continue;
+            }
+            for (path_start, path_end) in
+                konnect_sexp::writer::find_direct_child_blocks(project_block, "project")
+            {
+                let path_block = &project_block[path_start..path_end];
+                let path_node = parse_sexp(path_block)?;
+                if path_node.head() != Some("path") {
+                    continue;
+                }
+                if let Some((start, end)) = first_quoted_string(path_block) {
+                    edits.push(konnect_sexp::writer::SexpEdit::replace(
+                        instances_start + project_start + path_start + start,
+                        instances_start + project_start + path_start + end,
+                        escape_quoted(target_path),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(konnect_sexp::writer::apply_edits(block.to_string(), edits))
+}
+
+fn first_quoted_string(source: &str) -> Option<(usize, usize)> {
+    let bytes = source.as_bytes();
+    let start_quote = bytes.iter().position(|byte| *byte == b'"')?;
+    let mut escaped = false;
+    for (index, byte) in bytes[start_quote + 1..].iter().copied().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match byte {
+            b'\\' => escaped = true,
+            b'"' => return Some((start_quote + 1, start_quote + 1 + index)),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn escape_quoted(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\t', "\\t")
+}
+
+fn translate_coordinate_clauses(block: &str, dx: f64, dy: f64) -> String {
+    let mut edits = Vec::new();
+    let mut index = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let bytes = block.as_bytes();
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if escaped {
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        if in_string {
+            match byte {
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            index += 1;
+            continue;
+        }
+        if byte == b'"' {
+            in_string = true;
+            index += 1;
+            continue;
+        }
+        if byte == b'(' {
+            for tag in ["at", "start", "mid", "end", "center", "xy"] {
+                if let Some(after_tag) = coordinate_tag_end(block, index, tag) {
+                    if let Some((x_start, x_end, x)) = parse_number_at(block, after_tag) {
+                        if let Some((y_start, y_end, y)) = parse_number_at(block, x_end) {
+                            edits.push(konnect_sexp::writer::SexpEdit::replace(
+                                x_start,
+                                x_end,
+                                fmt_f64(x + dx),
+                            ));
+                            edits.push(konnect_sexp::writer::SexpEdit::replace(
+                                y_start,
+                                y_end,
+                                fmt_f64(y + dy),
+                            ));
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        index += 1;
+    }
+    konnect_sexp::writer::apply_edits(block.to_string(), edits)
+}
+
+fn coordinate_tag_end(source: &str, offset: usize, tag: &str) -> Option<usize> {
+    let rest = source.get(offset..)?;
+    let prefix = format!("({tag}");
+    if !rest.starts_with(&prefix) {
+        return None;
+    }
+    let after = offset + prefix.len();
+    source
+        .as_bytes()
+        .get(after)
+        .is_some_and(|byte| byte.is_ascii_whitespace() || *byte == b')')
+        .then_some(after)
+}
+
+fn parse_number_at(source: &str, offset: usize) -> Option<(usize, usize, f64)> {
+    let bytes = source.as_bytes();
+    let mut start = offset;
+    while bytes.get(start).is_some_and(u8::is_ascii_whitespace) {
+        start += 1;
+    }
+    let mut end = start;
+    while bytes
+        .get(end)
+        .is_some_and(|byte| !byte.is_ascii_whitespace() && !matches!(*byte, b')' | b'('))
+    {
+        end += 1;
+    }
+    (start < end)
+        .then(|| {
+            source[start..end]
+                .parse::<f64>()
+                .ok()
+                .map(|number| (start, end, number))
+        })
+        .flatten()
+}
+
+fn add_missing_lib_symbols(
+    target: &str,
+    source: &str,
+    required: &[String],
+) -> Result<String, konnect_sexp::SexpError> {
+    if required.is_empty() {
+        return Ok(target.to_string());
+    }
+    let source_symbols = embedded_lib_symbols(source)?;
+    let target_symbols = embedded_lib_symbols(target)?;
+    let target_names = target_symbols.keys().cloned().collect::<HashSet<_>>();
+    let missing = required
+        .iter()
+        .filter(|name| !target_names.contains(name.as_str()))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(target.to_string());
+    }
+    let mut insertion = String::new();
+    for name in missing {
+        let Some(block) = source_symbols.get(name.as_str()) else {
+            return Err(konnect_sexp::SexpError::MissingNode(format!(
+                "embedded lib_symbol {name}"
+            )));
+        };
+        insertion.push('\n');
+        insertion.push_str(&indent_block(block, "\t\t"));
+    }
+    insert_into_lib_symbols(target, &insertion)
+}
+
+fn embedded_lib_symbols(source: &str) -> Result<HashMap<String, String>, konnect_sexp::SexpError> {
+    let mut out = HashMap::new();
+    for (start, end) in konnect_sexp::writer::find_direct_child_blocks(source, "kicad_sch") {
+        let block = &source[start..end];
+        let node = parse_sexp(block)?;
+        if node.head() != Some("lib_symbols") {
+            continue;
+        }
+        for (symbol_start, symbol_end) in
+            konnect_sexp::writer::find_direct_child_blocks(block, "lib_symbols")
+        {
+            let symbol_block = &block[symbol_start..symbol_end];
+            let symbol_node = parse_sexp(symbol_block)?;
+            if symbol_node.head() == Some("symbol") {
+                if let Some(name) = symbol_node.get(1).and_then(|value| value.as_str()) {
+                    out.insert(name.to_string(), symbol_block.to_string());
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn insert_into_lib_symbols(
+    target: &str,
+    insertion: &str,
+) -> Result<String, konnect_sexp::SexpError> {
+    for (start, end) in konnect_sexp::writer::find_direct_child_blocks(target, "kicad_sch") {
+        let block = &target[start..end];
+        let node = parse_sexp(block)?;
+        if node.head() != Some("lib_symbols") {
+            continue;
+        }
+        let close = block.rfind(')').ok_or_else(|| {
+            konnect_sexp::SexpError::InvalidValue("lib_symbols block is malformed".to_string())
+        })?;
+        return Ok(konnect_sexp::writer::apply_edits(
+            target.to_string(),
+            vec![konnect_sexp::writer::SexpEdit::insert(
+                start + close,
+                insertion,
+            )],
+        ));
+    }
+    let root_children = konnect_sexp::writer::find_direct_child_blocks(target, "kicad_sch");
+    let anchor = root_children
+        .iter()
+        .find_map(|(start, _)| {
+            let block = &target[*start..];
+            block
+                .starts_with("(paper")
+                .then_some(target[..*start].rfind('\n').map_or(*start, |line| line + 1))
+        })
+        .unwrap_or_else(|| {
+            target
+                .rfind(')')
+                .map(|index| target[..index].rfind('\n').map_or(index, |line| line + 1))
+                .unwrap_or(target.len())
+        });
+    let block = format!("\t(lib_symbols{insertion}\n\t)\n");
+    Ok(konnect_sexp::writer::apply_edits(
+        target.to_string(),
+        vec![konnect_sexp::writer::SexpEdit::insert(anchor, block)],
+    ))
+}
+
+fn indent_block(block: &str, indent: &str) -> String {
+    block
+        .lines()
+        .map(|line| format!("{indent}{line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn validate_migration_result(
+    plan: &MovePlan,
+    source_after: &str,
+    target_after: &str,
+) -> anyhow::Result<()> {
+    parse_sexp(source_after)?;
+    parse_sexp(target_after)?;
+    ensure_unique_uuids(source_after, "source_schematic")?;
+    ensure_unique_uuids(target_after, "target_schematic")?;
+
+    let source_items = extract_migratable_items(source_after)
+        .map_err(|error| anyhow::anyhow!("source result validation failed: {:?}", error.content))?;
+    let target_items = extract_migratable_items(target_after)
+        .map_err(|error| anyhow::anyhow!("target result validation failed: {:?}", error.content))?;
+    for item in &plan.selected_items {
+        if source_items
+            .iter()
+            .any(|candidate| candidate.uuid == item.uuid)
+        {
+            anyhow::bail!(
+                "selected item {} still exists in source after migration",
+                item.uuid
+            );
+        }
+        let Some(after) = target_items
+            .iter()
+            .find(|candidate| candidate.uuid == item.uuid)
+        else {
+            anyhow::bail!(
+                "selected item {} was not found in target after migration",
+                item.uuid
+            );
+        };
+        if after.reference != item.reference
+            || after.value != item.value
+            || after.footprint != item.footprint
+            || after.lib_id != item.lib_id
+            || after.lib_name != item.lib_name
+            || after.unit != item.unit
+        {
+            anyhow::bail!(
+                "selected item {} changed identity metadata during migration",
+                item.uuid
+            );
+        }
+    }
+    validate_component_references(&target_items)?;
+    for item in plan
+        .selected_items
+        .iter()
+        .filter(|item| item.kind == "symbol")
+    {
+        let Some(block) = plan.moved_blocks.get(&item.uuid) else {
+            continue;
+        };
+        let node = parse_sexp(block)?;
+        if !symbol_has_instance_path_local(&node, &plan.project_name, &plan.target_hierarchy_path) {
+            anyhow::bail!(
+                "moved symbol {} does not carry target hierarchy path {}",
+                item.uuid,
+                plan.target_hierarchy_path
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_component_references(items: &[SchematicItem]) -> anyhow::Result<()> {
+    let mut by_reference: HashMap<&str, Vec<&SchematicItem>> = HashMap::new();
+    for item in items {
+        if let Some(reference) = item
+            .reference
+            .as_deref()
+            .filter(|reference| !reference.is_empty())
+        {
+            by_reference.entry(reference).or_default().push(item);
+        }
+    }
+
+    for (reference, group) in by_reference {
+        if group.len() <= 1 {
+            continue;
+        }
+        if group.iter().any(|item| item.kind != "symbol") {
+            anyhow::bail!("target_schematic contains duplicate non-symbol reference {reference}");
+        }
+
+        let first = group[0];
+        let mut units = HashSet::new();
+        for item in group {
+            if item.lib_id != first.lib_id
+                || item.lib_name != first.lib_name
+                || item.value != first.value
+                || item.footprint != first.footprint
+            {
+                anyhow::bail!(
+                    "target_schematic contains duplicate reference {reference} with inconsistent component metadata"
+                );
+            }
+            let unit = item.unit.unwrap_or(1);
+            if !units.insert(unit) {
+                anyhow::bail!(
+                    "target_schematic contains duplicate reference {reference} unit {unit}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_unique_uuids(source: &str, label: &str) -> anyhow::Result<()> {
+    let mut seen = HashSet::new();
+    let mut rest = source;
+    const PREFIX: &str = "(uuid \"";
+    while let Some(index) = rest.find(PREFIX) {
+        let value = &rest[index + PREFIX.len()..];
+        let Some(end) = value.find('"') else {
+            break;
+        };
+        let uuid = &value[..end];
+        if !seen.insert(uuid.to_string()) {
+            anyhow::bail!("{label} contains duplicate UUID {uuid}");
+        }
+        rest = &value[end..];
+    }
+    Ok(())
+}
+
+fn symbol_has_instance_path_local(
+    node: &konnect_sexp::SexpNode,
+    project_name: &str,
+    path: &str,
+) -> bool {
+    node.find("instances").is_some_and(|instances| {
+        instances.find_all("project").iter().any(|project| {
+            project.get(1).and_then(|value| value.as_str()) == Some(project_name)
+                && project.find_all("path").iter().any(|instance_path| {
+                    instance_path.get(1).and_then(|value| value.as_str()) == Some(path)
+                })
+        })
+    })
+}
+
+fn migration_plan_revision(
+    source: &str,
+    target: &str,
+    selected_ids: &[String],
+    target_hierarchy_path: &str,
+    offset: (f64, f64),
+) -> String {
+    let mut material = String::new();
+    material.push_str(&DocumentRevision::of(source).to_string());
+    material.push('\n');
+    material.push_str(&DocumentRevision::of(target).to_string());
+    material.push('\n');
+    material.push_str(target_hierarchy_path);
+    material.push('\n');
+    material.push_str(&fmt_f64(offset.0));
+    material.push(',');
+    material.push_str(&fmt_f64(offset.1));
+    for id in selected_ids {
+        material.push('\n');
+        material.push_str(id);
+    }
+    let revision = DocumentRevision::of(&material);
+    format!("move-schematic-items:{revision}")
+}
+
+fn same_file(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+fn transaction_root(source: &Path, target: &Path) -> anyhow::Result<PathBuf> {
+    let source_parent = source
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("source_schematic has no parent directory"))?
+        .canonicalize()?;
+    let target_parent = target
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("target_schematic has no parent directory"))?
+        .canonicalize()?;
+    if target_parent.starts_with(&source_parent) {
+        Ok(source_parent)
+    } else if source_parent.starts_with(&target_parent) {
+        Ok(target_parent)
+    } else {
+        anyhow::bail!(
+            "source_schematic and target_schematic must share a project directory for atomic migration"
+        );
+    }
+}
+
+#[derive(Debug)]
+struct DeleteUnlinkedChildPlan {
+    root_path: PathBuf,
+    target_path: PathBuf,
+    plan_revision: String,
+}
+
+impl DeleteUnlinkedChildPlan {
+    fn response(&self, dry_run: bool, deleted: bool) -> Value {
+        json!({
+            "dry_run": dry_run,
+            "deleted": deleted,
+            "safe_to_apply": true,
+            "plan_revision": self.plan_revision,
+            "root_schematic": self.root_path.display().to_string(),
+            "target_schematic": self.target_path.display().to_string(),
+            "reason": "target schematic is unlinked from the root hierarchy and contains no movable schematic items or child sheets"
+        })
+    }
+}
+
+async fn handle_delete_unlinked_child_schematic(
+    args: &Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let root_path = get_path(args, "root_schematic")?;
+    let target_path = get_path(args, "target_schematic")?;
+    let dry_run = args.get("dry_run").and_then(Value::as_bool).unwrap_or(true);
+
+    let plan = match build_delete_unlinked_child_plan(root_path, target_path) {
+        Ok(plan) => plan,
+        Err(error) => return Ok(error),
+    };
+
+    if dry_run {
+        return Ok(CallToolResult::json(&plan.response(true, false)));
+    }
+
+    let supplied_revision = args
+        .get("plan_revision")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if supplied_revision != plan.plan_revision {
+        return Ok(CallToolResult::error(format!(
+            "plan_revision mismatch; rerun dry_run and apply exactly '{}'",
+            plan.plan_revision
+        )));
+    }
+
+    fs::remove_file(&plan.target_path)?;
+    Ok(CallToolResult::json(&plan.response(false, true)))
+}
+
+fn build_delete_unlinked_child_plan(
+    root_path: PathBuf,
+    target_path: PathBuf,
+) -> Result<DeleteUnlinkedChildPlan, CallToolResult> {
+    if !root_path.is_file() {
+        return Err(CallToolResult::error("root_schematic is not a file"));
+    }
+    if same_file(&root_path, &target_path) {
+        return Err(CallToolResult::error(
+            "target_schematic must be different from root_schematic",
+        ));
+    }
+    if target_path
+        .extension()
+        .is_none_or(|extension| extension != "kicad_sch")
+    {
+        return Err(CallToolResult::error(
+            "target_schematic must be a .kicad_sch file",
+        ));
+    }
+
+    let metadata = fs::symlink_metadata(&target_path).map_err(|error| {
+        CallToolResult::error(format!("failed to inspect target_schematic: {error}"))
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(CallToolResult::error(
+            "target_schematic must not be a symlink",
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(CallToolResult::error(
+            "target_schematic must be a regular file",
+        ));
+    }
+
+    let root_dir = root_path
+        .parent()
+        .ok_or_else(|| CallToolResult::error("root_schematic has no parent directory"))?
+        .canonicalize()
+        .map_err(|error| {
+            CallToolResult::error(format!(
+                "failed to canonicalize root project directory: {error}"
+            ))
+        })?;
+    let target_canonical = target_path.canonicalize().map_err(|error| {
+        CallToolResult::error(format!("failed to canonicalize target_schematic: {error}"))
+    })?;
+    if !target_canonical.starts_with(&root_dir) {
+        return Err(CallToolResult::error(
+            "target_schematic must be inside root_schematic's project directory",
+        ));
+    }
+
+    let root_before = read_consistent(&root_path).map_err(|error| {
+        CallToolResult::error(format!("failed to read root_schematic: {error}"))
+    })?;
+    parse_sexp(&root_before).map_err(|error| {
+        CallToolResult::error(format!("root_schematic does not parse: {error}"))
+    })?;
+
+    let target_before = read_consistent(&target_path).map_err(|error| {
+        CallToolResult::error(format!("failed to read target_schematic: {error}"))
+    })?;
+    parse_sexp(&target_before).map_err(|error| {
+        CallToolResult::error(format!("target_schematic does not parse: {error}"))
+    })?;
+
+    let linked_paths = linked_child_schematic_paths(&root_path)?;
+    if linked_paths.contains(&target_canonical) {
+        return Err(CallToolResult::error(
+            "target_schematic is still linked from the root hierarchy",
+        ));
+    }
+
+    let target_items = extract_migratable_items(&target_before)?;
+    if !target_items.is_empty() {
+        return Err(CallToolResult::error(format!(
+            "target_schematic is not empty; found {} movable schematic item(s)",
+            target_items.len()
+        )));
+    }
+    let child_sheet_count = direct_child_count(&target_before, "sheet")?;
+    if child_sheet_count > 0 {
+        return Err(CallToolResult::error(format!(
+            "target_schematic is not empty; found {child_sheet_count} child sheet(s)"
+        )));
+    }
+
+    let plan_revision =
+        delete_unlinked_child_plan_revision(&root_before, &target_before, &target_canonical);
+    Ok(DeleteUnlinkedChildPlan {
+        root_path,
+        target_path,
+        plan_revision,
+    })
+}
+
+fn linked_child_schematic_paths(root_path: &Path) -> Result<HashSet<PathBuf>, CallToolResult> {
+    let mut visited = HashSet::new();
+    let mut linked = HashSet::new();
+    collect_linked_child_schematic_paths(root_path, &mut visited, &mut linked)?;
+    Ok(linked)
+}
+
+fn collect_linked_child_schematic_paths(
+    path: &Path,
+    visited: &mut HashSet<PathBuf>,
+    linked: &mut HashSet<PathBuf>,
+) -> Result<(), CallToolResult> {
+    let canonical = path.canonicalize().map_err(|error| {
+        CallToolResult::error(format!(
+            "failed to canonicalize schematic {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !visited.insert(canonical.clone()) {
+        return Ok(());
+    }
+
+    let schematic = cse::Schematic::load(&canonical).map_err(|error| {
+        CallToolResult::error(format!(
+            "failed to load schematic {}: {error}",
+            canonical.display()
+        ))
+    })?;
+    let dir = parent_dir(&canonical);
+    for sheet in &schematic.sheets {
+        let child_path = dir.join(sheet.file());
+        let Ok(child_canonical) = child_path.canonicalize() else {
+            continue;
+        };
+        linked.insert(child_canonical.clone());
+        if child_canonical.is_file() {
+            collect_linked_child_schematic_paths(&child_canonical, visited, linked)?;
+        }
+    }
+    Ok(())
+}
+
+fn direct_child_count(source: &str, tag: &str) -> Result<usize, CallToolResult> {
+    let mut count = 0usize;
+    for (start, end) in konnect_sexp::writer::find_direct_child_blocks(source, "kicad_sch") {
+        let block = &source[start..end];
+        let node = parse_sexp(block).map_err(|error| {
+            CallToolResult::error(format!("failed to parse schematic child block: {error}"))
+        })?;
+        if node.head() == Some(tag) {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+fn delete_unlinked_child_plan_revision(root: &str, target: &str, target_path: &Path) -> String {
+    let mut material = String::new();
+    material.push_str(&DocumentRevision::of(root).to_string());
+    material.push('\n');
+    material.push_str(&DocumentRevision::of(target).to_string());
+    material.push('\n');
+    material.push_str(&target_path.display().to_string());
+    let revision = DocumentRevision::of(&material);
+    format!("delete-unlinked-child-schematic:{revision}")
 }
 
 // ─── Handlers ───────────────────────────────────────────────────────────────
@@ -1529,11 +3306,580 @@ mod tests {
     }
 
     fn result_json(result: &CallToolResult) -> Value {
-        let text = match &result.content[0] {
+        serde_json::from_str(&result_text(result)).unwrap()
+    }
+
+    fn result_text(result: &CallToolResult) -> String {
+        match &result.content[0] {
             crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
             _ => panic!("expected text content"),
-        };
-        serde_json::from_str(&text).unwrap()
+        }
+    }
+
+    fn write_migration_fixture(tmp: &TempDir) -> (PathBuf, PathBuf) {
+        let root = tmp.path().join("root.kicad_sch");
+        let child = tmp.path().join("child.kicad_sch");
+        std::fs::write(
+            &root,
+            r##"(kicad_sch
+  (version 20250610)
+  (generator "konnect-test")
+  (uuid "root-uuid")
+  (paper "A4")
+  (lib_symbols
+    (symbol "Device:C"
+      (pin passive line (at 0 2.54 270) (length 1.27) (name "" (effects (font (size 1.27 1.27)))) (number "1" (effects (font (size 1.27 1.27)))))
+      (pin passive line (at 0 -2.54 90) (length 1.27) (name "" (effects (font (size 1.27 1.27)))) (number "2" (effects (font (size 1.27 1.27)))))
+    )
+    (symbol "Device:R"
+      (pin passive line (at 0 2.54 270) (length 1.27) (name "" (effects (font (size 1.27 1.27)))) (number "1" (effects (font (size 1.27 1.27)))))
+      (pin passive line (at 0 -2.54 90) (length 1.27) (name "" (effects (font (size 1.27 1.27)))) (number "2" (effects (font (size 1.27 1.27)))))
+    )
+    (symbol "power:GND"
+      (power)
+      (pin power_in line (at 0 0 0) (length 0) (name "GND" (effects (font (size 1.27 1.27)))) (number "1" (effects (font (size 1.27 1.27)))))
+    )
+  )
+  (symbol
+    (lib_id "Device:C")
+    (at 20 20 0)
+    (unit 1)
+    (dnp yes)
+    (in_bom no)
+    (on_board yes)
+    (property "Reference" "C1" (at 20 16 0))
+    (property "Value" "100n" (at 20 24 0))
+    (property "Footprint" "Capacitor_SMD:C_0402" (at 20 28 0))
+    (uuid "sym-c1")
+    (instances
+      (project "root"
+        (path "/root-uuid" (reference "C1") (unit 1))
+      )
+    )
+  )
+  (symbol
+    (lib_id "Device:R")
+    (at 40 20 0)
+    (unit 1)
+    (property "Reference" "R1" (at 40 16 0))
+    (property "Value" "10k" (at 40 24 0))
+    (uuid "sym-r1")
+    (instances
+      (project "root"
+        (path "/root-uuid" (reference "R1") (unit 1))
+      )
+    )
+  )
+  (symbol
+    (lib_id "power:GND")
+    (at 20 25.08 0)
+    (unit 1)
+    (property "Reference" "#PWR01" (at 20 25.08 0))
+    (property "Value" "GND" (at 20 27.62 0))
+    (uuid "sym-gnd")
+  )
+  (wire
+    (pts
+      (xy 20 22.54)
+      (xy 20 25.08)
+    )
+    (stroke (width 0) (type default))
+    (uuid "wire-c1-gnd")
+  )
+  (junction (at 20 25.08) (diameter 0) (uuid "junction-c1"))
+  (label "LOCAL_SIG" (at 20 17.46 0) (effects (font (size 1.27 1.27))) (uuid "label-c1"))
+  (no_connect (at 20 17.46) (uuid "nc-c1"))
+  (text "move me" (at 18 12 0) (effects (font (size 1.27 1.27))) (uuid "text-c1"))
+  (sheet
+    (at 100 40)
+    (size 60 40)
+    (uuid "sheet-child")
+    (property "Sheetname" "Child" (at 100 39.365 0))
+    (property "Sheetfile" "child.kicad_sch" (at 100 80.635 0))
+    (instances
+      (project "root"
+        (path "/root-uuid" (page "2"))
+      )
+    )
+  )
+  (sheet_instances
+    (path "/" (page "1"))
+  )
+)"##,
+        )
+        .unwrap();
+        std::fs::write(
+            &child,
+            r#"(kicad_sch
+  (version 20250610)
+  (generator "konnect-test")
+  (uuid "child-uuid")
+  (paper "A4")
+  (lib_symbols
+  )
+  (sheet_instances
+    (path "/" (page "2"))
+  )
+)"#,
+        )
+        .unwrap();
+        (root, child)
+    }
+
+    async fn migration_dry_run(root: &Path, child: &Path) -> Value {
+        let result = handle_move_schematic_items_to_sheet(
+            &json!({
+                "source_schematic": root.display().to_string(),
+                "target_schematic": child.display().to_string(),
+                "selection": { "references": ["C1"] },
+                "include_connected": {
+                    "wires": true,
+                    "junctions": true,
+                    "labels": true,
+                    "power_symbols": true,
+                    "no_connects": true,
+                    "text": true
+                },
+                "dry_run": true
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{}", result_text(&result));
+        result_json(&result)
+    }
+
+    #[tokio::test]
+    async fn move_schematic_items_dry_run_reports_revision_and_connected_items() {
+        let tmp = TempDir::new().unwrap();
+        let (root, child) = write_migration_fixture(&tmp);
+
+        let body = migration_dry_run(&root, &child).await;
+
+        assert_eq!(body["dry_run"], json!(true));
+        assert_eq!(body["applied"], json!(false));
+        assert!(body["plan_revision"]
+            .as_str()
+            .unwrap()
+            .starts_with("move-schematic-items:"));
+        assert_eq!(
+            body["target_hierarchy_path"],
+            json!("/root-uuid/sheet-child")
+        );
+        assert_eq!(body["items_to_move"]["symbol"].as_array().unwrap().len(), 2);
+        assert_eq!(body["items_to_move"]["wire"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            body["items_to_move"]["junction"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(body["items_to_move"]["label"].as_array().unwrap().len(), 1);
+        assert_eq!(body["no_connects_included"], json!(1));
+        assert!(body["local_nets_affected"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("LOCAL_SIG")));
+    }
+
+    #[tokio::test]
+    async fn move_schematic_items_apply_moves_exact_blocks_and_patches_instances() {
+        let tmp = TempDir::new().unwrap();
+        let (root, child) = write_migration_fixture(&tmp);
+        let plan = migration_dry_run(&root, &child).await;
+        let revision = plan["plan_revision"].as_str().unwrap();
+
+        let result = handle_move_schematic_items_to_sheet(
+            &json!({
+                "source_schematic": root.display().to_string(),
+                "target_schematic": child.display().to_string(),
+                "selection": { "references": ["C1"] },
+                "include_connected": {
+                    "wires": true,
+                    "junctions": true,
+                    "labels": true,
+                    "power_symbols": true,
+                    "no_connects": true,
+                    "text": true
+                },
+                "dry_run": false,
+                "plan_revision": revision
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{}", result_text(&result));
+        let body = result_json(&result);
+        assert_eq!(body["applied"], json!(true));
+
+        let root_after = std::fs::read_to_string(&root).unwrap();
+        let child_after = std::fs::read_to_string(&child).unwrap();
+        parse_sexp(&root_after).unwrap();
+        parse_sexp(&child_after).unwrap();
+        assert!(!root_after.contains("sym-c1"));
+        assert!(root_after.contains("sym-r1"));
+        assert!(child_after.contains("sym-c1"));
+        assert!(child_after.contains("(dnp yes)"));
+        assert!(child_after.contains("(in_bom no)"));
+        assert!(child_after.contains("(on_board yes)"));
+        assert!(child_after.contains("(path \"/root-uuid/sheet-child\""));
+        assert!(child_after.contains("(symbol \"Device:C\""));
+        assert!(child_after.contains("wire-c1-gnd"));
+        assert!(child_after.contains("label-c1"));
+        assert!(child_after.contains("sym-gnd"));
+    }
+
+    #[tokio::test]
+    async fn move_schematic_items_apply_requires_exact_plan_revision() {
+        let tmp = TempDir::new().unwrap();
+        let (root, child) = write_migration_fixture(&tmp);
+
+        let result = handle_move_schematic_items_to_sheet(
+            &json!({
+                "source_schematic": root.display().to_string(),
+                "target_schematic": child.display().to_string(),
+                "selection": { "references": ["C1"] },
+                "dry_run": false,
+                "plan_revision": "stale"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        assert!(result_text(&result).contains("plan_revision mismatch"));
+        assert!(std::fs::read_to_string(&root).unwrap().contains("sym-c1"));
+        assert!(!std::fs::read_to_string(&child).unwrap().contains("sym-c1"));
+    }
+
+    #[tokio::test]
+    async fn move_schematic_items_refuses_partial_multi_unit_by_default() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("root.kicad_sch");
+        let child = tmp.path().join("child.kicad_sch");
+        std::fs::write(
+            &root,
+            r#"(kicad_sch
+  (version 20250610)
+  (uuid "root-uuid")
+  (paper "A4")
+  (lib_symbols)
+  (symbol (lib_id "Amplifier_Operational:LM358") (at 10 10 0) (unit 1) (property "Reference" "U1" (at 10 10 0)) (property "Value" "LM358" (at 10 12 0)) (uuid "u1-a"))
+  (symbol (lib_id "Amplifier_Operational:LM358") (at 30 10 0) (unit 2) (property "Reference" "U1" (at 30 10 0)) (property "Value" "LM358" (at 30 12 0)) (uuid "u1-b"))
+  (sheet
+    (at 100 40)
+    (size 60 40)
+    (uuid "sheet-child")
+    (property "Sheetname" "Child" (at 100 39 0))
+    (property "Sheetfile" "child.kicad_sch" (at 100 81 0))
+    (instances (project "root" (path "/root-uuid" (page "2"))))
+  )
+)"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &child,
+            r#"(kicad_sch
+  (version 20250610)
+  (uuid "child-uuid")
+  (paper "A4")
+)"#,
+        )
+        .unwrap();
+
+        let result = handle_move_schematic_items_to_sheet(
+            &json!({
+                "source_schematic": root.display().to_string(),
+                "target_schematic": child.display().to_string(),
+                "selection": { "uuids": ["u1-a"] },
+                "dry_run": true
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        assert!(result_text(&result).contains("multi-unit"));
+    }
+
+    fn write_multi_unit_migration_fixture(tmp: &TempDir) -> (PathBuf, PathBuf) {
+        let root = tmp.path().join("root.kicad_sch");
+        let child = tmp.path().join("child.kicad_sch");
+        let mut symbols = String::new();
+        for unit in 1..=5 {
+            symbols.push_str(&format!(
+                r#"
+  (symbol
+    (lib_id "Device:U")
+    (at {} 10 0)
+    (unit {unit})
+    (property "Reference" "U1" (at {} 8 0))
+    (property "Value" "RK3576" (at {} 12 0))
+    (property "Footprint" "Package_BGA:BGA" (at {} 14 0))
+    (uuid "u1-{unit}")
+    (instances
+      (project "root"
+        (path "/root-uuid" (reference "U1") (unit {unit}))
+      )
+    )
+  )"#,
+                10 * unit,
+                10 * unit,
+                10 * unit,
+                10 * unit
+            ));
+        }
+        std::fs::write(
+            &root,
+            format!(
+                r#"(kicad_sch
+  (version 20250610)
+  (generator "konnect-test")
+  (uuid "root-uuid")
+  (paper "A4")
+  (lib_symbols
+    (symbol "Device:U")
+  )
+{symbols}
+  (sheet
+    (at 100 40)
+    (size 60 40)
+    (uuid "sheet-child")
+    (property "Sheetname" "Child" (at 100 39 0))
+    (property "Sheetfile" "child.kicad_sch" (at 100 81 0))
+    (instances (project "root" (path "/root-uuid" (page "2"))))
+  )
+)"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &child,
+            r#"(kicad_sch
+  (version 20250610)
+  (uuid "child-uuid")
+  (paper "A4")
+  (lib_symbols)
+)"#,
+        )
+        .unwrap();
+        (root, child)
+    }
+
+    #[tokio::test]
+    async fn move_schematic_items_apply_allows_legal_multi_unit_reference() {
+        let tmp = TempDir::new().unwrap();
+        let (root, child) = write_multi_unit_migration_fixture(&tmp);
+
+        let dry = handle_move_schematic_items_to_sheet(
+            &json!({
+                "source_schematic": root.display().to_string(),
+                "target_schematic": child.display().to_string(),
+                "selection": { "references": ["U1"] },
+                "dry_run": true
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!dry.is_error, "{}", result_text(&dry));
+        let body = result_json(&dry);
+        assert_eq!(body["safe_to_apply"], json!(true));
+        assert_eq!(
+            body["multi_unit_components_detected"],
+            json!([{ "reference": "U1", "units": [1, 2, 3, 4, 5], "count": 5 }])
+        );
+
+        let result = handle_move_schematic_items_to_sheet(
+            &json!({
+                "source_schematic": root.display().to_string(),
+                "target_schematic": child.display().to_string(),
+                "selection": { "references": ["U1"] },
+                "dry_run": false,
+                "plan_revision": body["plan_revision"].as_str().unwrap()
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{}", result_text(&result));
+
+        let root_after = std::fs::read_to_string(&root).unwrap();
+        let child_after = std::fs::read_to_string(&child).unwrap();
+        assert!(!root_after.contains("(property \"Reference\" \"U1\""));
+        for unit in 1..=5 {
+            assert!(child_after.contains(&format!("(uuid \"u1-{unit}\")")));
+            assert!(child_after.contains(&format!("(unit {unit})")));
+        }
+        assert!(child_after.contains("(path \"/root-uuid/sheet-child\""));
+    }
+
+    fn test_symbol_item(uuid: &str, reference: &str, unit: u32) -> SchematicItem {
+        SchematicItem {
+            uuid: uuid.to_string(),
+            kind: "symbol".to_string(),
+            source: String::new(),
+            reference: Some(reference.to_string()),
+            value: Some("RK3576".to_string()),
+            footprint: Some("Package_BGA:BGA".to_string()),
+            lib_id: Some("Device:U".to_string()),
+            lib_name: None,
+            unit: Some(unit),
+            bounds: None,
+        }
+    }
+
+    #[test]
+    fn component_reference_validation_rejects_duplicate_same_unit() {
+        let items = vec![
+            test_symbol_item("u1-a", "U1", 1),
+            test_symbol_item("u1-b", "U1", 1),
+        ];
+
+        let error = validate_component_references(&items).unwrap_err();
+        assert!(error.to_string().contains("duplicate reference U1 unit 1"));
+    }
+
+    #[test]
+    fn component_reference_validation_allows_legal_multi_unit_symbols() {
+        let items = vec![
+            test_symbol_item("u1-a", "U1", 1),
+            test_symbol_item("u1-b", "U1", 2),
+            test_symbol_item("u1-c", "U1", 3),
+            test_symbol_item("u1-d", "U1", 4),
+            test_symbol_item("u1-e", "U1", 5),
+        ];
+
+        validate_component_references(&items).unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_unlinked_child_schematic_dry_run_and_apply_delete_empty_unlinked_file() {
+        let tmp = TempDir::new().unwrap();
+        let root = blank_schematic(tmp.path(), "root.kicad_sch");
+        let orphan = blank_schematic(tmp.path(), "orphan.kicad_sch");
+
+        let dry = handle_delete_unlinked_child_schematic(
+            &json!({
+                "root_schematic": root.display().to_string(),
+                "target_schematic": orphan.display().to_string(),
+                "dry_run": true
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!dry.is_error, "{}", result_text(&dry));
+        assert!(orphan.exists());
+        let body = result_json(&dry);
+        assert_eq!(body["safe_to_apply"], json!(true));
+        assert!(body["plan_revision"]
+            .as_str()
+            .unwrap()
+            .starts_with("delete-unlinked-child-schematic:"));
+
+        let applied = handle_delete_unlinked_child_schematic(
+            &json!({
+                "root_schematic": root.display().to_string(),
+                "target_schematic": orphan.display().to_string(),
+                "dry_run": false,
+                "plan_revision": body["plan_revision"].as_str().unwrap()
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!applied.is_error, "{}", result_text(&applied));
+        assert!(!orphan.exists());
+    }
+
+    #[tokio::test]
+    async fn delete_unlinked_child_schematic_refuses_linked_or_nonempty_files() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = blank_schematic(tmp.path(), "root.kicad_sch");
+        handle_add_hierarchical_sheet(
+            &json!({
+                "schematic": root.display().to_string(),
+                "sheet_file": "linked.kicad_sch",
+                "sheet_name": "Linked"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let linked = tmp.path().join("linked.kicad_sch");
+
+        let linked_result = handle_delete_unlinked_child_schematic(
+            &json!({
+                "root_schematic": root.display().to_string(),
+                "target_schematic": linked.display().to_string()
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(linked_result.is_error);
+        assert!(result_text(&linked_result).contains("still linked"));
+
+        let nonempty = tmp.path().join("nonempty.kicad_sch");
+        std::fs::write(
+            &nonempty,
+            r#"(kicad_sch
+  (version 20250610)
+  (uuid "nonempty")
+  (paper "A4")
+  (symbol (lib_id "Device:R") (at 10 10 0) (unit 1) (property "Reference" "R1" (at 10 10 0)) (uuid "r1"))
+)"#,
+        )
+        .unwrap();
+
+        let nonempty_result = handle_delete_unlinked_child_schematic(
+            &json!({
+                "root_schematic": root.display().to_string(),
+                "target_schematic": nonempty.display().to_string()
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(nonempty_result.is_error);
+        assert!(result_text(&nonempty_result).contains("not empty"));
+        assert!(nonempty.exists());
+    }
+
+    #[test]
+    fn move_schematic_items_tool_is_registered_with_discoverable_schema() {
+        let tool = tools()
+            .into_iter()
+            .find(|tool| tool.name == "move_schematic_items_to_sheet")
+            .expect("tool is registered");
+        assert!(tool
+            .description
+            .contains("move existing objects between sheets"));
+        assert!(tool.description.contains("migrate hierarchy"));
+        assert!(tool.description.contains("hierarchical restructure"));
+        assert!(tool.input_schema["properties"]["selection"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("references"));
+        assert!(
+            tool.input_schema["properties"]["include_connected"]["properties"]["wires"].is_object()
+        );
+    }
+
+    #[test]
+    fn delete_unlinked_child_schematic_tool_is_registered_with_discoverable_schema() {
+        let tool = tools()
+            .into_iter()
+            .find(|tool| tool.name == "delete_unlinked_child_schematic")
+            .expect("tool is registered");
+        assert!(tool.description.contains("safe cleanup"));
+        assert!(tool.description.contains("must not be reachable"));
+        assert!(tool.input_schema["properties"]["root_schematic"].is_object());
+        assert!(tool.input_schema["properties"]["plan_revision"].is_object());
     }
 
     async fn sheet_at(tmp: &TempDir, ctx: &ToolContext, x: f64, y: f64) -> PathBuf {
