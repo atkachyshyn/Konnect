@@ -13,7 +13,7 @@
 Rust binary — that lets Claude and other AI assistants design schematics and PCBs
 through the [Model Context Protocol](https://modelcontextprotocol.io) (MCP).
 
-**215 tools across 19 on-demand toolsets.** Schematic capture, PCB layout and
+**216 tools across 19 on-demand toolsets.** Schematic capture, PCB layout and
 routing, ERC/DRC, design-review audits, JLCPCB part search, reference
 circuits, and a full manufacturing export pipeline — with bundled skills and agents
 that teach Claude KiCAD conventions out of the box.
@@ -70,7 +70,7 @@ through its own S-expression engine with atomic writes (write, fsync, rename), U
 preservation, and round-trip tests — no third-party schematic library with known
 gaps, no text-manipulation workarounds.
 
-**Context economy is a feature.** Exposing all 215 tools to an LLM costs roughly
+**Context economy is a feature.** Exposing all 216 tools to an LLM costs roughly
 34K tokens of tool schemas in every request, for the whole task. Konnect's router
 loads a starter kit (~2.2K) and lets the model pull in toolsets on demand. Every
 client also gets three dispatcher tools that reach the entire catalogue on

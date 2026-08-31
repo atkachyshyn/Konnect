@@ -428,6 +428,7 @@ pub fn tools() -> Vec<ToolDef> {
                         },
                         "additionalProperties": false
                     },
+                    "grid": { "type": "number", "description": "Schematic grid used for endpoint diagnostics", "default": 1.27 },
                     "remove_redundant_local_labels": {
                         "type": "boolean",
                         "description": "After wire validation, remove redundant plain labels for this net. Global/hierarchical labels and one local name-preserving label are retained.",
@@ -439,6 +440,68 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["schematic", "net"]
             }),
             |args, ctx| async move { handle_materialize_schematic_net(args, ctx).await }
+        ),
+        tool!(
+            "refactor_schematic_net_representation",
+            "Preview or apply a transactional graphical refactor for an already-correct schematic net. \
+             Modes include wired_local net materialization, expand_coincident_connection, \
+             power_symbol conversion, and scope_diagnostic. Every apply compares final component-pin \
+             endpoint membership and shorted net sets before writing.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string" },
+                    "net": { "type": "string", "description": "Existing net name to refactor or inspect" },
+                    "representation": {
+                        "type": "string",
+                        "enum": ["wired_local", "expand_coincident_connection", "power_symbol", "scope_diagnostic"],
+                        "default": "wired_local"
+                    },
+                    "pins": {
+                        "type": "array",
+                        "description": "Optional explicit endpoint subset. Each item is {reference,pin_number}. Every named pin must already belong to net.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "reference": { "type": "string" },
+                                "pin_number": { "type": "string" }
+                            },
+                            "required": ["reference", "pin_number"]
+                        }
+                    },
+                    "strategy": {
+                        "type": "object",
+                        "properties": {
+                            "preferred_orientation": { "type": "string", "enum": ["horizontal", "vertical"], "default": "horizontal" },
+                            "trunk_x": { "type": "number" },
+                            "trunk_y": { "type": "number" },
+                            "ordering": { "type": "array", "items": { "type": "string" } }
+                        },
+                        "additionalProperties": false
+                    },
+                    "expand": {
+                        "type": "object",
+                        "description": "Coincident-endpoint expansion. move_reference names the symbol instance to translate before wiring.",
+                        "properties": {
+                            "move_reference": { "type": "string" },
+                            "dx": { "type": "number" },
+                            "dy": { "type": "number" }
+                        },
+                        "additionalProperties": false
+                    },
+                    "grid": { "type": "number", "description": "Schematic grid used for endpoint diagnostics and optional snapping", "default": 1.27 },
+                    "remove_redundant_local_labels": { "type": "boolean", "default": false },
+                    "scope_policy": {
+                        "type": "string",
+                        "enum": ["preserve_existing_scope", "allow_global_power_scope"],
+                        "default": "preserve_existing_scope"
+                    },
+                    "dry_run": { "type": "boolean", "default": true },
+                    "plan_revision": { "type": "string", "description": "Exact dry-run revision required when dry_run=false" }
+                },
+                "required": ["schematic", "net"]
+            }),
+            |args, ctx| async move { handle_refactor_schematic_net_representation(args, ctx).await }
         ),
     ]
 }
@@ -646,6 +709,11 @@ struct NetEndpoint {
     x: f64,
     y: f64,
     orientation_degrees: f64,
+    grid: f64,
+    on_grid: bool,
+    nearest_grid_x: f64,
+    nearest_grid_y: f64,
+    attachment_depends_on_off_grid_position: bool,
 }
 
 impl NetEndpoint {
@@ -661,7 +729,11 @@ impl NetEndpoint {
             "pin_name": self.pin_name,
             "x": self.x,
             "y": self.y,
-            "orientation_degrees": self.orientation_degrees
+            "orientation_degrees": self.orientation_degrees,
+            "grid": self.grid,
+            "on_grid": self.on_grid,
+            "nearest_grid_position": { "x": self.nearest_grid_x, "y": self.nearest_grid_y },
+            "attachment_depends_on_off_grid_position": self.attachment_depends_on_off_grid_position
         })
     }
 }
@@ -684,6 +756,7 @@ struct MaterializeNetPlan {
     removable_local_labels: Vec<(f64, f64)>,
     remove_redundant_local_labels: bool,
     before_snapshot: SemanticSnapshot,
+    final_content: String,
     plan_revision: String,
 }
 
@@ -718,6 +791,10 @@ impl MaterializeNetPlan {
             "remove_redundant_local_labels": self.remove_redundant_local_labels,
             "labels_that_would_be_removed": self.removable_local_labels.iter().map(|(x, y)| json!({"x": x, "y": y})).collect::<Vec<_>>(),
             "labels_removed": labels_removed,
+            "semantic_connectivity_comparison": semantic_comparison(&self.before_snapshot, &self.final_content).unwrap_or_else(|error| json!({
+                "preserved": false,
+                "error": error.to_string()
+            })),
             "ambiguity": [],
             "warnings": []
         })
@@ -755,29 +832,17 @@ async fn handle_materialize_schematic_net(
         )));
     }
 
-    let mut staged = plan.before.clone();
-    for segment in &plan.segments {
-        if !wire_exists(&extract_wires(&parse_sexp(&staged)?), *segment) {
-            staged =
-                insert_wire_with_junctions(staged, segment.x1, segment.y1, segment.x2, segment.y2);
-        }
-    }
-    validate_semantic_snapshot(&plan.before_snapshot, &staged, "after adding wires")?;
-
-    let mut labels_removed = 0usize;
-    if plan.remove_redundant_local_labels {
-        let (next, removed) =
-            remove_plain_labels_at(staged, &plan.net, &plan.removable_local_labels)?;
-        staged = next;
-        labels_removed = removed;
-        validate_semantic_snapshot(
-            &plan.before_snapshot,
-            &staged,
-            "after removing redundant labels",
-        )?;
-    }
-
-    write_atomic_if_unchanged(&plan.schematic, &plan.before, &staged)?;
+    validate_semantic_snapshot(
+        &plan.before_snapshot,
+        &plan.final_content,
+        "final transaction",
+    )?;
+    let labels_removed = if plan.remove_redundant_local_labels {
+        plan.removable_local_labels.len()
+    } else {
+        0
+    };
+    write_atomic_if_unchanged(&plan.schematic, &plan.before, &plan.final_content)?;
     Ok(CallToolResult::json(&plan.response(
         false,
         true,
@@ -795,6 +860,7 @@ fn build_materialize_net_plan(
         read_schematic(schematic).map_err(|error| CallToolResult::error(error.to_string()))?;
     let wires = extract_wires(&tree);
     let labels = konnect_sexp::schematic::extract_all_net_labels(&tree);
+    let grid = args["grid"].as_f64().unwrap_or(1.27);
     if !labels.iter().any(|label| label.net == net) {
         return Err(CallToolResult::error(format!(
             "net '{net}' was not found in schematic labels or power symbols"
@@ -827,6 +893,16 @@ fn build_materialize_net_plan(
                 x: placed.at.0,
                 y: placed.at.1,
                 orientation_degrees: placed.orientation_degrees,
+                grid,
+                on_grid: point_on_grid(placed.at.0, placed.at.1, grid),
+                nearest_grid_x: snap_point(placed.at.0, placed.at.1, grid).0,
+                nearest_grid_y: snap_point(placed.at.0, placed.at.1, grid).1,
+                attachment_depends_on_off_grid_position: attachment_depends_on_off_grid_position(
+                    &mut graph,
+                    placed.at.0,
+                    placed.at.1,
+                    grid,
+                ),
             });
         }
     }
@@ -840,7 +916,7 @@ fn build_materialize_net_plan(
     let segments = materialize_segments(&endpoints, args)?;
     let before_snapshot =
         semantic_snapshot(&before).map_err(|error| CallToolResult::error(error.to_string()))?;
-    let staged = segments
+    let mut final_content = segments
         .iter()
         .try_fold(before.clone(), |content, segment| {
             let tree =
@@ -852,22 +928,20 @@ fn build_materialize_net_plan(
                 insert_wire_with_junctions(content, segment.x1, segment.y1, segment.x2, segment.y2)
             })
         })?;
-    validate_semantic_snapshot(&before_snapshot, &staged, "preview after adding wires")
-        .map_err(|error| CallToolResult::error(error.to_string()))?;
-
-    let removable_local_labels = redundant_plain_label_positions(&staged, net);
+    let removable_local_labels = redundant_plain_label_positions(&final_content, net);
     if remove_redundant_local_labels {
-        let (without_labels, _) = remove_plain_labels_at(staged, net, &removable_local_labels)
-            .map_err(|error| {
-                CallToolResult::error(format!("failed to preview label cleanup: {error}"))
-            })?;
-        validate_semantic_snapshot(
-            &before_snapshot,
-            &without_labels,
-            "preview after label cleanup",
-        )
-        .map_err(|error| CallToolResult::error(error.to_string()))?;
+        let (without_labels, _) =
+            remove_plain_labels_at(final_content, net, &removable_local_labels).map_err(
+                |error| CallToolResult::error(format!("failed to preview label cleanup: {error}")),
+            )?;
+        final_content = without_labels;
     }
+    validate_semantic_snapshot(
+        &before_snapshot,
+        &final_content,
+        "preview final transaction",
+    )
+    .map_err(|error| CallToolResult::error(error.to_string()))?;
 
     let existing_wires = wires
         .iter()
@@ -899,6 +973,7 @@ fn build_materialize_net_plan(
         removable_local_labels,
         remove_redundant_local_labels,
         before_snapshot,
+        final_content,
         plan_revision,
     })
 }
@@ -1029,6 +1104,7 @@ fn semantic_snapshot(content: &str) -> anyhow::Result<SemanticSnapshot> {
     let tree = parse_sexp(content)?;
     let wires = extract_wires(&tree);
     let labels = konnect_sexp::schematic::extract_all_net_labels(&tree);
+    let representation_refs = representation_symbol_refs(&tree);
     let index = crate::tools::sch_connectivity::ConnectivityIndex::build(
         &tree,
         &wires,
@@ -1039,6 +1115,7 @@ fn semantic_snapshot(content: &str) -> anyhow::Result<SemanticSnapshot> {
     let pin_nets = index
         .placed_pins()
         .iter()
+        .filter(|pin| !representation_refs.contains(&(pin.reference.clone(), pin.unit)))
         .map(|pin| {
             (
                 format!("{}:{}:{}", pin.reference, pin.unit, pin.pin.number),
@@ -1050,6 +1127,16 @@ fn semantic_snapshot(content: &str) -> anyhow::Result<SemanticSnapshot> {
         pin_nets,
         shorts: shorted_label_sets(&tree),
     })
+}
+
+fn representation_symbol_refs(tree: &konnect_sexp::SexpNode) -> HashSet<(String, u32)> {
+    extract_symbol_instances(tree)
+        .into_iter()
+        .filter(|instance| {
+            instance.lib_id.starts_with("power:") || instance.reference.starts_with("#PWR")
+        })
+        .map(|instance| (instance.reference, instance.unit))
+        .collect()
 }
 
 fn shorted_label_sets(tree: &konnect_sexp::SexpNode) -> Vec<Vec<String>> {
@@ -1080,7 +1167,24 @@ fn validate_semantic_snapshot(
 ) -> anyhow::Result<()> {
     let after = semantic_snapshot(after_content)?;
     if after.pin_nets != before.pin_nets {
-        anyhow::bail!("semantic endpoint membership changed {stage}");
+        let mut diffs = Vec::new();
+        for key in before.pin_nets.keys().chain(after.pin_nets.keys()) {
+            let before_net = before.pin_nets.get(key).cloned().unwrap_or(None);
+            let after_net = after.pin_nets.get(key).cloned().unwrap_or(None);
+            if before_net != after_net {
+                diffs.push(format!(
+                    "{key}: {} -> {}",
+                    before_net.as_deref().unwrap_or("<unconnected>"),
+                    after_net.as_deref().unwrap_or("<unconnected>")
+                ));
+            }
+        }
+        diffs.sort();
+        diffs.dedup();
+        anyhow::bail!(
+            "semantic endpoint membership changed {stage}: {}",
+            diffs.join(", ")
+        );
     }
     if after.shorts != before.shorts {
         anyhow::bail!("shorted net set changed {stage}");
@@ -1132,14 +1236,15 @@ fn remove_plain_labels_at(
         return Ok((content, 0));
     }
     let mut ranges = Vec::new();
+    let mut consumed = vec![false; positions.len()];
     for label in find_label_blocks(&content)
         .into_iter()
         .filter(|label| label.kind == "label" && label.net == net)
     {
-        if positions
-            .iter()
-            .any(|(x, y)| points_coincident(label.x, label.y, *x, *y, 0.01))
-        {
+        if let Some(index) = positions.iter().enumerate().find_map(|(index, (x, y))| {
+            (!consumed[index] && points_coincident(label.x, label.y, *x, *y, 0.01)).then_some(index)
+        }) {
+            consumed[index] = true;
             if let Some(range) = find_block_with_leading_whitespace(&content, label.start) {
                 ranges.push(range);
             }
@@ -1187,6 +1292,652 @@ fn materialize_plan_revision(
     }
     let revision = DocumentRevision::of(&material);
     format!("materialize-schematic-net:{revision}")
+}
+
+fn point_on_grid(x: f64, y: f64, grid: f64) -> bool {
+    if grid <= 0.0 {
+        return true;
+    }
+    let (sx, sy) = snap_point(x, y, grid);
+    points_coincident(x, y, sx, sy, 0.001)
+}
+
+fn attachment_depends_on_off_grid_position(
+    graph: &mut crate::tools::sch_connectivity::NetGraph,
+    x: f64,
+    y: f64,
+    grid: f64,
+) -> bool {
+    if point_on_grid(x, y, grid) {
+        return false;
+    }
+    let current = graph.net_at(x, y);
+    let (sx, sy) = snap_point(x, y, grid);
+    graph.net_at(sx, sy) != current
+}
+
+fn semantic_comparison(
+    before: &SemanticSnapshot,
+    after_content: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let after = semantic_snapshot(after_content)?;
+    let pin_membership_preserved = after.pin_nets == before.pin_nets;
+    let shorts_preserved = after.shorts == before.shorts;
+    let pin_net_differences = before
+        .pin_nets
+        .iter()
+        .filter_map(|(pin, before_net)| {
+            let after_net = after.pin_nets.get(pin).cloned().unwrap_or(None);
+            (&after_net != before_net).then(|| {
+                json!({
+                    "pin": pin,
+                    "before": before_net,
+                    "after": after_net
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "preserved": pin_membership_preserved && shorts_preserved,
+        "pin_membership_preserved": pin_membership_preserved,
+        "shorted_net_sets_preserved": shorts_preserved,
+        "pin_net_differences": pin_net_differences,
+        "shorts_before": before.shorts,
+        "shorts_after": after.shorts
+    }))
+}
+
+#[derive(Debug, Clone)]
+struct RefactorNetPlan {
+    schematic: std::path::PathBuf,
+    before: String,
+    net: String,
+    representation: String,
+    endpoints: Vec<NetEndpoint>,
+    segments: Vec<Segment>,
+    moved_symbols: Vec<serde_json::Value>,
+    removable_local_labels: Vec<(f64, f64)>,
+    inserted_power_symbols: Vec<serde_json::Value>,
+    before_snapshot: SemanticSnapshot,
+    final_content: String,
+    plan_revision: String,
+    warnings: Vec<String>,
+}
+
+impl RefactorNetPlan {
+    fn response(&self, dry_run: bool, applied: bool) -> serde_json::Value {
+        json!({
+            "dry_run": dry_run,
+            "applied": applied,
+            "safe_to_apply": true,
+            "plan_revision": self.plan_revision,
+            "schematic": self.schematic.display().to_string(),
+            "net": self.net,
+            "representation": self.representation,
+            "endpoints": self.endpoints.iter().map(NetEndpoint::json).collect::<Vec<_>>(),
+            "proposed_moves": self.moved_symbols,
+            "proposed_wires": self.segments.iter().map(|segment| segment.json()).collect::<Vec<_>>(),
+            "proposed_removed_labels": self.removable_local_labels.iter().map(|(x, y)| json!({"x": x, "y": y})).collect::<Vec<_>>(),
+            "proposed_power_symbols": self.inserted_power_symbols,
+            "semantic_connectivity_comparison": semantic_comparison(&self.before_snapshot, &self.final_content).unwrap_or_else(|error| json!({
+                "preserved": false,
+                "error": error.to_string()
+            })),
+            "warnings": self.warnings
+        })
+    }
+}
+
+async fn handle_refactor_schematic_net_representation(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let schematic = get_path(args, "schematic")?;
+    let net = match require_str(args, "net") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let representation = args["representation"].as_str().unwrap_or("wired_local");
+    if representation == "scope_diagnostic" {
+        return inspect_net_representation_scope(&schematic, &net);
+    }
+    let dry_run = args["dry_run"].as_bool().unwrap_or(true);
+    let plan = match build_refactor_net_plan(&schematic, &net, representation, args) {
+        Ok(plan) => plan,
+        Err(error) => return Ok(error),
+    };
+    if dry_run {
+        return Ok(CallToolResult::json(&plan.response(true, false)));
+    }
+    let supplied_revision = args["plan_revision"].as_str().unwrap_or_default();
+    if supplied_revision != plan.plan_revision {
+        return Ok(CallToolResult::error(format!(
+            "plan_revision mismatch; rerun dry_run and apply exactly '{}'",
+            plan.plan_revision
+        )));
+    }
+    validate_semantic_snapshot(
+        &plan.before_snapshot,
+        &plan.final_content,
+        "final transaction",
+    )?;
+    write_atomic_if_unchanged(&plan.schematic, &plan.before, &plan.final_content)?;
+    Ok(CallToolResult::json(&plan.response(false, true)))
+}
+
+fn build_refactor_net_plan(
+    schematic: &std::path::PathBuf,
+    net: &str,
+    representation: &str,
+    args: &serde_json::Value,
+) -> Result<RefactorNetPlan, CallToolResult> {
+    match representation {
+        "wired_local" => {
+            let materialize = build_materialize_net_plan(
+                schematic,
+                net,
+                args,
+                args["remove_redundant_local_labels"]
+                    .as_bool()
+                    .unwrap_or(false),
+            )?;
+            Ok(RefactorNetPlan {
+                schematic: materialize.schematic,
+                before: materialize.before,
+                net: materialize.net,
+                representation: "wired_local".to_string(),
+                endpoints: materialize.endpoints,
+                segments: materialize.segments,
+                moved_symbols: Vec::new(),
+                removable_local_labels: materialize.removable_local_labels,
+                inserted_power_symbols: Vec::new(),
+                before_snapshot: materialize.before_snapshot,
+                final_content: materialize.final_content,
+                plan_revision: materialize
+                    .plan_revision
+                    .replace("materialize-schematic-net:", "refactor-schematic-net:"),
+                warnings: Vec::new(),
+            })
+        }
+        "expand_coincident_connection" => build_expand_coincident_net_plan(schematic, net, args),
+        "power_symbol" => build_power_symbol_refactor_plan(schematic, net, args),
+        other => Err(CallToolResult::error(format!(
+            "representation '{other}' is invalid"
+        ))),
+    }
+}
+
+fn build_expand_coincident_net_plan(
+    schematic: &std::path::PathBuf,
+    net: &str,
+    args: &serde_json::Value,
+) -> Result<RefactorNetPlan, CallToolResult> {
+    let (before, tree) =
+        read_schematic(schematic).map_err(|error| CallToolResult::error(error.to_string()))?;
+    let before_snapshot =
+        semantic_snapshot(&before).map_err(|error| CallToolResult::error(error.to_string()))?;
+    let grid = args["grid"].as_f64().unwrap_or(1.27);
+    let expand = args.get("expand").ok_or_else(|| {
+        CallToolResult::error("expand_coincident_connection requires an expand object")
+    })?;
+    let move_reference = expand["move_reference"]
+        .as_str()
+        .ok_or_else(|| CallToolResult::error("expand.move_reference is required"))?;
+    let dx = expand["dx"]
+        .as_f64()
+        .ok_or_else(|| CallToolResult::error("expand.dx is required"))?;
+    let dy = expand["dy"]
+        .as_f64()
+        .ok_or_else(|| CallToolResult::error("expand.dy is required"))?;
+
+    let endpoints = net_endpoints_for(&tree, net, args, grid)?;
+    let moved_before = endpoints
+        .iter()
+        .filter(|endpoint| endpoint.reference == move_reference)
+        .cloned()
+        .collect::<Vec<_>>();
+    if moved_before.is_empty() {
+        return Err(CallToolResult::error(format!(
+            "{move_reference} has no selected endpoint on net '{net}'"
+        )));
+    }
+    let coincident = moved_before.iter().any(|moved| {
+        endpoints.iter().any(|other| {
+            other.key() != moved.key()
+                && points_coincident(moved.x, moved.y, other.x, other.y, 0.01)
+        })
+    });
+    if !coincident {
+        return Err(CallToolResult::error(format!(
+            "selected endpoint for {move_reference} is not coincident with another endpoint on net '{net}'"
+        )));
+    }
+
+    let moved_content = translate_symbol_instances_by_reference(&before, move_reference, dx, dy)
+        .map_err(|error| CallToolResult::error(error.to_string()))?;
+    let mut segments = moved_before
+        .iter()
+        .map(|endpoint| Segment {
+            x1: endpoint.x,
+            y1: endpoint.y,
+            x2: endpoint.x + dx,
+            y2: endpoint.y + dy,
+        })
+        .filter(|segment| !segment.is_zero())
+        .collect::<Vec<_>>();
+    segments.sort_by(|a, b| {
+        a.normalized()
+            .json()
+            .to_string()
+            .cmp(&b.normalized().json().to_string())
+    });
+    segments.dedup_by(|a, b| a.normalized() == b.normalized());
+    let mut final_content = apply_segments(moved_content, &segments)
+        .map_err(|error| CallToolResult::error(error.to_string()))?;
+    let removable_local_labels = if args["remove_redundant_local_labels"]
+        .as_bool()
+        .unwrap_or(false)
+    {
+        redundant_plain_label_positions(&final_content, net)
+    } else {
+        Vec::new()
+    };
+    if !removable_local_labels.is_empty() {
+        let (without_labels, _) =
+            remove_plain_labels_at(final_content, net, &removable_local_labels)
+                .map_err(|error| CallToolResult::error(error.to_string()))?;
+        final_content = without_labels;
+    }
+    validate_semantic_snapshot(
+        &before_snapshot,
+        &final_content,
+        "preview final transaction",
+    )
+    .map_err(|error| CallToolResult::error(error.to_string()))?;
+    let mut material = format!(
+        "{}\n{net}\nexpand\n{move_reference}\n{dx}\n{dy}",
+        DocumentRevision::of(&before)
+    );
+    for segment in &segments {
+        material.push('\n');
+        material.push_str(&segment.json().to_string());
+    }
+    let plan_revision = format!("refactor-schematic-net:{}", DocumentRevision::of(&material));
+    Ok(RefactorNetPlan {
+        schematic: schematic.clone(),
+        before,
+        net: net.to_string(),
+        representation: "expand_coincident_connection".to_string(),
+        endpoints,
+        segments,
+        moved_symbols: vec![json!({
+            "reference": move_reference,
+            "dx": dx,
+            "dy": dy
+        })],
+        removable_local_labels,
+        inserted_power_symbols: Vec::new(),
+        before_snapshot,
+        final_content,
+        plan_revision,
+        warnings: Vec::new(),
+    })
+}
+
+fn build_power_symbol_refactor_plan(
+    schematic: &std::path::PathBuf,
+    net: &str,
+    args: &serde_json::Value,
+) -> Result<RefactorNetPlan, CallToolResult> {
+    let (before, tree) =
+        read_schematic(schematic).map_err(|error| CallToolResult::error(error.to_string()))?;
+    let before_snapshot =
+        semantic_snapshot(&before).map_err(|error| CallToolResult::error(error.to_string()))?;
+    let diagnostic = net_scope_diagnostic(&tree, schematic, net);
+    let scope_policy = args["scope_policy"]
+        .as_str()
+        .unwrap_or("preserve_existing_scope");
+    if scope_policy != "allow_global_power_scope" {
+        return Err(CallToolResult::error(format!(
+            "converting net '{net}' to power symbols changes to KiCad global power-symbol scope; rerun with scope_policy='allow_global_power_scope'. Diagnostic: {diagnostic}"
+        )));
+    }
+    let labels = konnect_sexp::schematic::extract_labels(&tree)
+        .into_iter()
+        .filter(|label| label.net == net && label.kind == LabelKind::NetLabel)
+        .collect::<Vec<_>>();
+    if labels.is_empty() {
+        return Err(CallToolResult::error(format!(
+            "net '{net}' has no ordinary labels to convert"
+        )));
+    }
+    let mut staged = if embedded_power_symbol_available(&tree, net) {
+        before.clone()
+    } else {
+        ensure_staged_power_symbol_definition(before.clone(), net)
+            .map_err(|error| CallToolResult::error(error.to_string()))?
+    };
+    let mut inserted = Vec::new();
+    for (index, label) in labels.iter().enumerate() {
+        let reference = next_power_reference_for_content(&staged, index + 1);
+        let block = staged_power_symbol_block(net, &reference, label.x, label.y, label.rotation);
+        staged = insert_direct_child_before_sheet_instances(staged, &block);
+        inserted.push(json!({
+            "reference": reference,
+            "lib_id": format!("power:{net}"),
+            "x": label.x,
+            "y": label.y,
+            "rotation": label.rotation
+        }));
+    }
+    let removable_local_labels = labels
+        .iter()
+        .map(|label| (label.x, label.y))
+        .collect::<Vec<_>>();
+    let (final_content, _) = remove_plain_labels_at(staged, net, &removable_local_labels)
+        .map_err(|error| CallToolResult::error(error.to_string()))?;
+    validate_semantic_snapshot(
+        &before_snapshot,
+        &final_content,
+        "preview final transaction",
+    )
+    .map_err(|error| CallToolResult::error(error.to_string()))?;
+    let material = format!(
+        "{}\n{net}\npower_symbol\n{scope_policy}\n{}",
+        DocumentRevision::of(&before),
+        inserted.len()
+    );
+    let plan_revision = format!("refactor-schematic-net:{}", DocumentRevision::of(&material));
+    let endpoints = net_endpoints_for(&tree, net, args, args["grid"].as_f64().unwrap_or(1.27))?;
+    let mut warnings = vec![
+        "KiCad power symbols have global power-rail scope; conversion required explicit scope_policy approval.".to_string(),
+    ];
+    if diagnostic["mixed_connection_mechanisms"].as_bool() == Some(true) {
+        warnings.push("Net already uses mixed connection mechanisms.".to_string());
+    }
+    Ok(RefactorNetPlan {
+        schematic: schematic.clone(),
+        before,
+        net: net.to_string(),
+        representation: "power_symbol".to_string(),
+        endpoints,
+        segments: Vec::new(),
+        moved_symbols: Vec::new(),
+        removable_local_labels,
+        inserted_power_symbols: inserted,
+        before_snapshot,
+        final_content,
+        plan_revision,
+        warnings,
+    })
+}
+
+fn inspect_net_representation_scope(
+    schematic: &std::path::PathBuf,
+    net: &str,
+) -> anyhow::Result<CallToolResult> {
+    let (_, tree) = read_schematic(schematic)?;
+    Ok(CallToolResult::json(&net_scope_diagnostic(
+        &tree, schematic, net,
+    )))
+}
+
+fn net_scope_diagnostic(
+    tree: &konnect_sexp::SexpNode,
+    schematic: &std::path::Path,
+    net: &str,
+) -> serde_json::Value {
+    let labels = konnect_sexp::schematic::extract_all_net_labels(tree)
+        .into_iter()
+        .filter(|label| label.net == net)
+        .collect::<Vec<_>>();
+    let ordinary = labels
+        .iter()
+        .filter(|label| label.kind == LabelKind::NetLabel)
+        .count();
+    let global = labels
+        .iter()
+        .filter(|label| label.kind == LabelKind::GlobalLabel)
+        .count();
+    let hierarchical = labels
+        .iter()
+        .filter(|label| label.kind == LabelKind::HierarchicalLabel)
+        .count();
+    let power = labels
+        .iter()
+        .filter(|label| label.kind == LabelKind::PowerSymbol)
+        .count();
+    let mechanisms = [ordinary, global, hierarchical, power]
+        .into_iter()
+        .filter(|count| *count > 0)
+        .count();
+    json!({
+        "net": net,
+        "sheets": [schematic.file_stem().and_then(|name| name.to_str()).unwrap_or("<sheet>")],
+        "ordinary_label_scope": ordinary > 0,
+        "hierarchical_connectivity": hierarchical > 0,
+        "global_label_connectivity": global > 0,
+        "power_symbol_connectivity": power > 0,
+        "ordinary_labels": ordinary,
+        "hierarchical_labels": hierarchical,
+        "global_labels": global,
+        "power_symbols": power,
+        "mixed_connection_mechanisms": mechanisms > 1,
+        "power_scope_conversion_requires_policy": (ordinary > 0 || hierarchical > 0 || global > 0) && power == 0
+    })
+}
+
+fn net_endpoints_for(
+    tree: &konnect_sexp::SexpNode,
+    net: &str,
+    args: &serde_json::Value,
+    grid: f64,
+) -> Result<Vec<NetEndpoint>, CallToolResult> {
+    let wires = extract_wires(tree);
+    let labels = konnect_sexp::schematic::extract_all_net_labels(tree);
+    let mut graph = crate::tools::sch_connectivity::net_graph_for(tree, &wires, &labels);
+    let index = crate::tools::sch_connectivity::ConnectivityIndex::build(
+        tree,
+        &wires,
+        &labels,
+        crate::tools::sch_connectivity::COINCIDENT_TOLERANCE,
+    );
+    let selected_keys = requested_materialize_pin_keys(tree, args, net, &mut graph)?;
+    let mut endpoints = Vec::new();
+    for placed in index.placed_pins() {
+        let key = format!("{}:{}:{}", placed.reference, placed.unit, placed.pin.number);
+        if selected_keys
+            .as_ref()
+            .is_some_and(|keys| !keys.contains(&key))
+        {
+            continue;
+        }
+        if graph.net_at(placed.at.0, placed.at.1).as_deref() == Some(net) {
+            endpoints.push(NetEndpoint {
+                reference: placed.reference.clone(),
+                unit: placed.unit,
+                pin_number: placed.pin.number.clone(),
+                pin_name: placed.pin.name.clone(),
+                x: placed.at.0,
+                y: placed.at.1,
+                orientation_degrees: placed.orientation_degrees,
+                grid,
+                on_grid: point_on_grid(placed.at.0, placed.at.1, grid),
+                nearest_grid_x: snap_point(placed.at.0, placed.at.1, grid).0,
+                nearest_grid_y: snap_point(placed.at.0, placed.at.1, grid).1,
+                attachment_depends_on_off_grid_position: attachment_depends_on_off_grid_position(
+                    &mut graph,
+                    placed.at.0,
+                    placed.at.1,
+                    grid,
+                ),
+            });
+        }
+    }
+    endpoints.sort_by(|a, b| a.key().cmp(&b.key()));
+    Ok(endpoints)
+}
+
+fn apply_segments(content: String, segments: &[Segment]) -> anyhow::Result<String> {
+    segments.iter().try_fold(content, |content, segment| {
+        let tree = parse_sexp(&content)?;
+        let current_wires = extract_wires(&tree);
+        Ok(if wire_exists(&current_wires, *segment) {
+            content
+        } else {
+            insert_wire_with_junctions(content, segment.x1, segment.y1, segment.x2, segment.y2)
+        })
+    })
+}
+
+fn translate_symbol_instances_by_reference(
+    content: &str,
+    reference: &str,
+    dx: f64,
+    dy: f64,
+) -> anyhow::Result<String> {
+    let mut edits = Vec::new();
+    for (start, end) in find_direct_child_blocks(content, "kicad_sch") {
+        let block = &content[start..end];
+        if !block.trim_start().starts_with("(symbol") {
+            continue;
+        }
+        let node = parse_sexp(block)?;
+        if property_value_in_node(&node, "Reference") != Some(reference) {
+            continue;
+        }
+        for (rel_start, rel_end, replacement) in coordinate_clause_replacements(block, dx, dy)? {
+            edits.push(SexpEdit::replace(
+                start + rel_start,
+                start + rel_end,
+                replacement,
+            ));
+        }
+    }
+    if edits.is_empty() {
+        anyhow::bail!("symbol reference '{reference}' was not found");
+    }
+    Ok(apply_edits(content.to_string(), edits))
+}
+
+fn property_value_in_node<'a>(node: &'a konnect_sexp::SexpNode, name: &str) -> Option<&'a str> {
+    node.find_all("property")
+        .into_iter()
+        .find(|property| property.get(1).and_then(|n| n.as_str()) == Some(name))
+        .and_then(|property| property.get(2))
+        .and_then(|value| value.as_str())
+}
+
+fn coordinate_clause_replacements(
+    block: &str,
+    dx: f64,
+    dy: f64,
+) -> anyhow::Result<Vec<(usize, usize, String)>> {
+    let mut replacements = Vec::new();
+    for start in find_block_starts(block, "at")
+        .into_iter()
+        .chain(find_block_starts(block, "start"))
+        .chain(find_block_starts(block, "mid"))
+        .chain(find_block_starts(block, "end"))
+        .chain(find_block_starts(block, "center"))
+        .chain(find_block_starts(block, "xy"))
+    {
+        let Some((clause_start, clause_end)) = find_balanced_block(block, start) else {
+            continue;
+        };
+        let clause = &block[clause_start..clause_end];
+        let Some(head_end) = clause.find(char::is_whitespace) else {
+            continue;
+        };
+        let values_start = clause_start + head_end;
+        let values_end = clause_end - 1;
+        let values = block[values_start..values_end].trim();
+        let mut parts = values.split_whitespace().collect::<Vec<_>>();
+        if parts.len() < 2 {
+            continue;
+        }
+        let (Some(x), Some(y)) = (
+            parts.first().and_then(|value| value.parse::<f64>().ok()),
+            parts.get(1).and_then(|value| value.parse::<f64>().ok()),
+        ) else {
+            continue;
+        };
+        let new_x = cse::types::fmt_f64(x + dx);
+        let new_y = cse::types::fmt_f64(y + dy);
+        parts[0] = &new_x;
+        parts[1] = &new_y;
+        replacements.push((values_start, values_end, format!(" {}", parts.join(" "))));
+    }
+    Ok(replacements)
+}
+
+fn embedded_power_symbol_available(tree: &konnect_sexp::SexpNode, net: &str) -> bool {
+    let want = format!("power:{net}");
+    tree.find("lib_symbols")
+        .map(|lib_symbols| {
+            lib_symbols.find_all("symbol").into_iter().any(|symbol| {
+                symbol.get(1).and_then(|value| value.as_str()) == Some(want.as_str())
+                    && symbol.find("power").is_some()
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn ensure_staged_power_symbol_definition(mut content: String, net: &str) -> anyhow::Result<String> {
+    let Some(start) = find_block_starts(&content, "lib_symbols")
+        .into_iter()
+        .next()
+    else {
+        anyhow::bail!("schematic has no lib_symbols block for staging power:{net}");
+    };
+    let Some((_, end)) = find_balanced_block(&content, start) else {
+        anyhow::bail!("lib_symbols block is malformed");
+    };
+    let definition = staged_power_lib_symbol_definition(net);
+    content.insert_str(end - 1, &definition);
+    Ok(content)
+}
+
+fn staged_power_lib_symbol_definition(net: &str) -> String {
+    format!(
+        "\n    (symbol \"power:{net}\"\n      (power)\n      (symbol \"{net}_0_1\"\n        (pin power_in line (at 0 0 270) (length 0)\n          (name \"~\" (effects (font (size 1.27 1.27))))\n          (number \"1\" (effects (font (size 1.27 1.27))))\n        )\n      )\n    )"
+    )
+}
+
+fn next_power_reference_for_content(content: &str, offset: usize) -> String {
+    let mut highest = 0u32;
+    let mut rest = content;
+    while let Some(index) = rest.find("#PWR") {
+        rest = &rest[index + 4..];
+        let digits = rest
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect::<String>();
+        if let Ok(value) = digits.parse::<u32>() {
+            highest = highest.max(value);
+        }
+    }
+    format!("#PWR{:03}", highest + offset as u32)
+}
+
+fn staged_power_symbol_block(net: &str, reference: &str, x: f64, y: f64, rotation: f64) -> String {
+    let x = cse::types::fmt_f64(x);
+    let y = cse::types::fmt_f64(y);
+    let rotation = cse::types::fmt_f64(rotation);
+    format!(
+        "\n  (symbol\n    (lib_id \"power:{net}\")\n    (at {x} {y} {rotation})\n    (unit 1)\n    (exclude_from_sim no)\n    (in_bom yes)\n    (on_board yes)\n    (dnp no)\n    (uuid \"{}\")\n    (property \"Reference\" \"{reference}\" (at {x} {y} 0) (hide yes))\n    (property \"Value\" \"{net}\" (at {x} {y} 0))\n  )",
+        uuid::Uuid::new_v4()
+    )
+}
+
+fn insert_direct_child_before_sheet_instances(mut content: String, block: &str) -> String {
+    let insert_at = find_block_starts(&content, "sheet_instances")
+        .into_iter()
+        .next()
+        .or_else(|| content.rfind(')'))
+        .unwrap_or(content.len());
+    content.insert_str(insert_at, block);
+    content
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
@@ -4368,6 +5119,87 @@ mod materialize_net_tests {
         (dir, path)
     }
 
+    fn one_pin_net_fixture(
+        name: &str,
+        labels_and_symbols: &str,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("{name}.kicad_sch"));
+        std::fs::write(
+            &path,
+            format!(
+                r#"(kicad_sch
+  (version 20250610)
+  (generator "konnect-test")
+  (uuid "root")
+  (paper "A4")
+  (lib_symbols
+    (symbol "Test:P"
+      (symbol "P_1_1"
+        (pin passive line (at 0 0 180) (length 0) (name "~" (effects (font (size 1.27 1.27)))) (number "1" (effects (font (size 1.27 1.27)))))
+      )
+    )
+    (symbol "power:GND"
+      (power)
+      (symbol "GND_0_1"
+        (pin power_in line (at 0 0 270) (length 0) (name "~" (effects (font (size 1.27 1.27)))) (number "1" (effects (font (size 1.27 1.27)))))
+      )
+    )
+    (symbol "power:+5V"
+      (power)
+      (symbol "+5V_0_1"
+        (pin power_in line (at 0 0 270) (length 0) (name "~" (effects (font (size 1.27 1.27)))) (number "1" (effects (font (size 1.27 1.27)))))
+      )
+    )
+  )
+{labels_and_symbols}
+)"#
+            ),
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    fn one_pin(reference: &str, value: &str, x: f64, y: f64, uuid: &str) -> String {
+        format!(
+            r#"  (symbol
+    (lib_id "Test:P")
+    (at {x} {y} 0)
+    (unit 1)
+    (property "Reference" "{reference}" (at {x} {} 0))
+    (property "Value" "{value}" (at {x} {} 0))
+    (uuid "{uuid}")
+  )"#,
+            y - 2.0,
+            y + 2.0
+        )
+    }
+
+    fn label(net: &str, x: f64, y: f64, uuid: &str) -> String {
+        format!(
+            r#"  (label "{net}" (at {x} {y} 0) (effects (font (size 1.27 1.27)) (justify left bottom)) (uuid "{uuid}"))"#
+        )
+    }
+
+    fn global_label(net: &str, x: f64, y: f64, uuid: &str) -> String {
+        format!(
+            r#"  (global_label "{net}" (shape input) (at {x} {y} 0) (effects (font (size 1.27 1.27)) (justify left)) (uuid "{uuid}"))"#
+        )
+    }
+
+    fn placed_power(net: &str, reference: &str, x: f64, y: f64, uuid: &str) -> String {
+        format!(
+            r##"  (symbol
+    (lib_id "power:{net}")
+    (at {x} {y} 0)
+    (unit 1)
+    (property "Reference" "{reference}" (at {x} {y} 0) (hide yes))
+    (property "Value" "{net}" (at {x} {y} 0))
+    (uuid "{uuid}")
+  )"##
+        )
+    }
+
     #[tokio::test]
     async fn materialize_net_connects_only_existing_same_net_endpoints_and_cleans_labels() {
         let (_dir, path) = ltc_fixture();
@@ -4492,6 +5324,399 @@ mod materialize_net_tests {
         assert!(result_text(&result).contains("SENSE_HI"));
     }
 
+    #[tokio::test]
+    async fn refactor_wired_local_previews_final_transaction_and_preserves_membership() {
+        let (_dir, path) = ltc_fixture();
+        let before = semantic_snapshot(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let dry = handle_refactor_schematic_net_representation(
+            &json!({
+                "schematic": path.display().to_string(),
+                "net": "LTC_SHDN",
+                "representation": "wired_local",
+                "remove_redundant_local_labels": true,
+                "dry_run": true
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!dry.is_error, "{}", result_text(&dry));
+        let body = result_json(&dry);
+        assert_eq!(
+            body["semantic_connectivity_comparison"]["preserved"],
+            json!(true)
+        );
+
+        let applied = handle_refactor_schematic_net_representation(
+            &json!({
+                "schematic": path.display().to_string(),
+                "net": "LTC_SHDN",
+                "representation": "wired_local",
+                "remove_redundant_local_labels": true,
+                "dry_run": false,
+                "plan_revision": body["plan_revision"].as_str().unwrap()
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!applied.is_error, "{}", result_text(&applied));
+        let after = semantic_snapshot(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(before.pin_nets, after.pin_nets);
+        assert_eq!(before.shorts, after.shorts);
+    }
+
+    #[tokio::test]
+    async fn refactor_branched_label_net_uses_tree_not_pairwise_mesh() {
+        let body = [
+            label("NODE", 50.0, 50.0, "l1"),
+            label("NODE", 80.0, 60.0, "l2"),
+            label("NODE", 110.0, 50.0, "l3"),
+            label("NODE", 95.0, 75.0, "l4"),
+            one_pin("J1", "CONN", 50.0, 50.0, "j1"),
+            one_pin("D1", "ESD", 80.0, 60.0, "d1"),
+            one_pin("R1", "0R", 110.0, 50.0, "r1"),
+            one_pin("U1", "IC", 95.0, 75.0, "u1"),
+        ]
+        .join("\n");
+        let (_dir, path) = one_pin_net_fixture("branch", &body);
+        let before = semantic_snapshot(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let dry = handle_refactor_schematic_net_representation(
+            &json!({
+                "schematic": path.display().to_string(),
+                "net": "NODE",
+                "representation": "wired_local",
+                "strategy": { "preferred_orientation": "horizontal", "trunk_y": 50.0 },
+                "remove_redundant_local_labels": true
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!dry.is_error, "{}", result_text(&dry));
+        let preview = result_json(&dry);
+        let wire_count = preview["proposed_wires"].as_array().unwrap().len();
+        assert!(
+            wire_count < 6,
+            "four endpoints should not produce a pairwise full mesh: {preview}"
+        );
+        assert!(wire_count >= 3, "expected trunk plus branches: {preview}");
+
+        let applied = handle_refactor_schematic_net_representation(
+            &json!({
+                "schematic": path.display().to_string(),
+                "net": "NODE",
+                "representation": "wired_local",
+                "strategy": { "preferred_orientation": "horizontal", "trunk_y": 50.0 },
+                "remove_redundant_local_labels": true,
+                "dry_run": false,
+                "plan_revision": preview["plan_revision"].as_str().unwrap()
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!applied.is_error, "{}", result_text(&applied));
+        let after = semantic_snapshot(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(before.pin_nets, after.pin_nets);
+        assert_eq!(before.shorts, after.shorts);
+    }
+
+    #[tokio::test]
+    async fn refactor_passive_boundary_remains_absolute() {
+        let (_dir, path) = ltc_fixture();
+        let result = handle_refactor_schematic_net_representation(
+            &json!({
+                "schematic": path.display().to_string(),
+                "net": "LTC_SHDN",
+                "representation": "wired_local",
+                "pins": [
+                    { "reference": "R16", "pin_number": "1" },
+                    { "reference": "U2", "pin_number": "6" }
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert!(result_text(&result).contains("R16.1"));
+        assert!(result_text(&result).contains("AUX_5V"));
+    }
+
+    #[tokio::test]
+    async fn refactor_expands_coincident_endpoint_with_move_and_wire() {
+        let (_dir, path) = ltc_fixture();
+        let mut content = std::fs::read_to_string(&path).unwrap();
+        content = content
+            .replace("(at 90 50 0)\n    (unit 1)", "(at 55 50 0)\n    (unit 1)")
+            .replace("(at 90 48 0)", "(at 55 48 0)")
+            .replace("(at 90 52 0)", "(at 55 52 0)")
+            .replace(
+                "(label \"LTC_SHDN\" (at 90 50 0)",
+                "(label \"LTC_SHDN\" (at 55 50 0)",
+            );
+        std::fs::write(&path, content).unwrap();
+        let before = semantic_snapshot(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let dry = handle_refactor_schematic_net_representation(
+            &json!({
+                "schematic": path.display().to_string(),
+                "net": "LTC_SHDN",
+                "representation": "expand_coincident_connection",
+                "expand": { "move_reference": "U2", "dx": 20.32, "dy": 0.0 },
+                "remove_redundant_local_labels": true
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!dry.is_error, "{}", result_text(&dry));
+        let preview = result_json(&dry);
+        assert_eq!(preview["proposed_moves"][0]["reference"], json!("U2"));
+        assert_eq!(preview["proposed_wires"].as_array().unwrap().len(), 1);
+
+        let applied = handle_refactor_schematic_net_representation(
+            &json!({
+                "schematic": path.display().to_string(),
+                "net": "LTC_SHDN",
+                "representation": "expand_coincident_connection",
+                "expand": { "move_reference": "U2", "dx": 20.32, "dy": 0.0 },
+                "remove_redundant_local_labels": true,
+                "dry_run": false,
+                "plan_revision": preview["plan_revision"].as_str().unwrap()
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!applied.is_error, "{}", result_text(&applied));
+        let after_text = std::fs::read_to_string(&path).unwrap();
+        assert!(after_text.contains("(at 75.32 50 0)"));
+        assert!(after_text.contains("(wire"));
+        let after = semantic_snapshot(&after_text).unwrap();
+        assert_eq!(before.pin_nets, after.pin_nets);
+        assert_eq!(before.shorts, after.shorts);
+    }
+
+    #[tokio::test]
+    async fn refactor_reports_off_grid_endpoint_dependency() {
+        let body = [
+            label("OFFGRID", 50.13, 50.0, "l1"),
+            label("OFFGRID", 80.0, 50.0, "l2"),
+            one_pin("TP1", "TP", 50.13, 50.0, "tp1"),
+            one_pin("U1", "IC", 80.0, 50.0, "u1"),
+        ]
+        .join("\n");
+        let (_dir, path) = one_pin_net_fixture("offgrid", &body);
+        let dry = handle_refactor_schematic_net_representation(
+            &json!({
+                "schematic": path.display().to_string(),
+                "net": "OFFGRID",
+                "representation": "wired_local",
+                "grid": 1.27
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!dry.is_error, "{}", result_text(&dry));
+        let preview = result_json(&dry);
+        let endpoints = preview["endpoints"].as_array().unwrap();
+        assert!(endpoints.iter().any(|endpoint| {
+            endpoint["reference"] == "TP1"
+                && endpoint["on_grid"] == false
+                && endpoint["attachment_depends_on_off_grid_position"] == true
+        }));
+    }
+
+    #[tokio::test]
+    async fn power_symbol_conversion_requires_explicit_global_scope_policy() {
+        let body = [
+            label("+5V_MAIN", 50.0, 50.0, "l1"),
+            label("+5V_MAIN", 80.0, 50.0, "l2"),
+            one_pin("U1", "IC", 50.0, 50.0, "u1"),
+            one_pin("J1", "CONN", 80.0, 50.0, "j1"),
+        ]
+        .join("\n");
+        let (_dir, path) = one_pin_net_fixture("powerpolicy", &body);
+        let before = std::fs::read_to_string(&path).unwrap();
+        let result = handle_refactor_schematic_net_representation(
+            &json!({
+                "schematic": path.display().to_string(),
+                "net": "+5V_MAIN",
+                "representation": "power_symbol"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert!(result_text(&result).contains("allow_global_power_scope"));
+        assert_eq!(before, std::fs::read_to_string(&path).unwrap());
+    }
+
+    #[tokio::test]
+    async fn arbitrary_power_rail_converts_with_embedded_symbol_and_preserved_membership() {
+        let body = [
+            label("+5V_MAIN", 50.0, 50.0, "l1"),
+            label("+5V_MAIN", 80.0, 50.0, "l2"),
+            one_pin("U1", "IC", 50.0, 50.0, "u1"),
+            one_pin("J1", "CONN", 80.0, 50.0, "j1"),
+        ]
+        .join("\n");
+        let (_dir, path) = one_pin_net_fixture("custom_power", &body);
+        let before = semantic_snapshot(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let dry = handle_refactor_schematic_net_representation(
+            &json!({
+                "schematic": path.display().to_string(),
+                "net": "+5V_MAIN",
+                "representation": "power_symbol",
+                "scope_policy": "allow_global_power_scope"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!dry.is_error, "{}", result_text(&dry));
+        let preview = result_json(&dry);
+        let applied = handle_refactor_schematic_net_representation(
+            &json!({
+                "schematic": path.display().to_string(),
+                "net": "+5V_MAIN",
+                "representation": "power_symbol",
+                "scope_policy": "allow_global_power_scope",
+                "dry_run": false,
+                "plan_revision": preview["plan_revision"].as_str().unwrap()
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!applied.is_error, "{}", result_text(&applied));
+        let after_text = std::fs::read_to_string(&path).unwrap();
+        assert!(after_text.contains("(symbol \"power:+5V_MAIN\""));
+        assert!(after_text.contains("(lib_id \"power:+5V_MAIN\")"));
+        assert_eq!(after_text.matches("(label \"+5V_MAIN\"").count(), 0);
+        let after = semantic_snapshot(&after_text).unwrap();
+        assert_eq!(before.pin_nets, after.pin_nets);
+        assert_eq!(before.shorts, after.shorts);
+    }
+
+    #[tokio::test]
+    async fn gnd_label_normalizes_to_power_symbol_with_membership_preserved() {
+        let body = [
+            label("GND", 50.0, 50.0, "l1"),
+            label("GND", 80.0, 50.0, "l2"),
+            one_pin("U1", "IC", 50.0, 50.0, "u1"),
+            one_pin("J1", "CONN", 80.0, 50.0, "j1"),
+        ]
+        .join("\n");
+        let (_dir, path) = one_pin_net_fixture("gnd", &body);
+        let before = semantic_snapshot(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let dry = handle_refactor_schematic_net_representation(
+            &json!({
+                "schematic": path.display().to_string(),
+                "net": "GND",
+                "representation": "power_symbol",
+                "scope_policy": "allow_global_power_scope"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!dry.is_error, "{}", result_text(&dry));
+        let preview = result_json(&dry);
+        assert_eq!(
+            preview["proposed_power_symbols"].as_array().unwrap().len(),
+            2
+        );
+        let applied = handle_refactor_schematic_net_representation(
+            &json!({
+                "schematic": path.display().to_string(),
+                "net": "GND",
+                "representation": "power_symbol",
+                "scope_policy": "allow_global_power_scope",
+                "dry_run": false,
+                "plan_revision": preview["plan_revision"].as_str().unwrap()
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!applied.is_error, "{}", result_text(&applied));
+        let after_text = std::fs::read_to_string(&path).unwrap();
+        assert!(after_text.contains("(lib_id \"power:GND\")"));
+        assert_eq!(after_text.matches("(label \"GND\"").count(), 0);
+        let after = semantic_snapshot(&after_text).unwrap();
+        assert_eq!(before.pin_nets, after.pin_nets);
+        assert_eq!(before.shorts, after.shorts);
+    }
+
+    #[tokio::test]
+    async fn scope_diagnostic_reports_mixed_label_and_power_mechanisms() {
+        let body = [
+            label("GND", 50.0, 50.0, "l1"),
+            global_label("GND", 80.0, 50.0, "g1"),
+            placed_power("GND", "#PWR001", 110.0, 50.0, "pwr1"),
+            one_pin("U1", "IC", 50.0, 50.0, "u1"),
+        ]
+        .join("\n");
+        let (_dir, path) = one_pin_net_fixture("mixedscope", &body);
+        let result = handle_refactor_schematic_net_representation(
+            &json!({
+                "schematic": path.display().to_string(),
+                "net": "GND",
+                "representation": "scope_diagnostic"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{}", result_text(&result));
+        let diagnostic = result_json(&result);
+        assert_eq!(diagnostic["ordinary_labels"], json!(1));
+        assert_eq!(diagnostic["global_labels"], json!(1));
+        assert_eq!(diagnostic["power_symbols"], json!(1));
+        assert_eq!(diagnostic["mixed_connection_mechanisms"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn refactor_apply_is_transactional_on_stale_revision() {
+        let (_dir, path) = ltc_fixture();
+        let dry = handle_refactor_schematic_net_representation(
+            &json!({
+                "schematic": path.display().to_string(),
+                "net": "LTC_SHDN",
+                "representation": "wired_local",
+                "remove_redundant_local_labels": true
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!dry.is_error, "{}", result_text(&dry));
+        let preview = result_json(&dry);
+        let before = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, before.replace("\"10k\"", "\"11k\"")).unwrap();
+        let changed = std::fs::read_to_string(&path).unwrap();
+
+        let applied = handle_refactor_schematic_net_representation(
+            &json!({
+                "schematic": path.display().to_string(),
+                "net": "LTC_SHDN",
+                "representation": "wired_local",
+                "remove_redundant_local_labels": true,
+                "dry_run": false,
+                "plan_revision": preview["plan_revision"].as_str().unwrap()
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(applied.is_error);
+        assert_eq!(changed, std::fs::read_to_string(&path).unwrap());
+    }
+
     #[test]
     fn materialize_schematic_net_tool_is_registered() {
         let tool = tools()
@@ -4500,5 +5725,8 @@ mod materialize_net_tests {
             .expect("tool is registered");
         assert!(tool.description.contains("net-aware"));
         assert!(tool.input_schema["properties"]["remove_redundant_local_labels"].is_object());
+        assert!(tools()
+            .into_iter()
+            .any(|tool| tool.name == "refactor_schematic_net_representation"));
     }
 }

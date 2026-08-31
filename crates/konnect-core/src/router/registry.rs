@@ -32,9 +32,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "sch_wiring",
-        description: "Wires, net-aware net materialization, net labels, power symbols, junctions, no-connects, pin-to-pin connections",
+        description: "Wires, net-aware representation refactoring, net labels, power symbols, junctions, no-connects, pin-to-pin connections",
         category: "schematic",
-        tool_count: 21,
+        tool_count: 22,
     },
     ToolsetMeta {
         name: "sch_bus",
