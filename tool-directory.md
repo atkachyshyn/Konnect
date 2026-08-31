@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **19 toolsets** organized into 10 categories
-- **212 registered tools** + **6 always-visible meta-tools** = **218 total**
+- **215 registered tools** + **6 always-visible meta-tools** = **221 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2.2K tokens instead of ~34K. (Every client also gets three dispatcher tools — `list_available_tools` / `get_tool_schema` / `execute_konnect_tool` — which reach every tool below on demand, for ~3.0K total. They exist for clients that cache their first listing rather than refreshing on `tools/list_changed`, for which the discovery pattern described next cannot work at all.) The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -101,8 +101,8 @@ Component population metadata example:
 `(in_bom no/yes)`, and `exclude_from_board` maps to `(on_board no/yes)`.
 Omitted metadata fields preserve their existing values.
 
-### `sch_wiring` · 20 tools
-**Purpose:** Wires, net labels, power symbols, junctions, no-connects, pin-to-pin connections.
+### `sch_wiring` · 21 tools
+**Purpose:** Wires, net-aware net materialization, net labels, power symbols, junctions, no-connects, pin-to-pin connections.
 **Source:** [`crates/konnect-core/src/tools/sch_wiring.rs`](crates/konnect-core/src/tools/sch_wiring.rs)
 
 | Tool | Description |
@@ -127,6 +127,7 @@ Omitted metadata fields preserve their existing values.
 | `connect_to_net` | Connect a pin to a named net by adding a short wire stub + net label. Name the pin (reference + pin_number) or give its coordinates; the stub direction defaults to `auto`, pointing away from the symbol body. |
 | `connect_pins` | Connect two component pins by reference+pin number. Looks up pin coordinates and routes a wire. |
 | `add_schematic_connection` | Connect two schematic points directly with a wire (auto H+V routing). Use `connect_pins` if you have references instead of coordinates. |
+| `materialize_schematic_net` | Preview or apply net-aware visible wiring for an already-correct same-sheet net. Resolves the parsed connectivity graph first, creates deterministic orthogonal trunk/branch geometry only between endpoints already on the requested net, validates semantic endpoint membership and shorts, and can remove redundant plain local labels while preserving global/hierarchical labels and one local net-name label. |
 
 ### `sch_bus` · 4 tools
 **Purpose:** Buses, bus entries, and fanning a group of pins out onto a bus.
@@ -161,8 +162,8 @@ Omitted metadata fields preserve their existing values.
 | `get_connected_items` | Get all wires, labels, and components connected to a given component by tracing each of its pins. |
 | `check_schematic_overlaps` | Find collisions using transformed symbol drawings and pins (excluding free text), with a reported origin fallback when geometry is unavailable. |
 
-### `sch_batch` · 12 tools
-**Purpose:** Bulk add, edit, delete, and move schematic elements in one call.
+### `sch_batch` · 14 tools
+**Purpose:** Bulk add, edit, delete, move, inspect, and arrange schematic elements in one call.
 **Source:** [`crates/konnect-core/src/tools/sch_batch.rs`](crates/konnect-core/src/tools/sch_batch.rs)
 
 | Tool | Description |
@@ -175,6 +176,8 @@ Omitted metadata fields preserve their existing values.
 | `connect_passthrough` | Add a wire stub and matching net label at a point to route a signal through a region without drawing a full path. Direction defaults to `auto`. |
 | `add_schematic_text` | Add a text annotation (non-net label) to the schematic at a given position. Aligns the text against that position with `justify`, per axis and defaulting to `left bottom` as KiCad does; an omitted axis is centred, and `center` centres both. |
 | `get_schematic_layout` | Return component positions and transformed drawing/pin bounds (excluding free text), reporting unresolved geometry; optionally include wires and labels. |
+| `inspect_schematic_selection_layout` | Return bounds for selected schematic items plus page, drawing-frame, safe printable region, title-block reserved area, margin, and out-of-bounds diagnostics. Select by component references, item UUIDs, or a bounding box. |
+| `arrange_schematic_selection` | Preview or apply generic layout operations to selected items: translate, move to anchor, align, and distribute. Preserves each selected item's internal geometry and refuses apply if semantic pin-net membership or shorts change. |
 | `validate_wire_connections` | Check all wire endpoints for floating ends not connected to a pin, label, or another wire. |
 | `validate_component_connections` | Check that every non-passive pin has at least one wire or label connected. Reports unconnected pins. |
 | `batch_place_components` | Place multiple symbols from KiCAD libraries in a single file read/write cycle. Pass explicit references -- there is no auto-numbering; an omitted reference becomes '?' like an eeschema-unannotated symbol, same as `add_schematic_component`. |

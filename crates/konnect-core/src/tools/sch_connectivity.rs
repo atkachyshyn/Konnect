@@ -31,8 +31,8 @@
 use konnect_sexp::{
     geometry::{point_on_segment, points_coincident},
     schematic::{
-        extract_junctions, extract_no_connects, extract_sheet_pins, pin_endpoint, Label, LabelKind,
-        LibPin, Wire,
+        extract_junctions, extract_no_connects, extract_sheet_pins, pin_endpoint,
+        pin_outward_direction, Label, LabelKind, LibPin, Wire,
     },
     SexpNode,
 };
@@ -335,8 +335,10 @@ pub(crate) struct PlacedPin {
     /// The owning component's value, carried so a caller reporting a pin does
     /// not re-walk the instances this was built from.
     pub(crate) value: String,
+    pub(crate) unit: u32,
     pub(crate) pin: LibPin,
     pub(crate) at: (f64, f64),
+    pub(crate) orientation_degrees: f64,
 }
 
 /// Every item that can terminate a point on one sheet, under one tolerance.
@@ -370,7 +372,9 @@ impl<'a> ConnectivityIndex<'a> {
                 pins.into_iter().map(move |(pin, transform)| PlacedPin {
                     reference: inst.reference.clone(),
                     value: inst.value.clone(),
+                    unit: inst.unit,
                     at: pin_endpoint(&pin, transform),
+                    orientation_degrees: pin_outward_direction(&pin, transform),
                     pin,
                 })
             })

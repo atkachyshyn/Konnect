@@ -20,12 +20,14 @@ use konnect_sexp::{
         read_schematic, symbol_bounds_for_instance, SymbolBounds,
     },
     writer::{
-        apply_edits, find_block_with_leading_whitespace, find_enclosing_direct_child_block,
-        new_uuid, read_consistent, write_atomic_if_unchanged, SexpEdit,
+        apply_edits, find_balanced_block, find_block_starts, find_block_with_leading_whitespace,
+        find_direct_child_blocks, find_enclosing_direct_child_block, new_uuid, read_consistent,
+        write_atomic_if_unchanged, SexpEdit,
     },
+    DocumentRevision,
 };
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::sch_connectivity::{ConnectivityIndex, COINCIDENT_TOLERANCE};
 // Re-use the single-item component placer and pin-to-pin router.
@@ -285,6 +287,72 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["schematic"]
             }),
             |args, ctx| async move { handle_get_layout(args, ctx).await }
+        ),
+        tool!(
+            "inspect_schematic_selection_layout",
+            "Return bounds for selected schematic items plus page, drawing-frame, safe \
+             printable region, title-block reserved area, margin, and out-of-bounds diagnostics. \
+             Select by component references, item UUIDs, or a bounding box.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
+                    "selection": {
+                        "type": "object",
+                        "properties": {
+                            "references": { "type": "array", "items": { "type": "string" } },
+                            "uuids": { "type": "array", "items": { "type": "string" } },
+                            "bbox": { "description": "Either [min_x,min_y,max_x,max_y] or {min_x,min_y,max_x,max_y}" }
+                        },
+                        "additionalProperties": false
+                    },
+                    "safe_margin": { "type": "number", "description": "Margin inside page frame in mm", "default": 10.0 }
+                },
+                "required": ["schematic"]
+            }),
+            |args, ctx| async move { handle_inspect_selection_layout(args, ctx).await }
+        ),
+        tool!(
+            "arrange_schematic_selection",
+            "Preview or apply a generic schematic layout operation to selected items. Supports \
+             translate, move_to_anchor, align, and distribute while preserving each item's internal \
+             geometry. Apply mode revalidates component-pin endpoint membership and shorts before \
+             writing, so moving only a component away from its labels/wires is refused.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
+                    "selection": {
+                        "type": "object",
+                        "properties": {
+                            "references": { "type": "array", "items": { "type": "string" } },
+                            "uuids": { "type": "array", "items": { "type": "string" } },
+                            "bbox": { "description": "Either [min_x,min_y,max_x,max_y] or {min_x,min_y,max_x,max_y}" }
+                        },
+                        "additionalProperties": false
+                    },
+                    "operation": {
+                        "type": "object",
+                        "properties": {
+                            "type": { "type": "string", "enum": ["translate", "move_to_anchor", "align", "distribute"] },
+                            "dx": { "type": "number" },
+                            "dy": { "type": "number" },
+                            "anchor": { "type": "string", "enum": ["top_left", "center", "bottom_right"], "default": "top_left" },
+                            "x": { "type": "number" },
+                            "y": { "type": "number" },
+                            "edge": { "type": "string", "enum": ["left", "right", "top", "bottom", "horizontal_center", "vertical_center"] },
+                            "axis": { "type": "string", "enum": ["horizontal", "vertical"] },
+                            "spacing": { "type": "number", "description": "Optional edge-to-edge spacing for distribution. Defaults to preserving the current span." }
+                        },
+                        "required": ["type"],
+                        "additionalProperties": false
+                    },
+                    "dry_run": { "type": "boolean", "description": "Default true. false applies the already-reviewed plan.", "default": true },
+                    "plan_revision": { "type": "string", "description": "Exact dry-run revision required when dry_run=false" }
+                },
+                "required": ["schematic", "selection", "operation"]
+            }),
+            |args, ctx| async move { handle_arrange_schematic_selection(args, ctx).await }
         ),
         tool!(
             "validate_wire_connections",
@@ -714,6 +782,842 @@ fn is_deletable_schematic_item(block: &str) -> bool {
             | "symbol_instances"
             | "embedded_fonts"
     )
+}
+
+// ─── Schematic layout selection and arrangement ──────────────────────────────
+
+const LAYOUT_ITEM_TAGS: &[&str] = &[
+    "symbol",
+    "wire",
+    "bus",
+    "bus_entry",
+    "junction",
+    "label",
+    "global_label",
+    "hierarchical_label",
+    "no_connect",
+    "text",
+    "text_box",
+    "polyline",
+    "rectangle",
+    "circle",
+    "arc",
+    "image",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct LayoutBounds {
+    min_x: f64,
+    min_y: f64,
+    max_x: f64,
+    max_y: f64,
+}
+
+impl LayoutBounds {
+    fn point(x: f64, y: f64) -> Self {
+        Self {
+            min_x: x,
+            min_y: y,
+            max_x: x,
+            max_y: y,
+        }
+    }
+
+    fn include(&mut self, x: f64, y: f64) {
+        self.min_x = self.min_x.min(x);
+        self.min_y = self.min_y.min(y);
+        self.max_x = self.max_x.max(x);
+        self.max_y = self.max_y.max(y);
+    }
+
+    fn union(self, other: Self) -> Self {
+        Self {
+            min_x: self.min_x.min(other.min_x),
+            min_y: self.min_y.min(other.min_y),
+            max_x: self.max_x.max(other.max_x),
+            max_y: self.max_y.max(other.max_y),
+        }
+    }
+
+    fn width(self) -> f64 {
+        self.max_x - self.min_x
+    }
+
+    fn height(self) -> f64 {
+        self.max_y - self.min_y
+    }
+
+    fn center_x(self) -> f64 {
+        (self.min_x + self.max_x) / 2.0
+    }
+
+    fn center_y(self) -> f64 {
+        (self.min_y + self.max_y) / 2.0
+    }
+
+    fn contains(self, other: Self) -> bool {
+        other.min_x >= self.min_x
+            && other.max_x <= self.max_x
+            && other.min_y >= self.min_y
+            && other.max_y <= self.max_y
+    }
+
+    fn margin_inside(self, other: Self) -> f64 {
+        [
+            other.min_x - self.min_x,
+            self.max_x - other.max_x,
+            other.min_y - self.min_y,
+            self.max_y - other.max_y,
+        ]
+        .into_iter()
+        .fold(f64::INFINITY, f64::min)
+    }
+
+    fn json(self) -> serde_json::Value {
+        json!({
+            "min_x": self.min_x,
+            "min_y": self.min_y,
+            "max_x": self.max_x,
+            "max_y": self.max_y,
+            "width": self.width(),
+            "height": self.height()
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LayoutItem {
+    uuid: String,
+    kind: String,
+    reference: Option<String>,
+    range: (usize, usize),
+    bounds: LayoutBounds,
+}
+
+impl LayoutItem {
+    fn json(&self) -> serde_json::Value {
+        json!({
+            "uuid": self.uuid,
+            "kind": self.kind,
+            "reference": self.reference,
+            "bounds": self.bounds.json()
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LayoutPlan {
+    schematic: std::path::PathBuf,
+    before: String,
+    selected: Vec<LayoutItem>,
+    deltas: BTreeMap<String, (f64, f64)>,
+    before_signature: SemanticSignature,
+    plan_revision: String,
+}
+
+impl LayoutPlan {
+    fn response(&self, dry_run: bool, applied: bool) -> serde_json::Value {
+        json!({
+            "dry_run": dry_run,
+            "applied": applied,
+            "safe_to_apply": true,
+            "plan_revision": self.plan_revision,
+            "schematic": self.schematic.display().to_string(),
+            "selected_count": self.selected.len(),
+            "selection_bounds": union_layout_bounds(&self.selected).map(LayoutBounds::json),
+            "items": self.selected.iter().map(LayoutItem::json).collect::<Vec<_>>(),
+            "deltas": self.deltas.iter().map(|(uuid, (dx, dy))| json!({"uuid": uuid, "dx": dx, "dy": dy})).collect::<Vec<_>>()
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct SemanticSignature {
+    pin_nets: BTreeMap<String, Option<String>>,
+    shorts: Vec<Vec<String>>,
+}
+
+async fn handle_inspect_selection_layout(
+    args: &serde_json::Value,
+    _ctx: &crate::tools::ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let safe_margin = args["safe_margin"].as_f64().unwrap_or(10.0);
+    let (content, tree) = read_schematic(&sch_path)?;
+    let items = extract_layout_items(&content, &tree)?;
+    let selected = match select_layout_items(&items, args.get("selection")) {
+        Ok(selected) => selected,
+        Err(error) => return Ok(error),
+    };
+    let page = schematic_page_geometry(&tree, safe_margin);
+    let selection_bounds = union_layout_bounds(&selected);
+    let safe = page.safe_region;
+    let out_of_bounds = selected
+        .iter()
+        .filter(|item| !safe.contains(item.bounds))
+        .map(LayoutItem::json)
+        .collect::<Vec<_>>();
+    let minimum_margin = selection_bounds.map(|bounds| safe.margin_inside(bounds));
+
+    Ok(CallToolResult::json(&json!({
+        "schematic": sch_path.display().to_string(),
+        "selected_count": selected.len(),
+        "selection_bounds": selection_bounds.map(LayoutBounds::json),
+        "items": selected.iter().map(LayoutItem::json).collect::<Vec<_>>(),
+        "page": page.json(),
+        "fully_inside_safe_region": out_of_bounds.is_empty(),
+        "minimum_margin": minimum_margin,
+        "out_of_bounds_items": out_of_bounds
+    })))
+}
+
+async fn handle_arrange_schematic_selection(
+    args: &serde_json::Value,
+    _ctx: &crate::tools::ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let dry_run = args["dry_run"].as_bool().unwrap_or(true);
+    let plan = match build_layout_plan(&sch_path, args) {
+        Ok(plan) => plan,
+        Err(error) => return Ok(error),
+    };
+    if dry_run {
+        return Ok(CallToolResult::json(&plan.response(true, false)));
+    }
+    let supplied_revision = args["plan_revision"].as_str().unwrap_or_default();
+    if supplied_revision != plan.plan_revision {
+        return Ok(CallToolResult::error(format!(
+            "plan_revision mismatch; rerun dry_run and apply exactly '{}'",
+            plan.plan_revision
+        )));
+    }
+    let after = apply_layout_deltas(&plan.before, &plan.selected, &plan.deltas)?;
+    validate_semantic_signature(&plan.before_signature, &after, "after layout arrangement")
+        .map_err(|error| anyhow::anyhow!(error))?;
+    write_atomic_if_unchanged(&plan.schematic, &plan.before, &after)?;
+    Ok(CallToolResult::json(&plan.response(false, true)))
+}
+
+fn build_layout_plan(
+    sch_path: &std::path::PathBuf,
+    args: &serde_json::Value,
+) -> Result<LayoutPlan, CallToolResult> {
+    let (before, tree) =
+        read_schematic(sch_path).map_err(|error| CallToolResult::error(error.to_string()))?;
+    let items = extract_layout_items(&before, &tree)
+        .map_err(|error| CallToolResult::error(error.to_string()))?;
+    let selected = select_layout_items(&items, args.get("selection"))?;
+    if selected.is_empty() {
+        return Err(CallToolResult::error("selection matched no layout items"));
+    }
+    let deltas = layout_deltas(&selected, &args["operation"])?;
+    let after = apply_layout_deltas(&before, &selected, &deltas)
+        .map_err(|error| CallToolResult::error(error.to_string()))?;
+    let before_signature =
+        semantic_signature(&before).map_err(|error| CallToolResult::error(error.to_string()))?;
+    validate_semantic_signature(
+        &before_signature,
+        &after,
+        "preview after layout arrangement",
+    )
+    .map_err(|error| CallToolResult::error(error.to_string()))?;
+    let plan_revision = layout_plan_revision(&before, &selected, &deltas, &args["operation"]);
+    Ok(LayoutPlan {
+        schematic: sch_path.clone(),
+        before,
+        selected,
+        deltas,
+        before_signature,
+        plan_revision,
+    })
+}
+
+fn extract_layout_items(
+    content: &str,
+    tree: &konnect_sexp::SexpNode,
+) -> anyhow::Result<Vec<LayoutItem>> {
+    let instances = extract_symbol_instances(tree);
+    let lib_symbols = tree
+        .find("lib_symbols")
+        .map(|node| node.find_all("symbol"))
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for (start, end) in find_direct_child_blocks(content, "kicad_sch") {
+        let block = &content[start..end];
+        let node = konnect_sexp::parse_sexp(block)?;
+        let Some(kind) = node.head() else { continue };
+        if !LAYOUT_ITEM_TAGS.contains(&kind) {
+            continue;
+        }
+        let Some(uuid) = node.find_str("uuid") else {
+            continue;
+        };
+        let reference = property_value(&node, "Reference").map(str::to_string);
+        let bounds = if kind == "symbol" {
+            instances
+                .iter()
+                .find(|instance| instance.uuid.as_deref() == Some(uuid))
+                .and_then(|instance| {
+                    find_lib_symbol(&lib_symbols, instance)
+                        .and_then(|symbol| symbol_bounds_for_instance(symbol, instance))
+                })
+                .map(|bounds| LayoutBounds {
+                    min_x: bounds.min_x,
+                    min_y: bounds.min_y,
+                    max_x: bounds.max_x,
+                    max_y: bounds.max_y,
+                })
+                .or_else(|| item_layout_bounds(&node))
+        } else {
+            item_layout_bounds(&node)
+        };
+        if let Some(bounds) = bounds {
+            out.push(LayoutItem {
+                uuid: uuid.to_string(),
+                kind: kind.to_string(),
+                reference,
+                range: (start, end),
+                bounds,
+            });
+        }
+    }
+    Ok(out)
+}
+
+fn property_value<'a>(node: &'a konnect_sexp::SexpNode, name: &str) -> Option<&'a str> {
+    node.find_all("property")
+        .into_iter()
+        .find(|property| property.get(1).and_then(|n| n.as_str()) == Some(name))
+        .and_then(|property| property.get(2))
+        .and_then(|value| value.as_str())
+}
+
+fn item_layout_bounds(node: &konnect_sexp::SexpNode) -> Option<LayoutBounds> {
+    let mut bounds: Option<LayoutBounds> = None;
+    let mut include = |x: f64, y: f64| match &mut bounds {
+        Some(bounds) => bounds.include(x, y),
+        None => bounds = Some(LayoutBounds::point(x, y)),
+    };
+    if let Some(at) = node.find("at") {
+        if let (Some(x), Some(y)) = (at.get_f64(1), at.get_f64(2)) {
+            include(x, y);
+        }
+    }
+    for tag in ["start", "mid", "end", "center"] {
+        if let Some(point) = node.find(tag) {
+            if let (Some(x), Some(y)) = (point.get_f64(1), point.get_f64(2)) {
+                include(x, y);
+            }
+        }
+    }
+    if let Some(points) = node.find("pts") {
+        for point in points.find_all("xy") {
+            if let (Some(x), Some(y)) = (point.get_f64(1), point.get_f64(2)) {
+                include(x, y);
+            }
+        }
+    }
+    if node.head() == Some("circle") {
+        if let (Some(center), Some(radius)) = (node.find("center"), node.find_f64("radius")) {
+            if let (Some(x), Some(y)) = (center.get_f64(1), center.get_f64(2)) {
+                include(x - radius, y - radius);
+                include(x + radius, y + radius);
+            }
+        }
+    }
+    bounds
+}
+
+fn select_layout_items(
+    items: &[LayoutItem],
+    selection: Option<&serde_json::Value>,
+) -> Result<Vec<LayoutItem>, CallToolResult> {
+    let Some(selection) = selection else {
+        return Ok(items.to_vec());
+    };
+    if !selection.is_object() {
+        return Err(CallToolResult::error("selection must be an object"));
+    }
+    let refs = string_array(selection, "references")?;
+    let uuids = string_array(selection, "uuids")?;
+    let bbox = parse_layout_bbox(selection.get("bbox"))?;
+    if refs.is_empty() && uuids.is_empty() && bbox.is_none() {
+        return Ok(items.to_vec());
+    }
+    let selected = items
+        .iter()
+        .filter(|item| {
+            item.reference
+                .as_ref()
+                .is_some_and(|reference| refs.contains(reference))
+                || uuids.contains(&item.uuid)
+                || bbox.is_some_and(|bbox| {
+                    item.bounds.min_x <= bbox.max_x
+                        && item.bounds.max_x >= bbox.min_x
+                        && item.bounds.min_y <= bbox.max_y
+                        && item.bounds.max_y >= bbox.min_y
+                })
+        })
+        .cloned()
+        .collect();
+    Ok(selected)
+}
+
+fn string_array(value: &serde_json::Value, field: &str) -> Result<Vec<String>, CallToolResult> {
+    match value.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        CallToolResult::error(format!(
+                            "selection.{field} must contain only non-empty strings"
+                        ))
+                    })
+            })
+            .collect(),
+        Some(_) => Err(CallToolResult::error(format!(
+            "selection.{field} must be an array"
+        ))),
+    }
+}
+
+fn parse_layout_bbox(
+    value: Option<&serde_json::Value>,
+) -> Result<Option<LayoutBounds>, CallToolResult> {
+    let Some(value) = value else { return Ok(None) };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let numbers = if let Some(items) = value.as_array() {
+        if items.len() != 4 {
+            return Err(CallToolResult::error(
+                "selection.bbox array must be [min_x,min_y,max_x,max_y]",
+            ));
+        }
+        items
+            .iter()
+            .map(serde_json::Value::as_f64)
+            .collect::<Option<Vec<_>>>()
+    } else if let Some(object) = value.as_object() {
+        let parsed = (
+            object.get("min_x").and_then(serde_json::Value::as_f64),
+            object.get("min_y").and_then(serde_json::Value::as_f64),
+            object.get("max_x").and_then(serde_json::Value::as_f64),
+            object.get("max_y").and_then(serde_json::Value::as_f64),
+        );
+        match parsed {
+            (Some(min_x), Some(min_y), Some(max_x), Some(max_y)) => {
+                Some(vec![min_x, min_y, max_x, max_y])
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let Some(numbers) = numbers else {
+        return Err(CallToolResult::error(
+            "selection.bbox must be an array or object with finite numeric bounds",
+        ));
+    };
+    Ok(Some(LayoutBounds {
+        min_x: numbers[0].min(numbers[2]),
+        min_y: numbers[1].min(numbers[3]),
+        max_x: numbers[0].max(numbers[2]),
+        max_y: numbers[1].max(numbers[3]),
+    }))
+}
+
+fn union_layout_bounds(items: &[LayoutItem]) -> Option<LayoutBounds> {
+    items
+        .iter()
+        .map(|item| item.bounds)
+        .reduce(LayoutBounds::union)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PageGeometry {
+    page: LayoutBounds,
+    drawing_frame: LayoutBounds,
+    safe_region: LayoutBounds,
+    title_block_reserved: LayoutBounds,
+}
+
+impl PageGeometry {
+    fn json(self) -> serde_json::Value {
+        json!({
+            "page_bounds": self.page.json(),
+            "drawing_frame": self.drawing_frame.json(),
+            "safe_printable_region": self.safe_region.json(),
+            "title_block_reserved_area": self.title_block_reserved.json()
+        })
+    }
+}
+
+fn schematic_page_geometry(tree: &konnect_sexp::SexpNode, safe_margin: f64) -> PageGeometry {
+    let (mut width, mut height) = match tree.find("paper").and_then(|paper| {
+        let name = paper
+            .get(1)
+            .and_then(|value| value.as_str())
+            .unwrap_or("A4");
+        if name == "User" {
+            Some((paper.get_f64(2)?, paper.get_f64(3)?))
+        } else {
+            named_paper_dimensions(name)
+        }
+    }) {
+        Some(size) => size,
+        None => named_paper_dimensions("A4").unwrap(),
+    };
+    if tree.find("paper").is_some_and(|paper| {
+        paper
+            .children()
+            .unwrap_or(&[])
+            .iter()
+            .any(|arg| arg.as_str() == Some("portrait"))
+    }) {
+        std::mem::swap(&mut width, &mut height);
+    }
+    let page = LayoutBounds {
+        min_x: 0.0,
+        min_y: 0.0,
+        max_x: width,
+        max_y: height,
+    };
+    let frame_margin = 5.0;
+    let drawing_frame = LayoutBounds {
+        min_x: frame_margin,
+        min_y: frame_margin,
+        max_x: width - frame_margin,
+        max_y: height - frame_margin,
+    };
+    let safe_region = LayoutBounds {
+        min_x: safe_margin,
+        min_y: safe_margin,
+        max_x: width - safe_margin,
+        max_y: height - safe_margin,
+    };
+    let title_block_reserved = LayoutBounds {
+        min_x: (width - 125.0).max(safe_margin),
+        min_y: (height - 40.0).max(safe_margin),
+        max_x: width - safe_margin,
+        max_y: height - safe_margin,
+    };
+    PageGeometry {
+        page,
+        drawing_frame,
+        safe_region,
+        title_block_reserved,
+    }
+}
+
+fn named_paper_dimensions(name: &str) -> Option<(f64, f64)> {
+    Some(match name {
+        "A0" => (1189.0, 841.0),
+        "A1" => (841.0, 594.0),
+        "A2" => (594.0, 420.0),
+        "A3" => (420.0, 297.0),
+        "A4" => (297.0, 210.0),
+        "A5" => (210.0, 148.0),
+        "A" | "USLetter" => (279.4, 215.9),
+        "B" | "USLedger" => (431.8, 279.4),
+        "C" => (558.8, 431.8),
+        "D" => (863.6, 558.8),
+        "E" => (1117.6, 863.6),
+        "USLegal" => (355.6, 215.9),
+        _ => return None,
+    })
+}
+
+fn layout_deltas(
+    selected: &[LayoutItem],
+    operation: &serde_json::Value,
+) -> Result<BTreeMap<String, (f64, f64)>, CallToolResult> {
+    if !operation.is_object() {
+        return Err(CallToolResult::error("operation must be an object"));
+    }
+    let Some(kind) = operation["type"].as_str() else {
+        return Err(CallToolResult::error("operation.type is required"));
+    };
+    let mut out = BTreeMap::new();
+    match kind {
+        "translate" => {
+            let dx = operation["dx"].as_f64().unwrap_or(0.0);
+            let dy = operation["dy"].as_f64().unwrap_or(0.0);
+            for item in selected {
+                out.insert(item.uuid.clone(), (dx, dy));
+            }
+        }
+        "move_to_anchor" => {
+            let bounds = union_layout_bounds(selected)
+                .ok_or_else(|| CallToolResult::error("selection has no bounds"))?;
+            let x = operation["x"]
+                .as_f64()
+                .ok_or_else(|| CallToolResult::error("operation.x is required"))?;
+            let y = operation["y"]
+                .as_f64()
+                .ok_or_else(|| CallToolResult::error("operation.y is required"))?;
+            let anchor = operation["anchor"].as_str().unwrap_or("top_left");
+            let (anchor_x, anchor_y) = match anchor {
+                "top_left" => (bounds.min_x, bounds.min_y),
+                "center" => (bounds.center_x(), bounds.center_y()),
+                "bottom_right" => (bounds.max_x, bounds.max_y),
+                other => {
+                    return Err(CallToolResult::error(format!(
+                        "operation.anchor '{other}' is invalid"
+                    )))
+                }
+            };
+            for item in selected {
+                out.insert(item.uuid.clone(), (x - anchor_x, y - anchor_y));
+            }
+        }
+        "align" => {
+            let edge = operation["edge"]
+                .as_str()
+                .ok_or_else(|| CallToolResult::error("operation.edge is required for align"))?;
+            let selection = union_layout_bounds(selected)
+                .ok_or_else(|| CallToolResult::error("selection has no bounds"))?;
+            for item in selected {
+                let (dx, dy) = match edge {
+                    "left" => (selection.min_x - item.bounds.min_x, 0.0),
+                    "right" => (selection.max_x - item.bounds.max_x, 0.0),
+                    "top" => (0.0, selection.min_y - item.bounds.min_y),
+                    "bottom" => (0.0, selection.max_y - item.bounds.max_y),
+                    "horizontal_center" => (selection.center_x() - item.bounds.center_x(), 0.0),
+                    "vertical_center" => (0.0, selection.center_y() - item.bounds.center_y()),
+                    other => {
+                        return Err(CallToolResult::error(format!(
+                            "operation.edge '{other}' is invalid"
+                        )))
+                    }
+                };
+                out.insert(item.uuid.clone(), (dx, dy));
+            }
+        }
+        "distribute" => {
+            let axis = operation["axis"].as_str().ok_or_else(|| {
+                CallToolResult::error("operation.axis is required for distribute")
+            })?;
+            let mut ordered = selected.to_vec();
+            match axis {
+                "horizontal" => ordered.sort_by(|a, b| {
+                    a.bounds
+                        .min_x
+                        .partial_cmp(&b.bounds.min_x)
+                        .expect("finite bounds")
+                }),
+                "vertical" => ordered.sort_by(|a, b| {
+                    a.bounds
+                        .min_y
+                        .partial_cmp(&b.bounds.min_y)
+                        .expect("finite bounds")
+                }),
+                other => {
+                    return Err(CallToolResult::error(format!(
+                        "operation.axis '{other}' is invalid"
+                    )))
+                }
+            }
+            if ordered.len() < 3 {
+                return Err(CallToolResult::error(
+                    "distribute requires at least three selected items",
+                ));
+            }
+            let first = ordered.first().unwrap().bounds;
+            let last = ordered.last().unwrap().bounds;
+            let spacing = operation["spacing"].as_f64();
+            for (index, item) in ordered.iter().enumerate() {
+                let (target_x, target_y) = if axis == "horizontal" {
+                    let target = if let Some(spacing) = spacing {
+                        first.min_x
+                            + ordered[..index]
+                                .iter()
+                                .map(|item| item.bounds.width() + spacing)
+                                .sum::<f64>()
+                    } else {
+                        first.min_x
+                            + (last.min_x - first.min_x) * index as f64 / (ordered.len() - 1) as f64
+                    };
+                    (target, item.bounds.min_y)
+                } else {
+                    let target = if let Some(spacing) = spacing {
+                        first.min_y
+                            + ordered[..index]
+                                .iter()
+                                .map(|item| item.bounds.height() + spacing)
+                                .sum::<f64>()
+                    } else {
+                        first.min_y
+                            + (last.min_y - first.min_y) * index as f64 / (ordered.len() - 1) as f64
+                    };
+                    (item.bounds.min_x, target)
+                };
+                out.insert(
+                    item.uuid.clone(),
+                    (target_x - item.bounds.min_x, target_y - item.bounds.min_y),
+                );
+            }
+        }
+        other => {
+            return Err(CallToolResult::error(format!(
+                "operation.type '{other}' is invalid"
+            )))
+        }
+    }
+    Ok(out)
+}
+
+fn apply_layout_deltas(
+    content: &str,
+    selected: &[LayoutItem],
+    deltas: &BTreeMap<String, (f64, f64)>,
+) -> anyhow::Result<String> {
+    let mut edits = Vec::new();
+    for item in selected {
+        let Some((dx, dy)) = deltas.get(&item.uuid).copied() else {
+            continue;
+        };
+        if dx == 0.0 && dy == 0.0 {
+            continue;
+        }
+        let block = &content[item.range.0..item.range.1];
+        for (rel_start, rel_end, replacement) in coordinate_clause_replacements(block, dx, dy)? {
+            edits.push(SexpEdit::replace(
+                item.range.0 + rel_start,
+                item.range.0 + rel_end,
+                replacement,
+            ));
+        }
+    }
+    Ok(apply_edits(content.to_string(), edits))
+}
+
+fn coordinate_clause_replacements(
+    block: &str,
+    dx: f64,
+    dy: f64,
+) -> anyhow::Result<Vec<(usize, usize, String)>> {
+    let mut replacements = Vec::new();
+    for start in find_block_starts(block, "at")
+        .into_iter()
+        .chain(find_block_starts(block, "start"))
+        .chain(find_block_starts(block, "mid"))
+        .chain(find_block_starts(block, "end"))
+        .chain(find_block_starts(block, "center"))
+        .chain(find_block_starts(block, "xy"))
+    {
+        let Some((clause_start, clause_end)) = find_balanced_block(block, start) else {
+            continue;
+        };
+        let clause = &block[clause_start..clause_end];
+        let Some(head_end) = clause.find(char::is_whitespace) else {
+            continue;
+        };
+        let values_start = clause_start + head_end;
+        let values_end = clause_end - 1;
+        let values = block[values_start..values_end].trim();
+        let mut parts = values.split_whitespace().collect::<Vec<_>>();
+        if parts.len() < 2 {
+            continue;
+        }
+        let (Some(x), Some(y)) = (
+            parts.first().and_then(|value| value.parse::<f64>().ok()),
+            parts.get(1).and_then(|value| value.parse::<f64>().ok()),
+        ) else {
+            continue;
+        };
+        let new_x = cse::types::fmt_f64(x + dx);
+        let new_y = cse::types::fmt_f64(y + dy);
+        parts[0] = &new_x;
+        parts[1] = &new_y;
+        replacements.push((values_start, values_end, format!(" {}", parts.join(" "))));
+    }
+    Ok(replacements)
+}
+
+fn semantic_signature(content: &str) -> anyhow::Result<SemanticSignature> {
+    let tree = konnect_sexp::parse_sexp(content)?;
+    let wires = extract_wires(&tree);
+    let labels = extract_all_net_labels(&tree);
+    let index = ConnectivityIndex::build(&tree, &wires, &labels, COINCIDENT_TOLERANCE);
+    let mut graph = super::sch_connectivity::net_graph_for(&tree, &wires, &labels);
+    let pin_nets = index
+        .placed_pins()
+        .iter()
+        .map(|pin| {
+            (
+                format!("{}:{}:{}", pin.reference, pin.unit, pin.pin.number),
+                graph.net_at(pin.at.0, pin.at.1),
+            )
+        })
+        .collect();
+    Ok(SemanticSignature {
+        pin_nets,
+        shorts: layout_shorted_label_sets(&tree),
+    })
+}
+
+fn layout_shorted_label_sets(tree: &konnect_sexp::SexpNode) -> Vec<Vec<String>> {
+    let wires = extract_wires(tree);
+    let labels = extract_all_net_labels(tree);
+    let mut graph = super::sch_connectivity::net_graph_for(tree, &wires, &labels);
+    let mut root_nets: HashMap<(i64, i64), Vec<String>> = HashMap::new();
+    for label in &labels {
+        let root = graph.find(super::sch_connectivity::pt_key(label.x, label.y));
+        root_nets.entry(root).or_default().push(label.net.clone());
+    }
+    let mut shorts = root_nets
+        .into_values()
+        .filter_map(|mut nets| {
+            nets.sort();
+            nets.dedup();
+            (nets.len() > 1).then_some(nets)
+        })
+        .collect::<Vec<_>>();
+    shorts.sort();
+    shorts
+}
+
+fn validate_semantic_signature(
+    before: &SemanticSignature,
+    after_content: &str,
+    stage: &str,
+) -> anyhow::Result<()> {
+    let after = semantic_signature(after_content)?;
+    if after != *before {
+        anyhow::bail!("semantic endpoint membership or short set changed {stage}");
+    }
+    Ok(())
+}
+
+fn layout_plan_revision(
+    before: &str,
+    selected: &[LayoutItem],
+    deltas: &BTreeMap<String, (f64, f64)>,
+    operation: &serde_json::Value,
+) -> String {
+    let mut material = String::new();
+    material.push_str(&DocumentRevision::of(before).to_string());
+    material.push('\n');
+    material.push_str(&operation.to_string());
+    for item in selected {
+        material.push('\n');
+        material.push_str(&item.uuid);
+    }
+    for (uuid, (dx, dy)) in deltas {
+        material.push('\n');
+        material.push_str(uuid);
+        material.push(':');
+        material.push_str(&cse::types::fmt_f64(*dx));
+        material.push(',');
+        material.push_str(&cse::types::fmt_f64(*dy));
+    }
+    let revision = DocumentRevision::of(&material);
+    format!("arrange-schematic-selection:{revision}")
 }
 
 /// Edits translating every `(property …)` anchor inside the symbol block at
@@ -1699,6 +2603,187 @@ mod batch_place_and_connect_tests {
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["connected_count"], 3);
         assert_eq!(parsed["errors"].as_array().unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod schematic_layout_primitive_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::{ServerConfig, ToolContext};
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+                dispatcher_tools: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    fn result_text(result: &CallToolResult) -> String {
+        match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+            _ => panic!("expected text content"),
+        }
+    }
+
+    fn result_json(result: &CallToolResult) -> serde_json::Value {
+        serde_json::from_str(&result_text(result)).unwrap()
+    }
+
+    fn layout_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.kicad_sch");
+        std::fs::write(
+            &path,
+            r#"(kicad_sch
+  (version 20250610)
+  (generator "konnect-test")
+  (uuid "root")
+  (paper "A4")
+  (lib_symbols
+    (symbol "Test:PT"
+      (symbol "PT_1_1"
+        (pin passive line (at 0 0 0) (length 0) (name "~" (effects (font (size 1.27 1.27)))) (number "1" (effects (font (size 1.27 1.27)))))
+      )
+    )
+  )
+  (label "SIG" (at 250 30 0) (effects (font (size 1.27 1.27)) (justify left bottom)) (uuid "label-a"))
+  (label "SIG" (at 292 30 0) (effects (font (size 1.27 1.27)) (justify left bottom)) (uuid "label-b"))
+  (symbol
+    (lib_id "Test:PT")
+    (at 250 30 0)
+    (unit 1)
+    (property "Reference" "TP1" (at 250 28 0))
+    (property "Value" "TP" (at 250 32 0))
+    (uuid "tp1")
+  )
+  (symbol
+    (lib_id "Test:PT")
+    (at 292 30 0)
+    (unit 1)
+    (property "Reference" "TP2" (at 292 28 0))
+    (property "Value" "TP" (at 292 32 0))
+    (uuid "tp2")
+  )
+)"#,
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    #[tokio::test]
+    async fn inspect_selection_layout_reports_page_safe_region_and_out_of_bounds_items() {
+        let (_dir, path) = layout_fixture();
+        let result = handle_inspect_selection_layout(
+            &json!({
+                "schematic": path.display().to_string(),
+                "selection": { "bbox": [240, 20, 300, 40] }
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{}", result_text(&result));
+        let body = result_json(&result);
+        assert_eq!(body["page"]["page_bounds"]["max_x"], json!(297.0));
+        assert_eq!(body["selected_count"], json!(4));
+        assert_eq!(body["fully_inside_safe_region"], json!(false));
+        assert!(!body["out_of_bounds_items"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn arrange_selection_moves_connected_group_to_target_anchor() {
+        let (_dir, path) = layout_fixture();
+        let ctx = test_ctx();
+
+        let dry = handle_arrange_schematic_selection(
+            &json!({
+                "schematic": path.display().to_string(),
+                "selection": { "bbox": [240, 20, 300, 40] },
+                "operation": { "type": "move_to_anchor", "anchor": "top_left", "x": 20.0, "y": 20.0 },
+                "dry_run": true
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!dry.is_error, "{}", result_text(&dry));
+        let body = result_json(&dry);
+
+        let applied = handle_arrange_schematic_selection(
+            &json!({
+                "schematic": path.display().to_string(),
+                "selection": { "bbox": [240, 20, 300, 40] },
+                "operation": { "type": "move_to_anchor", "anchor": "top_left", "x": 20.0, "y": 20.0 },
+                "dry_run": false,
+                "plan_revision": body["plan_revision"].as_str().unwrap()
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!applied.is_error, "{}", result_text(&applied));
+
+        let inspect = handle_inspect_selection_layout(
+            &json!({
+                "schematic": path.display().to_string(),
+                "selection": { "bbox": [15, 15, 60, 35] }
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let inspected = result_json(&inspect);
+        assert_eq!(inspected["fully_inside_safe_region"], json!(true));
+        assert_eq!(
+            semantic_signature(&std::fs::read_to_string(&path).unwrap())
+                .unwrap()
+                .pin_nets
+                .values()
+                .filter(|net| net.as_deref() == Some("SIG"))
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn arrange_selection_refuses_to_move_symbols_away_from_labels() {
+        let (_dir, path) = layout_fixture();
+        let result = handle_arrange_schematic_selection(
+            &json!({
+                "schematic": path.display().to_string(),
+                "selection": { "references": ["TP1", "TP2"] },
+                "operation": { "type": "translate", "dx": -100.0, "dy": 0.0 },
+                "dry_run": true
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        assert!(result_text(&result).contains("semantic endpoint membership"));
+    }
+
+    #[test]
+    fn schematic_layout_primitive_tools_are_registered() {
+        let tools = tools();
+        assert!(tools
+            .iter()
+            .any(|tool| tool.name == "inspect_schematic_selection_layout"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool.name == "arrange_schematic_selection"));
     }
 }
 

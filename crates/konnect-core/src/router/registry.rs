@@ -32,9 +32,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "sch_wiring",
-        description: "Wires, net labels, power symbols, junctions, no-connects, pin-to-pin connections",
+        description: "Wires, net-aware net materialization, net labels, power symbols, junctions, no-connects, pin-to-pin connections",
         category: "schematic",
-        tool_count: 20,
+        tool_count: 21,
     },
     ToolsetMeta {
         name: "sch_bus",
@@ -50,9 +50,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "sch_batch",
-        description: "Bulk add, edit, delete, and move schematic elements in one call",
+        description: "Bulk add, edit, delete, move, inspect, and arrange schematic elements in one call",
         category: "schematic",
-        tool_count: 12,
+        tool_count: 14,
     },
     ToolsetMeta {
         name: "sch_export",
