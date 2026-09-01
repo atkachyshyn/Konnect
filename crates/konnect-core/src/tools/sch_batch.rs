@@ -128,8 +128,23 @@ pub fn tools() -> Vec<ToolDef> {
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
                     "uuids": {
                         "type": "array",
-                        "description": "UUIDs of items to delete",
-                        "items": { "type": "string" }
+                        "description": "UUIDs of items to delete. Each entry may be a string UUID or an object with uuid and expected_type.",
+                        "items": {
+                            "oneOf": [
+                                { "type": "string" },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "uuid": { "type": "string" },
+                                        "expected_type": {
+                                            "type": "string",
+                                            "enum": ["symbol", "local_label", "hierarchical_label", "global_label", "wire", "junction", "no_connect", "text"]
+                                        }
+                                    },
+                                    "required": ["uuid"]
+                                }
+                            ]
+                        }
                     },
                     "references": {
                         "type": "array",
@@ -678,13 +693,50 @@ async fn handle_batch_delete(
     let mut errors: Vec<String> = Vec::new();
     let mut delete_ranges: HashSet<(usize, usize)> = HashSet::new();
 
-    // Delete by UUID — walk back from uuid node to enclosing top-level block
+    // TODO(KICAD_IPC):
+    // Replace this KiCad-10 compatibility deletion path when the minimum
+    // supported KiCad release provides reliable typed DeleteItems for arbitrary
+    // schematic items/sheets.
+    //
+    // Delete by UUID — walk back from uuid node to enclosing top-level block.
+    // Typed requests are preflighted: an expected-type mismatch must fail
+    // without applying any other mutation in the same batch.
     if let Some(uuids) = args["uuids"].as_array() {
-        for uuid_val in uuids {
-            let uuid = match uuid_val.as_str() {
-                Some(u) => u,
-                None => continue,
+        let mut requests = Vec::new();
+        for (index, uuid_val) in uuids.iter().enumerate() {
+            let Some((uuid, expected_type)) = parse_uuid_delete_request(uuid_val) else {
+                errors.push(format!(
+                    "uuids[{index}] must be a string UUID or an object with uuid"
+                ));
+                continue;
             };
+            if let Some(expected_type) = expected_type {
+                let pattern = format!(r#"(uuid "{}")"#, uuid);
+                let Some(uuid_pos) = content.find(&pattern) else {
+                    errors.push(format!("UUID '{}' not found", uuid));
+                    continue;
+                };
+                let Some((block_start, block_end)) =
+                    find_enclosing_direct_child_block(&content, "kicad_sch", uuid_pos)
+                else {
+                    errors.push(format!("Cannot locate block for UUID '{}'", uuid));
+                    continue;
+                };
+                let item = &content[block_start..block_end];
+                let actual_type = schematic_item_type(item);
+                if Some(expected_type) != actual_type {
+                    return Ok(CallToolResult::error(format!(
+                        "UUID '{}' has type '{}', not expected_type '{}'; no items deleted",
+                        uuid,
+                        actual_type.unwrap_or("unknown"),
+                        expected_type
+                    )));
+                }
+            }
+            requests.push((uuid.to_string(), expected_type.map(str::to_string)));
+        }
+
+        for (uuid, _expected_type) in requests {
             let pattern = format!(r#"(uuid "{}")"#, uuid);
             match content.find(&pattern) {
                 Some(uuid_pos) => {
@@ -703,7 +755,7 @@ async fn handle_batch_delete(
                                 Some((del_start, del_end)) => {
                                     if delete_ranges.insert((del_start, del_end)) {
                                         edits.push(SexpEdit::delete(del_start, del_end));
-                                        deleted.push(uuid.to_string());
+                                        deleted.push(uuid.clone());
                                     }
                                 }
                                 None => {
@@ -763,6 +815,29 @@ fn sexp_tag(block: &str) -> &str {
         .find(|c: char| c.is_whitespace() || c == '(' || c == ')')
         .unwrap_or(after_open.len());
     &after_open[..end]
+}
+
+fn parse_uuid_delete_request(value: &serde_json::Value) -> Option<(&str, Option<&str>)> {
+    value.as_str().map(|uuid| (uuid, None)).or_else(|| {
+        let object = value.as_object()?;
+        let uuid = object.get("uuid")?.as_str()?;
+        let expected_type = object.get("expected_type").and_then(|v| v.as_str());
+        Some((uuid, expected_type))
+    })
+}
+
+fn schematic_item_type(block: &str) -> Option<&'static str> {
+    match sexp_tag(block) {
+        "symbol" => Some("symbol"),
+        "label" => Some("local_label"),
+        "hierarchical_label" => Some("hierarchical_label"),
+        "global_label" => Some("global_label"),
+        "wire" => Some("wire"),
+        "junction" => Some("junction"),
+        "no_connect" => Some("no_connect"),
+        "text" => Some("text"),
+        _ => None,
+    }
 }
 
 // Blocklist of structural forms, not an allowlist of item kinds: deleting a
@@ -2411,6 +2486,65 @@ mod batch_delete_tests {
         assert!(after.contains("(uuid \"root\")"));
         assert!(after.contains("(sheet_instances"));
         assert!(konnect_sexp::parse_sexp(&after).is_ok());
+    }
+
+    #[tokio::test]
+    async fn batch_delete_uuid_expected_type_removes_only_coincident_local_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coincident-label-delete.kicad_sch");
+        let local_uuid = "33333333-3333-3333-3333-333333333333";
+        let hier_uuid = "44444444-4444-4444-4444-444444444444";
+        std::fs::write(
+            &path,
+            format!(
+                "(kicad_sch\n  (version 20260306)\n  (generator \"eeschema\")\n  (uuid \"root\")\n  (label \"SIGNAL\" (at 10 20 0) (effects (font (size 1.27 1.27)) (justify left bottom)) (uuid \"{local_uuid}\"))\n  (hierarchical_label \"SIGNAL\" (shape bidirectional) (at 10 20 0) (effects (font (size 1.27 1.27)) (justify left)) (uuid \"{hier_uuid}\"))\n  (sheet_instances (path \"/\" (page \"1\")))\n)\n"
+            ),
+        )
+        .unwrap();
+
+        let result = handle_batch_delete(
+            &json!({
+                "schematic": path.display().to_string(),
+                "uuids": [{ "uuid": local_uuid, "expected_type": "local_label" }]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(!after.contains(local_uuid));
+        assert!(after.contains(hier_uuid));
+        assert!(after.contains("(hierarchical_label \"SIGNAL\""));
+        assert_eq!(after.matches("\"SIGNAL\"").count(), 1);
+        assert!(konnect_sexp::parse_sexp(&after).is_ok());
+    }
+
+    #[tokio::test]
+    async fn batch_delete_uuid_expected_type_mismatch_fails_without_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("typed-delete-mismatch.kicad_sch");
+        let uuid = "55555555-5555-5555-5555-555555555555";
+        let content = format!(
+            "(kicad_sch\n  (version 20260306)\n  (generator \"eeschema\")\n  (uuid \"root\")\n  (label \"SIGNAL\" (at 10 20 0) (uuid \"{uuid}\"))\n  (text \"keep\" (at 5 5 0) (uuid \"text\"))\n  (sheet_instances (path \"/\" (page \"1\")))\n)\n"
+        );
+        std::fs::write(&path, &content).unwrap();
+
+        let result = handle_batch_delete(
+            &json!({
+                "schematic": path.display().to_string(),
+                "uuids": [
+                    { "uuid": uuid, "expected_type": "hierarchical_label" },
+                    "text"
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert_eq!(content, std::fs::read_to_string(&path).unwrap());
     }
 }
 

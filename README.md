@@ -65,10 +65,11 @@ Konnect talks to KiCAD 10 through the official IPC API (protobuf over NNG) — t
 interface KiCAD is investing in — with real-time board edits that integrate with
 KiCAD's own undo/redo.
 
-**Schematic edits should not corrupt files.** Konnect edits `.kicad_sch` files
-through its own S-expression engine with atomic writes (write, fsync, rename), UUID
-preservation, and round-trip tests — no third-party schematic library with known
-gaps, no text-manipulation workarounds.
+**Schematic edits should not corrupt files.** Konnect uses native KiCAD CLI/IPC
+primitives when the supported KiCAD release exposes complete safe semantics.
+Higher-level planning and validation remain in Konnect. Operations not yet safely
+exposed by stable KiCAD 10 use a version-gated schematic compatibility backend
+with atomic writes, UUID preservation, and round-trip tests.
 
 **Context economy is a feature.** Exposing all 216 tools to an LLM costs roughly
 34K tokens of tool schemas in every request, for the whole task. Konnect's router
@@ -107,7 +108,9 @@ The full tool catalog is documented in [tool-directory.md](tool-directory.md).
 
 | Layer | Mechanism |
 |-------|-----------|
-| Schematic editing | Direct `.kicad_sch` S-expression editing with atomic writes (no KiCAD required) |
+| KICAD_ONLY | KiCAD owns complete native operations such as ERC, DRC, netlist, BOM, SVG/PDF, and fabrication exports |
+| KICAD_PLUS_CUSTOM | Konnect plans/orchestrates higher-level schematic and PCB operations while KiCAD defines or executes safe native primitives |
+| CUSTOM | Version-gated compatibility paths cover behavior not completely exposed by stable KiCAD 10, such as arbitrary schematic item mutation, typed deletion, hierarchy migration, and obstacle-aware schematic routing |
 | PCB editing | KiCAD 10 IPC API (NNG + protobuf) — real-time and undo-aware; single-footprint placement has a safe headless fallback |
 | Exports & checks | `kicad-cli` subprocess (Gerber, PDF, ERC, DRC, …) |
 | Transport | MCP JSON-RPC over stdio (default), or Streamable HTTP (`transport = "http"` / `"both"`) |
@@ -300,7 +303,7 @@ the architecture it proved, rebuilt for production:
 | Runtime | Node.js + Python + SWIG bindings | Single static binary (20–25 MB) |
 | Tool call path | TS → subprocess → Python → SWIG C++ | Direct function call |
 | PCB backend | SWIG (deprecated by KiCAD) + experimental IPC | KiCAD 10 IPC API |
-| Schematic backend | kicad-skip + custom loaders | Native S-expression engine, atomic writes |
+| Schematic backend | kicad-skip + custom loaders | Native KiCAD primitives where complete; version-gated compatibility backend otherwise |
 | Context cost | Router pattern | Load/unload toolsets + observability |
 | Skills / agents | — | 6 skills + 2 agents bundled |
 | License | MIT | AGPL-3.0 + commercial |

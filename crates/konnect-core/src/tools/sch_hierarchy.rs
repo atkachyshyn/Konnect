@@ -3,9 +3,10 @@
 //! hierarchy/page-numbering queries; import/add/edit/delete sheet pins and a
 //! read-only pin/label sync check.
 //!
-//! Every handler here is file-editing only — KiCAD's own IPC API has no
-//! schematic-editing commands upstream (`schematic_commands.proto` is empty),
-//! so there's no dual IPC/file path to maintain, unlike the PCB toolsets.
+//! Konnect uses KiCad-native CLI/IPC primitives where the supported KiCad
+//! release exposes complete safe semantics. Higher-level hierarchy planning
+//! and validation remain here, while operations not yet safely exposed by
+//! stable KiCad 10 use this schematic compatibility backend.
 
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
@@ -281,7 +282,9 @@ pub fn tools() -> Vec<ToolDef> {
                     "pin_name": { "type": "string", "description": "Current pin name to look up" },
                     "new_name": { "type": "string" },
                     "pin_type": { "type": "string", "enum": ALLOWED_PIN_TYPES },
-                    "x": { "type": "number" }, "y": { "type": "number" }
+                    "x": { "type": "number" }, "y": { "type": "number" },
+                    "face_peer_sheet": { "type": "string", "description": "Optional peer sheet name; places the pin on the border facing that sheet." },
+                    "peer_offset": { "type": "number", "description": "Offset from the chosen border's minimum coordinate. Default: preserve current orthogonal position or use the midpoint." }
                 },
                 "required": ["schematic", "sheet_name", "pin_name"]
             }),
@@ -3074,6 +3077,18 @@ async fn handle_edit_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resu
 
     let before = read_consistent(&sch_path)?;
     let mut sch = cse::Schematic::load(&sch_path)?;
+    let peer_placement = match opt_str(args, "face_peer_sheet") {
+        Some(peer_name) => match resolve_facing_sheet_pin_placement(
+            &sch,
+            &sheet_name,
+            peer_name,
+            opt_f64(args, "peer_offset"),
+        ) {
+            Ok(placement) => Some(placement),
+            Err(error) => return Ok(error),
+        },
+        None => None,
+    };
     let sheet = match sch.sheets.by_name_mut(&sheet_name) {
         Some(s) => s,
         None => {
@@ -3108,6 +3123,12 @@ async fn handle_edit_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resu
         pin.at.y = y;
         changed.push("position");
     }
+    if let Some((x, y, rotation)) = peer_placement {
+        pin.at.x = x;
+        pin.at.y = y;
+        pin.at.rotation = Some(rotation);
+        changed.push("facing_peer_position");
+    }
 
     if changed.is_empty() {
         return Ok(CallToolResult::error(
@@ -3126,6 +3147,57 @@ async fn handle_edit_sheet_pin(args: &Value, _ctx: &ToolContext) -> anyhow::Resu
         "changed_fields": changed,
         "pin": summary
     })))
+}
+
+fn resolve_facing_sheet_pin_placement(
+    sch: &cse::Schematic,
+    sheet_name: &str,
+    peer_name: &str,
+    peer_offset: Option<f64>,
+) -> Result<(f64, f64, f64), CallToolResult> {
+    // TODO(KICAD_IPC):
+    // Replace this KiCad-10 compatibility sheet-pin mutation path when the
+    // minimum supported KiCad release provides reliable hierarchical-sheet
+    // pin Create/Update/Delete and persistence across arbitrary sheets.
+    let sheet = sch
+        .sheets
+        .by_name(sheet_name)
+        .ok_or_else(|| CallToolResult::error(format!("Sheet '{}' not found", sheet_name)))?;
+    let peer = sch
+        .sheets
+        .by_name(peer_name)
+        .ok_or_else(|| CallToolResult::error(format!("Peer sheet '{}' not found", peer_name)))?;
+    let sheet_cx = sheet.at.x + sheet.width / 2.0;
+    let sheet_cy = sheet.at.y + sheet.height / 2.0;
+    let peer_cx = peer.at.x + peer.width / 2.0;
+    let peer_cy = peer.at.y + peer.height / 2.0;
+    let dx = peer_cx - sheet_cx;
+    let dy = peer_cy - sheet_cy;
+    let offset = peer_offset.unwrap_or_else(|| {
+        if dx.abs() >= dy.abs() {
+            sheet.height / 2.0
+        } else {
+            sheet.width / 2.0
+        }
+    });
+    let placement = if dx.abs() >= dy.abs() {
+        let x = if dx >= 0.0 {
+            sheet.at.x + sheet.width
+        } else {
+            sheet.at.x
+        };
+        let rotation = if dx >= 0.0 { 0.0 } else { 180.0 };
+        (x, sheet.at.y + offset.clamp(0.0, sheet.height), rotation)
+    } else {
+        let y = if dy >= 0.0 {
+            sheet.at.y + sheet.height
+        } else {
+            sheet.at.y
+        };
+        let rotation = if dy >= 0.0 { 270.0 } else { 90.0 };
+        (sheet.at.x + offset.clamp(0.0, sheet.width), y, rotation)
+    };
+    Ok(placement)
 }
 
 async fn handle_delete_sheet_pin(
@@ -4016,6 +4088,114 @@ mod tests {
         assert!(
             !result.is_error,
             "the relaxed command layer covers callers that do not pre-compare"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_sheet_pin_places_interface_on_border_facing_peer_sheet() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = test_ctx();
+        let root = blank_schematic(tmp.path(), "root.kicad_sch");
+        handle_add_hierarchical_sheet(
+            &json!({
+                "schematic": root.display().to_string(),
+                "sheet_file": "a.kicad_sch",
+                "sheet_name": "A",
+                "x": 20.0,
+                "y": 20.0,
+                "width": 30.0,
+                "height": 20.0
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        handle_add_hierarchical_sheet(
+            &json!({
+                "schematic": root.display().to_string(),
+                "sheet_file": "b.kicad_sch",
+                "sheet_name": "B",
+                "x": 80.0,
+                "y": 20.0,
+                "width": 30.0,
+                "height": 20.0
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        handle_add_sheet_pin(
+            &json!({
+                "schematic": root.display().to_string(),
+                "sheet_name": "A",
+                "pin_name": "BUS",
+                "pin_type": "bidirectional",
+                "x": 20.0,
+                "y": 25.0
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        handle_add_sheet_pin(
+            &json!({
+                "schematic": root.display().to_string(),
+                "sheet_name": "B",
+                "pin_name": "BUS",
+                "pin_type": "bidirectional",
+                "x": 110.0,
+                "y": 25.0
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let a = handle_edit_sheet_pin(
+            &json!({
+                "schematic": root.display().to_string(),
+                "sheet_name": "A",
+                "pin_name": "BUS",
+                "face_peer_sheet": "B"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!a.is_error, "{}", result_text(&a));
+        let b = handle_edit_sheet_pin(
+            &json!({
+                "schematic": root.display().to_string(),
+                "sheet_name": "B",
+                "pin_name": "BUS",
+                "face_peer_sheet": "A"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!b.is_error, "{}", result_text(&b));
+
+        let parent = cse::Schematic::load(&root).unwrap();
+        let a_pin = parent
+            .sheets
+            .by_name("A")
+            .unwrap()
+            .pin_by_name("BUS")
+            .unwrap();
+        let b_pin = parent
+            .sheets
+            .by_name("B")
+            .unwrap()
+            .pin_by_name("BUS")
+            .unwrap();
+        assert_eq!(
+            (a_pin.at.x, a_pin.at.y, a_pin.at.rotation),
+            (50.0, 30.0, Some(0.0))
+        );
+        assert_eq!(
+            (b_pin.at.x, b_pin.at.y, b_pin.at.rotation),
+            (80.0, 30.0, Some(180.0))
         );
     }
 

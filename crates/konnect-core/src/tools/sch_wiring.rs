@@ -16,7 +16,7 @@ use konnect_sexp::{
     schematic::{
         extract_symbol_instances, extract_wires, find_lib_symbol, find_t_junctions,
         format_junction, format_wire, parse_at, pin_endpoint, pin_outward_direction,
-        read_schematic, Label, LabelKind, Wire,
+        read_schematic, symbol_bounds_for_instance, Label, LabelKind, SymbolBounds, Wire,
     },
     writer::{
         apply_edits, find_balanced_block, find_block_starts, find_block_with_leading_whitespace,
@@ -26,7 +26,7 @@ use konnect_sexp::{
     DocumentRevision,
 };
 use serde_json::json;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 pub fn tools() -> Vec<ToolDef> {
     vec![
@@ -803,7 +803,7 @@ impl MaterializeNetPlan {
 
 async fn handle_materialize_schematic_net(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let schematic = get_path(args, "schematic")?;
     let net = match require_str(args, "net") {
@@ -837,6 +837,8 @@ async fn handle_materialize_schematic_net(
         &plan.final_content,
         "final transaction",
     )?;
+    validate_kicad_netlist_if_configured(ctx, &plan.schematic, &plan.before, &plan.final_content)
+        .await?;
     let labels_removed = if plan.remove_redundant_local_labels {
         plan.removable_local_labels.len()
     } else {
@@ -913,7 +915,7 @@ fn build_materialize_net_plan(
         )));
     }
 
-    let segments = materialize_segments(&endpoints, args)?;
+    let segments = materialize_segments(&tree, &wires, &labels, net, &endpoints, args)?;
     let before_snapshot =
         semantic_snapshot(&before).map_err(|error| CallToolResult::error(error.to_string()))?;
     let mut final_content = segments
@@ -1025,6 +1027,10 @@ fn requested_materialize_pin_keys(
 }
 
 fn materialize_segments(
+    tree: &konnect_sexp::SexpNode,
+    wires: &[Wire],
+    labels: &[Label],
+    net: &str,
     endpoints: &[NetEndpoint],
     args: &serde_json::Value,
 ) -> Result<Vec<Segment>, CallToolResult> {
@@ -1032,72 +1038,608 @@ fn materialize_segments(
     let orientation = strategy["preferred_orientation"]
         .as_str()
         .unwrap_or("horizontal");
-    let mut points = endpoints.iter().map(|e| (e.x, e.y)).collect::<Vec<_>>();
+    if !matches!(orientation, "horizontal" | "vertical") {
+        return Err(CallToolResult::error(format!(
+            "strategy.preferred_orientation '{orientation}' is invalid; expected horizontal or vertical"
+        )));
+    }
+
+    // TODO(KICAD_IPC):
+    // Replace this KiCad 10 compatibility router when native schematic APIs can
+    // reliably create validated arbitrary-sheet wires by typed item IDs.
+    let obstacles = MaterializeObstacles::build(tree, wires, labels, net, endpoints);
+    let escape = args["escape_length"]
+        .as_f64()
+        .unwrap_or_else(|| endpoints.first().map(|e| e.grid).unwrap_or(1.27).max(1.27));
+    let escaped_points = endpoints
+        .iter()
+        .map(|endpoint| escaped_endpoint(endpoint, escape, &obstacles))
+        .collect::<Vec<_>>();
+    let mut points = escaped_points.clone();
     points.sort_by(|a, b| a.partial_cmp(b).expect("finite endpoint coordinates"));
     points.dedup_by(|a, b| points_coincident(a.0, a.1, b.0, b.1, 0.01));
 
+    let mut candidates = Vec::new();
+    if points.len() == 2 {
+        candidates.extend(two_point_candidates(points[0], points[1], &obstacles));
+    }
+    candidates.extend(trunk_candidates(&points, orientation, strategy, &obstacles));
+    if orientation == "horizontal" {
+        candidates.extend(trunk_candidates(&points, "vertical", strategy, &obstacles));
+    } else {
+        candidates.extend(trunk_candidates(
+            &points,
+            "horizontal",
+            strategy,
+            &obstacles,
+        ));
+    }
+
+    for mut candidate in candidates {
+        candidate.extend(pin_escape_segments(endpoints, &escaped_points));
+        let out = normalize_segments(candidate);
+        if !out.is_empty() && out.iter().all(|segment| obstacles.allows(*segment)) {
+            return Ok(out);
+        }
+    }
+
+    Err(CallToolResult::error(format!(
+        "no obstacle-safe Manhattan materialization route found for net '{net}'"
+    )))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RectObstacle {
+    min_x: f64,
+    min_y: f64,
+    max_x: f64,
+    max_y: f64,
+}
+
+impl RectObstacle {
+    fn from_bounds(bounds: SymbolBounds) -> Self {
+        Self {
+            min_x: bounds.min_x,
+            min_y: bounds.min_y,
+            max_x: bounds.max_x,
+            max_y: bounds.max_y,
+        }
+    }
+
+    fn padded(self, amount: f64) -> Self {
+        Self {
+            min_x: self.min_x - amount,
+            min_y: self.min_y - amount,
+            max_x: self.max_x + amount,
+            max_y: self.max_y + amount,
+        }
+    }
+}
+
+struct MaterializeObstacles {
+    bodies: Vec<RectObstacle>,
+    foreign_pins: Vec<(f64, f64)>,
+    foreign_wires: Vec<Segment>,
+}
+
+impl MaterializeObstacles {
+    fn build(
+        tree: &konnect_sexp::SexpNode,
+        wires: &[Wire],
+        labels: &[Label],
+        net: &str,
+        endpoints: &[NetEndpoint],
+    ) -> Self {
+        let endpoint_refs = endpoints
+            .iter()
+            .map(|endpoint| endpoint.reference.as_str())
+            .collect::<HashSet<_>>();
+        let endpoint_points = endpoints
+            .iter()
+            .map(|endpoint| (endpoint.x, endpoint.y))
+            .collect::<Vec<_>>();
+        let mut graph = crate::tools::sch_connectivity::net_graph_for(tree, wires, labels);
+        let index = crate::tools::sch_connectivity::ConnectivityIndex::build(
+            tree,
+            wires,
+            labels,
+            crate::tools::sch_connectivity::COINCIDENT_TOLERANCE,
+        );
+        let instances = extract_symbol_instances(tree);
+        let lib_syms = tree
+            .find("lib_symbols")
+            .map(|n| n.find_all("symbol"))
+            .unwrap_or_default();
+
+        let mut bodies = Vec::new();
+        for instance in &instances {
+            if endpoint_refs.contains(instance.reference.as_str()) {
+                continue;
+            }
+            if let Some(lib_sym) = find_lib_symbol(&lib_syms, instance) {
+                if let Some(bounds) = symbol_bounds_for_instance(lib_sym, instance) {
+                    bodies.push(RectObstacle::from_bounds(bounds).padded(0.01));
+                }
+            }
+        }
+        bodies.extend(
+            sheet_body_obstacles(tree)
+                .into_iter()
+                .map(|r| r.padded(0.01)),
+        );
+
+        let foreign_pins = index
+            .placed_pins()
+            .iter()
+            .map(|pin| pin.at)
+            .filter(|&(x, y)| {
+                !endpoint_points
+                    .iter()
+                    .any(|&(ex, ey)| points_coincident(x, y, ex, ey, 0.01))
+            })
+            .filter(|&(x, y)| graph.net_at(x, y).as_deref() != Some(net))
+            .collect();
+
+        let foreign_wires = wires
+            .iter()
+            .filter(|wire| {
+                graph.net_at(wire.x1, wire.y1).as_deref() != Some(net)
+                    && graph.net_at(wire.x2, wire.y2).as_deref() != Some(net)
+            })
+            .map(|wire| Segment {
+                x1: wire.x1,
+                y1: wire.y1,
+                x2: wire.x2,
+                y2: wire.y2,
+            })
+            .collect();
+
+        Self {
+            bodies,
+            foreign_pins,
+            foreign_wires,
+        }
+    }
+
+    fn allows(&self, segment: Segment) -> bool {
+        if segment.is_zero() {
+            return true;
+        }
+        !self
+            .bodies
+            .iter()
+            .any(|body| segment_crosses_rect_interior(segment, *body))
+            && !self
+                .foreign_pins
+                .iter()
+                .any(|&(x, y)| point_strictly_on_segment(x, y, segment))
+            && !self
+                .foreign_wires
+                .iter()
+                .any(|wire| segments_intersect(segment, *wire))
+    }
+}
+
+fn sheet_body_obstacles(tree: &konnect_sexp::SexpNode) -> Vec<RectObstacle> {
+    tree.find_all("sheet")
+        .into_iter()
+        .filter_map(|sheet| {
+            let (x, y, _) = parse_at(sheet)?;
+            let size = sheet.find("size")?;
+            let (Some(width), Some(height)) = (size.get_f64(1), size.get_f64(2)) else {
+                return None;
+            };
+            Some(RectObstacle {
+                min_x: x,
+                min_y: y,
+                max_x: x + width,
+                max_y: y + height,
+            })
+        })
+        .collect()
+}
+
+fn escaped_endpoint(
+    endpoint: &NetEndpoint,
+    escape: f64,
+    obstacles: &MaterializeObstacles,
+) -> (f64, f64) {
+    let dir = crate::tools::stub_direction("auto", Some(endpoint.orientation_degrees));
+    for multiple in [1.0, 2.0, 3.0] {
+        let candidate = (
+            round6(endpoint.x + dir.dx * escape * multiple),
+            round6(endpoint.y + dir.dy * escape * multiple),
+        );
+        let segment = Segment {
+            x1: endpoint.x,
+            y1: endpoint.y,
+            x2: candidate.0,
+            y2: candidate.1,
+        };
+        if obstacles.allows(segment) {
+            return candidate;
+        }
+    }
+    (
+        round6(endpoint.x + dir.dx * escape),
+        round6(endpoint.y + dir.dy * escape),
+    )
+}
+
+fn pin_escape_segments(endpoints: &[NetEndpoint], escaped_points: &[(f64, f64)]) -> Vec<Segment> {
+    endpoints
+        .iter()
+        .zip(escaped_points.iter())
+        .map(|(endpoint, &(x, y))| Segment {
+            x1: endpoint.x,
+            y1: endpoint.y,
+            x2: x,
+            y2: y,
+        })
+        .collect()
+}
+
+fn two_point_candidates(
+    a: (f64, f64),
+    b: (f64, f64),
+    obstacles: &MaterializeObstacles,
+) -> Vec<Vec<Segment>> {
     let mut out = Vec::new();
-    match orientation {
-        "horizontal" => {
-            let trunk_y = strategy["trunk_y"].as_f64().unwrap_or(points[0].1);
+    if points_coincident(a.0, a.1, b.0, b.1, 0.01) {
+        return out;
+    }
+    if (a.0 - b.0).abs() < 0.01 || (a.1 - b.1).abs() < 0.01 {
+        out.push(vec![Segment {
+            x1: a.0,
+            y1: a.1,
+            x2: b.0,
+            y2: b.1,
+        }]);
+    }
+    out.push(vec![
+        Segment {
+            x1: a.0,
+            y1: a.1,
+            x2: b.0,
+            y2: a.1,
+        },
+        Segment {
+            x1: b.0,
+            y1: a.1,
+            x2: b.0,
+            y2: b.1,
+        },
+    ]);
+    out.push(vec![
+        Segment {
+            x1: a.0,
+            y1: a.1,
+            x2: a.0,
+            y2: b.1,
+        },
+        Segment {
+            x1: a.0,
+            y1: b.1,
+            x2: b.0,
+            y2: b.1,
+        },
+    ]);
+    for y in detour_rows_between(a, b, obstacles) {
+        out.push(vec![
+            Segment {
+                x1: a.0,
+                y1: a.1,
+                x2: a.0,
+                y2: y,
+            },
+            Segment {
+                x1: a.0,
+                y1: y,
+                x2: b.0,
+                y2: y,
+            },
+            Segment {
+                x1: b.0,
+                y1: y,
+                x2: b.0,
+                y2: b.1,
+            },
+        ]);
+    }
+    for x in detour_columns_between(a, b, obstacles) {
+        out.push(vec![
+            Segment {
+                x1: a.0,
+                y1: a.1,
+                x2: x,
+                y2: a.1,
+            },
+            Segment {
+                x1: x,
+                y1: a.1,
+                x2: x,
+                y2: b.1,
+            },
+            Segment {
+                x1: x,
+                y1: b.1,
+                x2: b.0,
+                y2: b.1,
+            },
+        ]);
+    }
+    out
+}
+
+fn trunk_candidates(
+    points: &[(f64, f64)],
+    orientation: &str,
+    strategy: &serde_json::Value,
+    obstacles: &MaterializeObstacles,
+) -> Vec<Vec<Segment>> {
+    let mut out = Vec::new();
+    let coords = if orientation == "horizontal" {
+        let mut rows = strategy["trunk_y"]
+            .as_f64()
+            .into_iter()
+            .chain(points.first().map(|p| p.1))
+            .chain(points.iter().map(|p| p.1))
+            .chain(
+                obstacles
+                    .bodies
+                    .iter()
+                    .flat_map(|r| [round6(r.min_y - 1.27), round6(r.max_y + 1.27)]),
+            )
+            .chain(
+                obstacles
+                    .foreign_pins
+                    .iter()
+                    .flat_map(|(_, y)| [round6(*y - 1.27), round6(*y + 1.27)]),
+            )
+            .chain(obstacles.foreign_wires.iter().flat_map(|wire| {
+                [
+                    round6(wire.y1.min(wire.y2) - 1.27),
+                    round6(wire.y1.max(wire.y2) + 1.27),
+                ]
+            }))
+            .collect::<Vec<_>>();
+        rows.sort_by(|a, b| a.partial_cmp(b).expect("finite row"));
+        rows.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+        rows
+    } else {
+        let mut cols = strategy["trunk_x"]
+            .as_f64()
+            .into_iter()
+            .chain(points.first().map(|p| p.0))
+            .chain(points.iter().map(|p| p.0))
+            .chain(
+                obstacles
+                    .bodies
+                    .iter()
+                    .flat_map(|r| [round6(r.min_x - 1.27), round6(r.max_x + 1.27)]),
+            )
+            .chain(
+                obstacles
+                    .foreign_pins
+                    .iter()
+                    .flat_map(|(x, _)| [round6(*x - 1.27), round6(*x + 1.27)]),
+            )
+            .chain(obstacles.foreign_wires.iter().flat_map(|wire| {
+                [
+                    round6(wire.x1.min(wire.x2) - 1.27),
+                    round6(wire.x1.max(wire.x2) + 1.27),
+                ]
+            }))
+            .collect::<Vec<_>>();
+        cols.sort_by(|a, b| a.partial_cmp(b).expect("finite column"));
+        cols.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+        cols
+    };
+
+    for trunk in coords {
+        let mut candidate = Vec::new();
+        if orientation == "horizontal" {
             let min_x = points.iter().map(|(x, _)| *x).fold(f64::INFINITY, f64::min);
             let max_x = points
                 .iter()
                 .map(|(x, _)| *x)
                 .fold(f64::NEG_INFINITY, f64::max);
-            out.push(Segment {
+            candidate.push(Segment {
                 x1: min_x,
-                y1: trunk_y,
+                y1: trunk,
                 x2: max_x,
-                y2: trunk_y,
+                y2: trunk,
             });
-            for (x, y) in points {
-                out.push(Segment {
+            for &(x, y) in points {
+                candidate.push(Segment {
                     x1: x,
                     y1: y,
                     x2: x,
-                    y2: trunk_y,
+                    y2: trunk,
                 });
             }
-        }
-        "vertical" => {
-            let trunk_x = strategy["trunk_x"].as_f64().unwrap_or(points[0].0);
+        } else {
             let min_y = points.iter().map(|(_, y)| *y).fold(f64::INFINITY, f64::min);
             let max_y = points
                 .iter()
                 .map(|(_, y)| *y)
                 .fold(f64::NEG_INFINITY, f64::max);
-            out.push(Segment {
-                x1: trunk_x,
+            candidate.push(Segment {
+                x1: trunk,
                 y1: min_y,
-                x2: trunk_x,
+                x2: trunk,
                 y2: max_y,
             });
-            for (x, y) in points {
-                out.push(Segment {
+            for &(x, y) in points {
+                candidate.push(Segment {
                     x1: x,
                     y1: y,
-                    x2: trunk_x,
+                    x2: trunk,
                     y2: y,
                 });
             }
         }
-        other => {
-            return Err(CallToolResult::error(format!(
-            "strategy.preferred_orientation '{other}' is invalid; expected horizontal or vertical"
-        )))
-        }
+        out.push(candidate);
     }
+    out
+}
 
-    out.retain(|segment| !segment.is_zero());
-    out.sort_by(|a, b| {
+fn normalize_segments(mut segments: Vec<Segment>) -> Vec<Segment> {
+    segments.retain(|segment| !segment.is_zero());
+    segments.sort_by(|a, b| {
         a.normalized()
             .json()
             .to_string()
             .cmp(&b.normalized().json().to_string())
     });
-    out.dedup_by(|a, b| a.normalized() == b.normalized());
-    Ok(out)
+    segments.dedup_by(|a, b| a.normalized() == b.normalized());
+    segments
+}
+
+fn detour_rows_between(a: (f64, f64), b: (f64, f64), obstacles: &MaterializeObstacles) -> Vec<f64> {
+    let direct = Segment {
+        x1: a.0,
+        y1: a.1,
+        x2: b.0,
+        y2: a.1,
+    };
+    let mut rows = obstacles
+        .bodies
+        .iter()
+        .filter(|rect| segment_crosses_rect_interior(direct, **rect))
+        .flat_map(|rect| [round6(rect.min_y - 1.27), round6(rect.max_y + 1.27)])
+        .collect::<Vec<_>>();
+    rows.sort_by(|x, y| {
+        (x - a.1)
+            .abs()
+            .partial_cmp(&(y - a.1).abs())
+            .expect("finite detour rows")
+    });
+    for &(x, y) in &obstacles.foreign_pins {
+        if point_strictly_on_segment(x, y, direct) {
+            rows.push(round6(y - 1.27));
+            rows.push(round6(y + 1.27));
+        }
+    }
+    for wire in &obstacles.foreign_wires {
+        if segments_intersect(direct, *wire) {
+            rows.push(round6(wire.y1.min(wire.y2) - 1.27));
+            rows.push(round6(wire.y1.max(wire.y2) + 1.27));
+        }
+    }
+    rows.sort_by(|x, y| {
+        (x - a.1)
+            .abs()
+            .partial_cmp(&(y - a.1).abs())
+            .expect("finite detour rows")
+    });
+    rows.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+    rows
+}
+
+fn detour_columns_between(
+    a: (f64, f64),
+    b: (f64, f64),
+    obstacles: &MaterializeObstacles,
+) -> Vec<f64> {
+    let direct = Segment {
+        x1: a.0,
+        y1: a.1,
+        x2: a.0,
+        y2: b.1,
+    };
+    let mut cols = obstacles
+        .bodies
+        .iter()
+        .filter(|rect| segment_crosses_rect_interior(direct, **rect))
+        .flat_map(|rect| [round6(rect.min_x - 1.27), round6(rect.max_x + 1.27)])
+        .collect::<Vec<_>>();
+    cols.sort_by(|x, y| {
+        (x - a.0)
+            .abs()
+            .partial_cmp(&(y - a.0).abs())
+            .expect("finite detour columns")
+    });
+    for &(x, y) in &obstacles.foreign_pins {
+        if point_strictly_on_segment(x, y, direct) {
+            cols.push(round6(x - 1.27));
+            cols.push(round6(x + 1.27));
+        }
+    }
+    for wire in &obstacles.foreign_wires {
+        if segments_intersect(direct, *wire) {
+            cols.push(round6(wire.x1.min(wire.x2) - 1.27));
+            cols.push(round6(wire.x1.max(wire.x2) + 1.27));
+        }
+    }
+    cols.sort_by(|x, y| {
+        (x - a.0)
+            .abs()
+            .partial_cmp(&(y - a.0).abs())
+            .expect("finite detour columns")
+    });
+    cols.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+    cols
+}
+
+fn segment_crosses_rect_interior(segment: Segment, rect: RectObstacle) -> bool {
+    let min_x = segment.x1.min(segment.x2);
+    let max_x = segment.x1.max(segment.x2);
+    let min_y = segment.y1.min(segment.y2);
+    let max_y = segment.y1.max(segment.y2);
+    if (segment.y1 - segment.y2).abs() < 0.01 {
+        segment.y1 > rect.min_y
+            && segment.y1 < rect.max_y
+            && max_x > rect.min_x
+            && min_x < rect.max_x
+    } else if (segment.x1 - segment.x2).abs() < 0.01 {
+        segment.x1 > rect.min_x
+            && segment.x1 < rect.max_x
+            && max_y > rect.min_y
+            && min_y < rect.max_y
+    } else {
+        false
+    }
+}
+
+fn point_strictly_on_segment(x: f64, y: f64, segment: Segment) -> bool {
+    if points_coincident(x, y, segment.x1, segment.y1, 0.01)
+        || points_coincident(x, y, segment.x2, segment.y2, 0.01)
+    {
+        return false;
+    }
+    konnect_sexp::geometry::point_on_segment(
+        x, y, segment.x1, segment.y1, segment.x2, segment.y2, 0.01,
+    )
+}
+
+fn segments_intersect(a: Segment, b: Segment) -> bool {
+    for (x, y) in [(a.x1, a.y1), (a.x2, a.y2), (b.x1, b.y1), (b.x2, b.y2)] {
+        if point_strictly_on_segment(x, y, a) && point_strictly_on_segment(x, y, b) {
+            return true;
+        }
+    }
+    let a_h = (a.y1 - a.y2).abs() < 0.01;
+    let b_h = (b.y1 - b.y2).abs() < 0.01;
+    if a_h == b_h {
+        if a_h && (a.y1 - b.y1).abs() < 0.01 {
+            return ranges_overlap_strict(a.x1, a.x2, b.x1, b.x2);
+        }
+        if !a_h && (a.x1 - b.x1).abs() < 0.01 {
+            return ranges_overlap_strict(a.y1, a.y2, b.y1, b.y2);
+        }
+        return false;
+    }
+    let (h, v) = if a_h { (a, b) } else { (b, a) };
+    point_strictly_on_segment(v.x1, h.y1, h) && point_strictly_on_segment(v.x1, h.y1, v)
+}
+
+fn ranges_overlap_strict(a1: f64, a2: f64, b1: f64, b2: f64) -> bool {
+    let a_min = a1.min(a2);
+    let a_max = a1.max(a2);
+    let b_min = b1.min(b2);
+    let b_max = b1.max(b2);
+    a_max > b_min + 0.01 && b_max > a_min + 0.01
 }
 
 fn semantic_snapshot(content: &str) -> anyhow::Result<SemanticSnapshot> {
@@ -1347,6 +1889,87 @@ fn semantic_comparison(
     }))
 }
 
+async fn validate_kicad_netlist_if_configured(
+    ctx: &ToolContext,
+    schematic: &std::path::Path,
+    before: &str,
+    after: &str,
+) -> anyhow::Result<()> {
+    if ctx.config.kicad_cli.trim().is_empty() {
+        return Ok(());
+    }
+    let before_snapshot = kicad_netlist_component_groups(&ctx.config.kicad_cli, schematic, before)
+        .await
+        .map_err(|error| anyhow::anyhow!("KiCad netlist BEFORE export failed: {error}"))?;
+    let after_snapshot = kicad_netlist_component_groups(&ctx.config.kicad_cli, schematic, after)
+        .await
+        .map_err(|error| anyhow::anyhow!("KiCad netlist AFTER export failed: {error}"))?;
+    if before_snapshot != after_snapshot {
+        anyhow::bail!("KiCad netlist component-pin membership changed final transaction");
+    }
+    Ok(())
+}
+
+async fn kicad_netlist_component_groups(
+    kicad_cli: &str,
+    schematic: &std::path::Path,
+    content: &str,
+) -> anyhow::Result<BTreeSet<Vec<String>>> {
+    let temp = tempfile::tempdir()?;
+    let source_dir = schematic
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    for entry in std::fs::read_dir(source_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name() else {
+            continue;
+        };
+        if matches!(
+            path.extension().and_then(|ext| ext.to_str()),
+            Some("kicad_sch" | "kicad_pro")
+        ) {
+            std::fs::copy(&path, temp.path().join(name))?;
+        }
+    }
+    let temp_schematic = temp.path().join(
+        schematic
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("schematic has no file name"))?,
+    );
+    std::fs::write(&temp_schematic, content)?;
+    let netlist_path = temp.path().join("snapshot.net");
+    crate::tools::cli::export_netlist(kicad_cli, &temp_schematic, &netlist_path, "kicadsexpr")
+        .await?;
+    let netlist = std::fs::read_to_string(&netlist_path)?;
+    normalized_kicad_netlist_groups(&netlist)
+}
+
+fn normalized_kicad_netlist_groups(netlist: &str) -> anyhow::Result<BTreeSet<Vec<String>>> {
+    let tree = parse_sexp(netlist)?;
+    let mut groups = BTreeSet::new();
+    let Some(nets) = tree.find("nets") else {
+        return Ok(groups);
+    };
+    for net in nets.find_all("net") {
+        let mut pins = net
+            .find_all("node")
+            .into_iter()
+            .filter_map(|node| {
+                let reference = node.find_str("ref")?;
+                let pin = node.find_str("pin")?;
+                Some(format!("{reference}.{pin}"))
+            })
+            .collect::<Vec<_>>();
+        pins.sort();
+        pins.dedup();
+        if pins.len() > 1 {
+            groups.insert(pins);
+        }
+    }
+    Ok(groups)
+}
+
 #[derive(Debug, Clone)]
 struct RefactorNetPlan {
     schematic: std::path::PathBuf,
@@ -1390,7 +2013,7 @@ impl RefactorNetPlan {
 
 async fn handle_refactor_schematic_net_representation(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let schematic = get_path(args, "schematic")?;
     let net = match require_str(args, "net") {
@@ -1421,6 +2044,8 @@ async fn handle_refactor_schematic_net_representation(
         &plan.final_content,
         "final transaction",
     )?;
+    validate_kicad_netlist_if_configured(ctx, &plan.schematic, &plan.before, &plan.final_content)
+        .await?;
     write_atomic_if_unchanged(&plan.schematic, &plan.before, &plan.final_content)?;
     Ok(CallToolResult::json(&plan.response(false, true)))
 }
@@ -1594,9 +2219,14 @@ fn build_power_symbol_refactor_plan(
     let before_snapshot =
         semantic_snapshot(&before).map_err(|error| CallToolResult::error(error.to_string()))?;
     let diagnostic = net_scope_diagnostic(&tree, schematic, net);
+    let allow_global_scope_change = args["allow_global_scope_change"].as_bool().unwrap_or(false);
     let scope_policy = args["scope_policy"]
         .as_str()
-        .unwrap_or("preserve_existing_scope");
+        .unwrap_or(if allow_global_scope_change {
+            "allow_global_power_scope"
+        } else {
+            "preserve_existing_scope"
+        });
     if scope_policy != "allow_global_power_scope" {
         return Err(CallToolResult::error(format!(
             "converting net '{net}' to power symbols changes to KiCad global power-symbol scope; rerun with scope_policy='allow_global_power_scope'. Diagnostic: {diagnostic}"
@@ -1611,23 +2241,38 @@ fn build_power_symbol_refactor_plan(
             "net '{net}' has no ordinary labels to convert"
         )));
     }
-    let mut staged = if embedded_power_symbol_available(&tree, net) {
+    let template_lib_id = power_symbol_template_lib_id(net);
+    let mut staged = if embedded_power_symbol_available(&tree, &template_lib_id) {
         before.clone()
     } else {
-        ensure_staged_power_symbol_definition(before.clone(), net)
+        ensure_staged_power_symbol_definition(before.clone(), &template_lib_id)
             .map_err(|error| CallToolResult::error(error.to_string()))?
     };
+    let grid = args["grid"].as_f64().unwrap_or(1.27);
+    let wires = extract_wires(&tree);
+    let all_labels = konnect_sexp::schematic::extract_all_net_labels(&tree);
+    let mut graph = crate::tools::sch_connectivity::net_graph_for(&tree, &wires, &all_labels);
     let mut inserted = Vec::new();
     for (index, label) in labels.iter().enumerate() {
         let reference = next_power_reference_for_content(&staged, index + 1);
-        let block = staged_power_symbol_block(net, &reference, label.x, label.y, label.rotation);
+        let (x, y, normalized) = power_symbol_anchor_for_label(label, net, grid, &mut graph)
+            .map_err(|error| {
+                CallToolResult::error(format!(
+                    "cannot convert '{}' label to power symbol: {error}",
+                    net
+                ))
+            })?;
+        let block =
+            staged_power_symbol_block(&template_lib_id, net, &reference, x, y, label.rotation);
         staged = insert_direct_child_before_sheet_instances(staged, &block);
         inserted.push(json!({
             "reference": reference,
-            "lib_id": format!("power:{net}"),
-            "x": label.x,
-            "y": label.y,
+            "template_lib_id": template_lib_id,
+            "net": net,
+            "x": x,
+            "y": y,
             "rotation": label.rotation
+            ,"normalized_from": normalized.map(|(old_x, old_y)| json!({"x": old_x, "y": old_y}))
         }));
     }
     let removable_local_labels = labels
@@ -1871,36 +2516,79 @@ fn coordinate_clause_replacements(
     Ok(replacements)
 }
 
-fn embedded_power_symbol_available(tree: &konnect_sexp::SexpNode, net: &str) -> bool {
-    let want = format!("power:{net}");
+fn power_symbol_template_lib_id(net: &str) -> String {
+    match net {
+        "GND" => "power:GND".to_string(),
+        "+5V" => "power:+5V".to_string(),
+        "+3V3" => "power:+3V3".to_string(),
+        _ if net.starts_with("+5V") || net.starts_with("+5") => "power:+5V".to_string(),
+        _ if net.starts_with("+3V3") || net.starts_with("+3.3V") => "power:+3V3".to_string(),
+        _ => "power:VCC".to_string(),
+    }
+}
+
+fn power_symbol_template_name(template_lib_id: &str) -> &str {
+    template_lib_id
+        .split_once(':')
+        .map(|(_, symbol)| symbol)
+        .unwrap_or(template_lib_id)
+}
+
+fn power_symbol_anchor_for_label(
+    label: &Label,
+    net: &str,
+    grid: f64,
+    graph: &mut crate::tools::sch_connectivity::NetGraph,
+) -> anyhow::Result<(f64, f64, Option<(f64, f64)>)> {
+    if net != "GND" || point_on_grid(label.x, label.y, grid) {
+        return Ok((label.x, label.y, None));
+    }
+    let (x, y) = snap_point(label.x, label.y, grid);
+    if graph.net_at(x, y).as_deref() == Some(net) {
+        return Ok((x, y, Some((label.x, label.y))));
+    }
+    anyhow::bail!(
+        "off-grid GND label at ({}, {}) cannot be moved to ({}, {}) without changing connectivity",
+        label.x,
+        label.y,
+        x,
+        y
+    )
+}
+
+fn embedded_power_symbol_available(tree: &konnect_sexp::SexpNode, template_lib_id: &str) -> bool {
     tree.find("lib_symbols")
         .map(|lib_symbols| {
             lib_symbols.find_all("symbol").into_iter().any(|symbol| {
-                symbol.get(1).and_then(|value| value.as_str()) == Some(want.as_str())
+                symbol.get(1).and_then(|value| value.as_str()) == Some(template_lib_id)
                     && symbol.find("power").is_some()
             })
         })
         .unwrap_or(false)
 }
 
-fn ensure_staged_power_symbol_definition(mut content: String, net: &str) -> anyhow::Result<String> {
+fn ensure_staged_power_symbol_definition(
+    mut content: String,
+    template_lib_id: &str,
+) -> anyhow::Result<String> {
     let Some(start) = find_block_starts(&content, "lib_symbols")
         .into_iter()
         .next()
     else {
-        anyhow::bail!("schematic has no lib_symbols block for staging power:{net}");
+        anyhow::bail!("schematic has no lib_symbols block for staging {template_lib_id}");
     };
     let Some((_, end)) = find_balanced_block(&content, start) else {
         anyhow::bail!("lib_symbols block is malformed");
     };
-    let definition = staged_power_lib_symbol_definition(net);
+    let definition = staged_power_lib_symbol_definition(template_lib_id);
     content.insert_str(end - 1, &definition);
     Ok(content)
 }
 
-fn staged_power_lib_symbol_definition(net: &str) -> String {
+fn staged_power_lib_symbol_definition(template_lib_id: &str) -> String {
+    let symbol_name = power_symbol_template_name(template_lib_id);
     format!(
-        "\n    (symbol \"power:{net}\"\n      (power)\n      (symbol \"{net}_0_1\"\n        (pin power_in line (at 0 0 270) (length 0)\n          (name \"~\" (effects (font (size 1.27 1.27))))\n          (number \"1\" (effects (font (size 1.27 1.27))))\n        )\n      )\n    )"
+        "\n    (symbol \"{template_lib_id}\"\n      (power)\n      (property \"Reference\" \"#PWR\" (at 0 0 0) (effects (font (size 1.27 1.27))) (hide yes))\n      (property \"Value\" \"{symbol_name}\" (at 0 -3.81 0) (effects (font (size 1.27 1.27))))\n      (symbol \"{symbol_name}_0_1\"\n        (pin power_in line (at 0 0 270) (length 0)\n          (name \"~\" (effects (font (size 1.27 1.27))))\n          (number \"1\" (effects (font (size 1.27 1.27))))\n        )\n      )\n    )"
     )
 }
 
@@ -1920,12 +2608,19 @@ fn next_power_reference_for_content(content: &str, offset: usize) -> String {
     format!("#PWR{:03}", highest + offset as u32)
 }
 
-fn staged_power_symbol_block(net: &str, reference: &str, x: f64, y: f64, rotation: f64) -> String {
+fn staged_power_symbol_block(
+    template_lib_id: &str,
+    net: &str,
+    reference: &str,
+    x: f64,
+    y: f64,
+    rotation: f64,
+) -> String {
     let x = cse::types::fmt_f64(x);
     let y = cse::types::fmt_f64(y);
     let rotation = cse::types::fmt_f64(rotation);
     format!(
-        "\n  (symbol\n    (lib_id \"power:{net}\")\n    (at {x} {y} {rotation})\n    (unit 1)\n    (exclude_from_sim no)\n    (in_bom yes)\n    (on_board yes)\n    (dnp no)\n    (uuid \"{}\")\n    (property \"Reference\" \"{reference}\" (at {x} {y} 0) (hide yes))\n    (property \"Value\" \"{net}\" (at {x} {y} 0))\n  )",
+        "\n  (symbol\n    (lib_id \"{template_lib_id}\")\n    (at {x} {y} {rotation})\n    (unit 1)\n    (exclude_from_sim no)\n    (in_bom yes)\n    (on_board yes)\n    (dnp no)\n    (uuid \"{}\")\n    (property \"Reference\" \"{reference}\" (at {x} {y} 0) (hide yes))\n    (property \"Value\" \"{net}\" (at {x} {y} 0))\n  )",
         uuid::Uuid::new_v4()
     )
 }
@@ -2975,15 +3670,17 @@ async fn handle_add_power_symbol(
 
     let pwr_ref = format!("#PWR{:03}", next_pwr_number(&sch));
 
-    // Embed the power symbol definition in lib_symbols
-    let lib_id = format!("power:{}", power_net);
+    // KiCad resolves the symbol body from lib_id, but the global rail name
+    // comes from the placed instance's Value field. Custom rails therefore use
+    // a stock power-symbol template and keep the requested rail in Value.
+    let lib_id = power_symbol_template_lib_id(&power_net);
     let src = crate::tools::library::KiCadSymbolSource::for_file(&sch_path);
     if !cse::library::ensure_lib_symbol(&mut sch, &lib_id, &src) {
         return Ok(crate::tools::lib_symbol_not_found_error(&lib_id, &src));
     }
 
     // Build the Symbol struct
-    let mut sym = cse::Symbol::new(format!("power:{}", power_net), x, y);
+    let mut sym = cse::Symbol::new(lib_id.clone(), x, y);
     sym.at.rotation = Some(rotation);
     sym.unit = 1;
     sym.in_bom = true;
@@ -3055,6 +3752,7 @@ async fn handle_add_power_symbol(
 
     Ok(CallToolResult::json(&json!({
         "added_power": power_net,
+        "template_lib_id": lib_id,
         "reference": pwr_ref,
         "x": x, "y": y,
         "junctions_added": junctions_added.iter().map(|(x, y)| json!({"x": x, "y": y})).collect::<Vec<_>>()
@@ -5200,6 +5898,74 @@ mod materialize_net_tests {
         )
     }
 
+    fn materialize_obstacle_fixture(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("obstacles.kicad_sch");
+        std::fs::write(
+            &path,
+            format!(
+                r#"(kicad_sch
+  (version 20250610)
+  (generator "konnect-test")
+  (uuid "root")
+  (paper "A4")
+  (lib_symbols
+    (symbol "Test:P"
+      (symbol "P_1_1"
+        (pin passive line (at 0 0 180) (length 0) (name "~" (effects (font (size 1.27 1.27)))) (number "1" (effects (font (size 1.27 1.27)))))
+      )
+    )
+    (symbol "Test:Block"
+      (symbol "Block_0_1"
+        (rectangle (start -10 -5) (end 10 5) (stroke (width 0.1524) (type solid)) (fill (type none)))
+      )
+    )
+  )
+  (label "NODE" (at 50 50 0) (effects (font (size 1.27 1.27)) (justify left bottom)) (uuid "label-a"))
+  (label "NODE" (at 100 50 0) (effects (font (size 1.27 1.27)) (justify left bottom)) (uuid "label-b"))
+  (symbol (lib_id "Test:P") (at 50 50 0) (unit 1) (property "Reference" "J1" (at 50 48 0)) (property "Value" "P" (at 50 52 0)) (uuid "j1"))
+  (symbol (lib_id "Test:P") (at 100 50 0) (unit 1) (property "Reference" "U1" (at 100 48 0)) (property "Value" "P" (at 100 52 0)) (uuid "u1"))
+{body}
+)"#
+            ),
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    fn materialize_and_preview(path: &std::path::Path) -> serde_json::Value {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let dry = handle_refactor_schematic_net_representation(
+                &json!({
+                    "schematic": path.display().to_string(),
+                    "net": "NODE",
+                    "representation": "wired_local",
+                    "remove_redundant_local_labels": true
+                }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+            assert!(!dry.is_error, "{}", result_text(&dry));
+            result_json(&dry)
+        })
+    }
+
+    fn proposed_segments(preview: &serde_json::Value) -> Vec<Segment> {
+        preview["proposed_wires"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|wire| Segment {
+                x1: wire["x1"].as_f64().unwrap(),
+                y1: wire["y1"].as_f64().unwrap(),
+                x2: wire["x2"].as_f64().unwrap(),
+                y2: wire["y2"].as_f64().unwrap(),
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn materialize_net_connects_only_existing_same_net_endpoints_and_cleans_labels() {
         let (_dir, path) = ltc_fixture();
@@ -5219,7 +5985,10 @@ mod materialize_net_tests {
         assert!(!dry.is_error, "{}", result_text(&dry));
         let body = result_json(&dry);
         assert_eq!(body["endpoint_count"], json!(2));
-        assert_eq!(body["candidate_wire_count"], json!(1));
+        assert!(
+            body["candidate_wire_count"].as_u64().unwrap() >= 1,
+            "{body}"
+        );
         assert_eq!(
             body["labels_that_would_be_removed"]
                 .as_array()
@@ -5397,8 +6166,8 @@ mod materialize_net_tests {
         let preview = result_json(&dry);
         let wire_count = preview["proposed_wires"].as_array().unwrap().len();
         assert!(
-            wire_count < 6,
-            "four endpoints should not produce a pairwise full mesh: {preview}"
+            wire_count < 8,
+            "four endpoints should use a trunk plus pin escapes, not a pairwise full mesh: {preview}"
         );
         assert!(wire_count >= 3, "expected trunk plus branches: {preview}");
 
@@ -5420,6 +6189,68 @@ mod materialize_net_tests {
         let after = semantic_snapshot(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(before.pin_nets, after.pin_nets);
         assert_eq!(before.shorts, after.shorts);
+    }
+
+    #[test]
+    fn materialize_routes_around_foreign_symbol_body() {
+        let body = r#"  (symbol (lib_id "Test:Block") (at 75 50 0) (unit 1) (property "Reference" "B1" (at 75 43 0)) (property "Value" "BLOCK" (at 75 57 0)) (uuid "b1"))"#;
+        let (_dir, path) = materialize_obstacle_fixture(body);
+        let preview = materialize_and_preview(&path);
+        let proposed = proposed_segments(&preview);
+        let obstacle = RectObstacle {
+            min_x: 65.0,
+            min_y: 45.0,
+            max_x: 85.0,
+            max_y: 55.0,
+        };
+        assert!(
+            proposed
+                .iter()
+                .all(|segment| !segment_crosses_rect_interior(*segment, obstacle)),
+            "{preview}"
+        );
+        assert!(
+            proposed
+                .iter()
+                .any(|segment| (segment.y1 - 50.0).abs() > 0.01),
+            "route should detour off the blocked row: {preview}"
+        );
+    }
+
+    #[test]
+    fn materialize_routes_around_foreign_pin() {
+        let body = r#"  (label "OTHER" (at 75 50 0) (effects (font (size 1.27 1.27)) (justify left bottom)) (uuid "other"))
+  (symbol (lib_id "Test:P") (at 75 50 0) (unit 1) (property "Reference" "F1" (at 75 48 0)) (property "Value" "P" (at 75 52 0)) (uuid "f1"))"#;
+        let (_dir, path) = materialize_obstacle_fixture(body);
+        let preview = materialize_and_preview(&path);
+        let proposed = proposed_segments(&preview);
+        assert!(
+            proposed
+                .iter()
+                .all(|segment| !point_strictly_on_segment(75.0, 50.0, *segment)),
+            "{preview}"
+        );
+    }
+
+    #[test]
+    fn materialize_routes_around_foreign_conductive_wire() {
+        let body = r#"  (label "OTHER" (at 75 45 0) (effects (font (size 1.27 1.27)) (justify left bottom)) (uuid "other"))
+  (wire (pts (xy 75 45) (xy 75 55)) (uuid "foreign-wire"))"#;
+        let (_dir, path) = materialize_obstacle_fixture(body);
+        let preview = materialize_and_preview(&path);
+        let proposed = proposed_segments(&preview);
+        let foreign = Segment {
+            x1: 75.0,
+            y1: 45.0,
+            x2: 75.0,
+            y2: 55.0,
+        };
+        assert!(
+            proposed
+                .iter()
+                .all(|segment| !segments_intersect(*segment, foreign)),
+            "{preview}"
+        );
     }
 
     #[tokio::test]
@@ -5594,8 +6425,10 @@ mod materialize_net_tests {
         .unwrap();
         assert!(!applied.is_error, "{}", result_text(&applied));
         let after_text = std::fs::read_to_string(&path).unwrap();
-        assert!(after_text.contains("(symbol \"power:+5V_MAIN\""));
-        assert!(after_text.contains("(lib_id \"power:+5V_MAIN\")"));
+        assert!(!after_text.contains("(symbol \"power:+5V_MAIN\""));
+        assert!(after_text.contains("(symbol \"power:+5V\""));
+        assert!(after_text.contains("(lib_id \"power:+5V\")"));
+        assert!(after_text.contains("(property \"Value\" \"+5V_MAIN\""));
         assert_eq!(after_text.matches("(label \"+5V_MAIN\"").count(), 0);
         let after = semantic_snapshot(&after_text).unwrap();
         assert_eq!(before.pin_nets, after.pin_nets);
@@ -5603,12 +6436,68 @@ mod materialize_net_tests {
     }
 
     #[tokio::test]
+    async fn custom_power_rail_values_use_resolvable_stock_templates() {
+        for (net, template) in [
+            ("+5V_MAIN", "power:+5V"),
+            ("VCC_3V3_S0", "power:VCC"),
+            ("TEST_CUSTOM_RAIL", "power:VCC"),
+        ] {
+            let body = [
+                label(net, 50.0, 50.0, "l1"),
+                label(net, 80.0, 50.0, "l2"),
+                one_pin("U1", "IC", 50.0, 50.0, "u1"),
+                one_pin("J1", "CONN", 80.0, 50.0, "j1"),
+            ]
+            .join("\n");
+            let (_dir, path) = one_pin_net_fixture(net, &body);
+            let before = semantic_snapshot(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let dry = handle_refactor_schematic_net_representation(
+                &json!({
+                    "schematic": path.display().to_string(),
+                    "net": net,
+                    "representation": "power_symbol",
+                    "scope_policy": "allow_global_power_scope"
+                }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+            assert!(!dry.is_error, "{}: {}", net, result_text(&dry));
+            let preview = result_json(&dry);
+            let applied = handle_refactor_schematic_net_representation(
+                &json!({
+                    "schematic": path.display().to_string(),
+                    "net": net,
+                    "representation": "power_symbol",
+                    "scope_policy": "allow_global_power_scope",
+                    "dry_run": false,
+                    "plan_revision": preview["plan_revision"].as_str().unwrap()
+                }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+            assert!(!applied.is_error, "{}: {}", net, result_text(&applied));
+            let after_text = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                !after_text.contains(&format!("(symbol \"power:{net}\"")),
+                "custom rail must not invent a custom library symbol:\n{after_text}"
+            );
+            assert!(after_text.contains(&format!("(lib_id \"{template}\")")));
+            assert!(after_text.contains(&format!("(property \"Value\" \"{net}\"")));
+            let after = semantic_snapshot(&after_text).unwrap();
+            assert_eq!(before.pin_nets, after.pin_nets, "{net}");
+            assert_eq!(before.shorts, after.shorts, "{net}");
+        }
+    }
+
+    #[tokio::test]
     async fn gnd_label_normalizes_to_power_symbol_with_membership_preserved() {
         let body = [
-            label("GND", 50.0, 50.0, "l1"),
-            label("GND", 80.0, 50.0, "l2"),
-            one_pin("U1", "IC", 50.0, 50.0, "u1"),
-            one_pin("J1", "CONN", 80.0, 50.0, "j1"),
+            label("GND", 50.8, 50.8, "l1"),
+            label("GND", 80.01, 50.8, "l2"),
+            one_pin("U1", "IC", 50.8, 50.8, "u1"),
+            one_pin("J1", "CONN", 80.01, 50.8, "j1"),
         ]
         .join("\n");
         let (_dir, path) = one_pin_net_fixture("gnd", &body);
@@ -5647,6 +6536,69 @@ mod materialize_net_tests {
         let after_text = std::fs::read_to_string(&path).unwrap();
         assert!(after_text.contains("(lib_id \"power:GND\")"));
         assert_eq!(after_text.matches("(label \"GND\"").count(), 0);
+        let after = semantic_snapshot(&after_text).unwrap();
+        assert_eq!(before.pin_nets, after.pin_nets);
+        assert_eq!(before.shorts, after.shorts);
+    }
+
+    #[tokio::test]
+    async fn off_grid_gnd_label_normalizes_to_grid_point_on_same_net() {
+        let body = [
+            label("GND", 51.0, 50.8, "l1"),
+            label("GND", 80.01, 50.8, "l2"),
+            one_pin("U1", "IC", 50.8, 50.8, "u1"),
+            one_pin("J1", "CONN", 80.01, 50.8, "j1"),
+            r#"  (wire (pts (xy 50.8 50.8) (xy 80.01 50.8)) (uuid "w1"))"#.to_string(),
+        ]
+        .join("\n");
+        let (_dir, path) = one_pin_net_fixture("gnd_offgrid", &body);
+        let before = semantic_snapshot(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let dry = handle_refactor_schematic_net_representation(
+            &json!({
+                "schematic": path.display().to_string(),
+                "net": "GND",
+                "representation": "power_symbol",
+                "scope_policy": "allow_global_power_scope",
+                "grid": 1.27
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!dry.is_error, "{}", result_text(&dry));
+        let preview = result_json(&dry);
+        let proposed = preview["proposed_power_symbols"].as_array().unwrap();
+        assert!(
+            proposed
+                .iter()
+                .any(|p| p["normalized_from"] == json!({"x": 51.0, "y": 50.8})),
+            "{preview}"
+        );
+        assert!(
+            proposed.iter().all(|p| point_on_grid(
+                p["x"].as_f64().unwrap(),
+                p["y"].as_f64().unwrap(),
+                1.27
+            )),
+            "{preview}"
+        );
+        let applied = handle_refactor_schematic_net_representation(
+            &json!({
+                "schematic": path.display().to_string(),
+                "net": "GND",
+                "representation": "power_symbol",
+                "scope_policy": "allow_global_power_scope",
+                "grid": 1.27,
+                "dry_run": false,
+                "plan_revision": preview["plan_revision"].as_str().unwrap()
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!applied.is_error, "{}", result_text(&applied));
+        let after_text = std::fs::read_to_string(&path).unwrap();
+        assert!(!after_text.contains("(at 51 50.8"));
         let after = semantic_snapshot(&after_text).unwrap();
         assert_eq!(before.pin_nets, after.pin_nets);
         assert_eq!(before.shorts, after.shorts);

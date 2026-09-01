@@ -138,6 +138,20 @@ fn body(result: &Value) -> Value {
         .unwrap_or(Value::Null)
 }
 
+fn pin_xy(p: &mut Mcp, sch: &std::path::Path, reference: &str, pin_number: &str) -> (f64, f64) {
+    let pins = body(&p.tool(
+        "get_schematic_pin_locations",
+        json!({"schematic": sch.to_string_lossy(), "reference": reference}),
+    ));
+    let pin = pins["pins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|pin| pin["number"] == json!(pin_number))
+        .unwrap_or_else(|| panic!("pin {reference}.{pin_number} not found: {pins}"));
+    (pin["x"].as_f64().unwrap(), pin["y"].as_f64().unwrap())
+}
+
 #[test]
 #[ignore = "requires kicad-cli + symbol libraries; run via e2e workflow"]
 fn full_design_loop_with_real_kicad() {
@@ -298,4 +312,98 @@ fn full_design_loop_with_real_kicad() {
     );
 
     eprintln!("E2E OK: project created, wired, ERC'd, {produced} gerber files, DRC'd");
+}
+
+#[test]
+#[ignore = "requires kicad-cli + symbol libraries; run via e2e workflow"]
+fn custom_power_symbols_netlist_and_erc_with_real_kicad() {
+    let Some(kicad_cli) = find_kicad_cli() else {
+        panic!("kicad-cli not found — set KICAD_CLI or install KiCAD (this test is e2e-only)");
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("custom-power");
+    let sch = proj.join("custom-power.kicad_sch");
+    let mut p = Mcp::spawn(&kicad_cli);
+
+    p.tool(
+        "create_project",
+        json!({"name": "custom-power", "path": proj.to_string_lossy()}),
+    );
+    p.load("sch_components");
+    p.load("sch_wiring");
+    p.load("sch_export");
+
+    for (index, rail) in ["+5V_MAIN", "VCC_3V3_S0", "TEST_CUSTOM_RAIL"]
+        .into_iter()
+        .enumerate()
+    {
+        let reference = format!("R{}", index + 1);
+        let x = 100.0 + index as f64 * 25.0;
+        p.tool(
+            "add_schematic_component",
+            json!({
+                "schematic": sch.to_string_lossy(),
+                "lib_id": "Device:R",
+                "reference": reference,
+                "value": "10k",
+                "x": x,
+                "y": 100.0
+            }),
+        );
+        let (pin_x, pin_y) = pin_xy(&mut p, &sch, &reference, "1");
+        p.tool(
+            "add_power_symbol",
+            json!({
+                "schematic": sch.to_string_lossy(),
+                "power_net": rail,
+                "x": pin_x,
+                "y": pin_y
+            }),
+        );
+    }
+
+    let content = std::fs::read_to_string(&sch).unwrap();
+    assert!(!content.contains("(lib_id \"power:+5V_MAIN\")"));
+    assert!(!content.contains("(lib_id \"power:VCC_3V3_S0\")"));
+    assert!(!content.contains("(lib_id \"power:TEST_CUSTOM_RAIL\")"));
+    assert!(content.contains("(property \"Value\" \"+5V_MAIN\""));
+    assert!(content.contains("(property \"Value\" \"VCC_3V3_S0\""));
+    assert!(content.contains("(property \"Value\" \"TEST_CUSTOM_RAIL\""));
+
+    let net_file = proj.join("custom-power.net");
+    p.tool(
+        "generate_netlist",
+        json!({"schematic": sch.to_string_lossy(), "output": net_file.to_string_lossy()}),
+    );
+    let netlist = std::fs::read_to_string(&net_file).unwrap();
+    for (reference, rail) in [
+        ("R1", "+5V_MAIN"),
+        ("R2", "VCC_3V3_S0"),
+        ("R3", "TEST_CUSTOM_RAIL"),
+    ] {
+        let net = netlist
+            .split("(net")
+            .find(|block| {
+                block
+                    .split_once("(name ")
+                    .and_then(|(_, rest)| rest.split_once(')'))
+                    .is_some_and(|(name, _)| name.contains(rail))
+            })
+            .unwrap_or_else(|| panic!("KiCad netlist has no rail {rail}:\n{netlist}"));
+        assert!(
+            net.split("(node").any(|n| {
+                n.contains(&format!(r#"(ref "{reference}")"#)) && n.contains(r#"(pin "1")"#)
+            }),
+            "{reference}.1 is not on {rail}:\n{net}"
+        );
+    }
+
+    let erc = body(&p.tool("run_erc", json!({"schematic": sch.to_string_lossy()})));
+    let erc_text = erc.to_string();
+    assert!(
+        !erc_text.contains("power:+5V_MAIN")
+            && !erc_text.contains("power:VCC_3V3_S0")
+            && !erc_text.contains("power:TEST_CUSTOM_RAIL"),
+        "custom rails must not appear as unresolved library IDs: {erc}"
+    );
 }

@@ -181,10 +181,18 @@ Konnect/
 - Scope: **PCB editor only** — full CRUD on all board items, layer management, design rules
 - Schematic editor IPC: export-only (SVG, PDF, BOM, netlist) — NO item CRUD
 
-### S-Expression File Editing (Schematic — offline)
-- Direct read/write of `.kicad_sch` files
-- Symbol definitions auto-embedded from KiCAD 10's `.kicad_symdir` format
-- Power symbols (VCC, GND) embedded from `power.kicad_symdir`
+### Schematic Backend Policy
+- **KICAD_ONLY**: KiCAD owns complete native operations such as ERC, DRC,
+  authoritative netlist export, BOM/export, SVG/PDF, and fabrication exports.
+- **KICAD_PLUS_CUSTOM**: Konnect plans/orchestrates higher-level operations such
+  as semantic refactoring, layout planning, power normalization, and final
+  connectivity validation while KiCAD defines or executes safe native primitives.
+- **CUSTOM**: Version-gated compatibility paths cover behavior not completely
+  exposed by stable KiCAD 10, including semantic net materialization,
+  obstacle-aware routing, exact typed schematic deletion, hierarchy
+  representation migration, and current sheet-pin/hierarchy compatibility.
+- Symbol definitions auto-embed from KiCAD 10's `.kicad_symdir` format when a
+  compatibility path must place schematic symbols.
 - Existing-file edits use revision-checked atomic replacement: read the exact
   source, acquire a cooperative lock, reject any intervening KiCad or Konnect
   change, write a unique sibling scratch file, fsync, and rename.
@@ -194,6 +202,13 @@ Konnect/
 - Multi-file schematic changes use project-local
   `.konnect-transaction-*.json` write-ahead journals. These journals contain
   complete before/after images and must be treated as sensitive project data.
+
+K10 compatibility TODO capabilities:
+- reliable schematic GetItems/GetItemsById for arbitrary sheets;
+- reliable typed DeleteItems for arbitrary schematic items/sheets;
+- sheet-pin Create/Update/Delete with persistence across arbitrary sheets;
+- safe arbitrary hierarchical-sheet mutation and project-wide persistence;
+- complete schematic delete support suitable for replacing compatibility edits.
 
 `konnect_schematic_editor::Schematic` deliberately distinguishes creation from
 replacement:
