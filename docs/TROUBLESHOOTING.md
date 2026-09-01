@@ -194,7 +194,7 @@ dispatcher tools to `tools/list`:
 
 | tool | purpose |
 |---|---|
-| `list_available_tools` | browse all 216 tools, including unloaded ones |
+| `list_available_tools` | browse all 217 tools, including unloaded ones |
 | `get_tool_schema` | fetch a tool's real input schema on demand |
 | `execute_konnect_tool` | run any tool by name, whether or not its toolset is loaded |
 
@@ -212,7 +212,7 @@ possible listing — pass `--no-dispatcher-tools`, or set:
 in `konnect.toml` in the working directory, or a `settings.json` beside the binary.
 
 **The heavyweight alternative** is `eager_toolsets` (or `--eager-toolsets`),
-which pre-loads every toolset so `tools/list` carries all 222 tools natively.
+which pre-loads every toolset so `tools/list` carries all 223 tools natively.
 That also works, and gives the model native schemas rather than a dispatcher
 call — but it costs roughly 34K tokens of tool schemas in *every* request for
 the whole task, against ~2.2K. It is off by default for every client.

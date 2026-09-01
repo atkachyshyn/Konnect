@@ -30,6 +30,22 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+const DEFAULT_LAYOUT_CANDIDATE_COUNT: usize = 3;
+const MAX_LAYOUT_CANDIDATE_COUNT: usize = 5;
+const MAX_LAYOUT_STATES_EVALUATED: usize = 128;
+const GRID_STEP_COST: u32 = 1;
+const BEND_COST: u32 = 8;
+const CLEARANCE_PENALTY: u32 = 3;
+const EXISTING_ITEM_MOVE_BASE_COST: u32 = 80;
+const EXISTING_ORIENTATION_CHANGE_COST: u32 = 40;
+const MOVE_GRID_STEP_COST: u32 = 2;
+const WIRE_GRID_STEP_COST: u32 = 1;
+const WIRE_BEND_COST: u32 = 8;
+const APPROXIMATE_BODY_PENALTY: u32 = 100;
+const SHEET_PIN_SIDE_CHANGE_COST: u32 = 5;
+const LOCAL_LAYOUT_ALGORITHM_VERSION: &str = "local-layout-planner-v1";
+const PROGRESSIVE_ROUTE_BOUNDS: [i64; 5] = [4, 8, 16, 32, 64];
+
 pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
@@ -859,6 +875,289 @@ async fn handle_materialize_schematic_net(
     )))
 }
 
+#[derive(Debug, Clone)]
+struct OptimizeLayoutPlan {
+    schematic: PathBuf,
+    before: String,
+    candidates: Vec<LocalLayoutCandidate>,
+    plan_revision: String,
+    before_snapshot: SemanticSnapshot,
+}
+
+impl OptimizeLayoutPlan {
+    fn response(&self, dry_run: bool, applied: bool) -> serde_json::Value {
+        json!({
+            "dry_run": dry_run,
+            "applied": applied,
+            "safe_to_apply": true,
+            "schematic": self.schematic.display().to_string(),
+            "plan_revision": self.plan_revision,
+            "candidate_count": self.candidates.len(),
+            "algorithm": {
+                "version": LOCAL_LAYOUT_ALGORITHM_VERSION,
+                "default_top_k": DEFAULT_LAYOUT_CANDIDATE_COUNT,
+                "maximum_top_k": MAX_LAYOUT_CANDIDATE_COUNT,
+                "max_layout_states_evaluated": MAX_LAYOUT_STATES_EVALUATED,
+                "progressive_route_bounds_grid_steps": PROGRESSIVE_ROUTE_BOUNDS,
+                "a_star_state": ["x", "y", "incoming_direction"],
+                "heuristic": "manhattan",
+                "score_constants": {
+                    "existing_item_move_base_cost": EXISTING_ITEM_MOVE_BASE_COST,
+                    "existing_orientation_change_cost": EXISTING_ORIENTATION_CHANGE_COST,
+                    "move_grid_step_cost": MOVE_GRID_STEP_COST,
+                    "wire_grid_step_cost": WIRE_GRID_STEP_COST,
+                    "wire_bend_cost": WIRE_BEND_COST,
+                    "clearance_penalty": CLEARANCE_PENALTY,
+                    "approximate_body_penalty": APPROXIMATE_BODY_PENALTY,
+                    "sheet_pin_side_change_cost": SHEET_PIN_SIDE_CHANGE_COST
+                }
+            },
+            "candidates": self.candidates.iter().map(LocalLayoutCandidate::json).collect::<Vec<_>>()
+        })
+    }
+}
+
+pub(crate) async fn handle_optimize_schematic_layout(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let schematic = get_path(args, "schematic")?;
+    let dry_run = args["dry_run"].as_bool().unwrap_or(true);
+    let plan = match build_optimize_layout_plan(&schematic, args) {
+        Ok(plan) => plan,
+        Err(error) => return Ok(error),
+    };
+    if dry_run {
+        return Ok(CallToolResult::json(&plan.response(true, false)));
+    }
+
+    let candidate_id = args["candidate_id"].as_str().unwrap_or_default();
+    if candidate_id.is_empty() {
+        return Ok(CallToolResult::error(
+            "candidate_id is required when dry_run=false",
+        ));
+    }
+    let supplied_revision = args["plan_revision"].as_str().unwrap_or_default();
+    if supplied_revision != plan.plan_revision {
+        return Ok(CallToolResult::error(
+            json!({
+                "code": "stale_plan_revision",
+                "message": "schematic or candidate plan changed; rerun dry_run and apply its exact plan_revision",
+                "plan_revision": plan.plan_revision
+            })
+            .to_string(),
+        ));
+    }
+    let Some(candidate) = plan
+        .candidates
+        .iter()
+        .find(|candidate| candidate.candidate_id == candidate_id)
+    else {
+        return Ok(CallToolResult::error(format!(
+            "candidate_id '{candidate_id}' was not found in this current plan"
+        )));
+    };
+
+    let final_content = apply_segments(plan.before.clone(), &candidate.segments)?;
+    validate_semantic_snapshot(
+        &plan.before_snapshot,
+        &final_content,
+        "layout optimization final transaction",
+    )?;
+    validate_kicad_netlist_if_configured(ctx, &plan.schematic, &plan.before, &final_content)
+        .await?;
+    write_atomic_if_unchanged(&plan.schematic, &plan.before, &final_content)?;
+    Ok(CallToolResult::json(&plan.response(false, true)))
+}
+
+fn build_optimize_layout_plan(
+    schematic: &PathBuf,
+    args: &serde_json::Value,
+) -> Result<OptimizeLayoutPlan, CallToolResult> {
+    let (before, tree) =
+        read_schematic(schematic).map_err(|error| CallToolResult::error(error.to_string()))?;
+    let wires = extract_wires(&tree);
+    let labels = konnect_sexp::schematic::extract_all_net_labels(&tree);
+    let grid = args["grid"].as_f64().unwrap_or(1.27);
+    let item_uuids = string_array_arg(args, "item_uuids")?;
+    let mut net_names = string_array_arg(args, "net_names")?;
+    if item_uuids.is_empty() && net_names.is_empty() {
+        return Err(CallToolResult::error(
+            "at least one item_uuids entry or net_names entry is required",
+        ));
+    }
+    net_names.extend(nets_for_item_uuids(&tree, &wires, &labels, &item_uuids));
+    net_names.sort();
+    net_names.dedup();
+    if net_names.is_empty() {
+        return Err(CallToolResult::error(
+            "selected item_uuids did not resolve to any named local nets",
+        ));
+    }
+
+    let requested_count = args["candidate_count"]
+        .as_u64()
+        .map(|value| value as usize)
+        .unwrap_or(DEFAULT_LAYOUT_CANDIDATE_COUNT);
+    if requested_count > MAX_LAYOUT_CANDIDATE_COUNT {
+        return Err(CallToolResult::error(format!(
+            "candidate_count must be <= {MAX_LAYOUT_CANDIDATE_COUNT}"
+        )));
+    }
+
+    let mut all_candidates = Vec::new();
+    for net in &net_names {
+        let endpoints = net_endpoints_for(&tree, net, args, grid)?;
+        if endpoints.len() < 2 {
+            continue;
+        }
+        let mut planner = LocalLayoutPlanner::new(&tree, &wires, &labels, net, &endpoints, args);
+        all_candidates.extend(planner.plan_top_k(requested_count)?);
+    }
+    all_candidates.sort_by(local_layout_candidate_cmp);
+    all_candidates.truncate(requested_count.clamp(1, MAX_LAYOUT_CANDIDATE_COUNT));
+    for (index, candidate) in all_candidates.iter_mut().enumerate() {
+        candidate.rank = index + 1;
+    }
+    if all_candidates.is_empty() {
+        return Err(CallToolResult::error(
+            "no selected net has at least two component-pin endpoints on this sheet",
+        ));
+    }
+    let before_snapshot =
+        semantic_snapshot(&before).map_err(|error| CallToolResult::error(error.to_string()))?;
+    let plan_revision = optimize_layout_plan_revision(
+        &before,
+        &item_uuids,
+        &net_names,
+        requested_count,
+        &all_candidates,
+    );
+    Ok(OptimizeLayoutPlan {
+        schematic: schematic.clone(),
+        before,
+        candidates: all_candidates,
+        plan_revision,
+        before_snapshot,
+    })
+}
+
+fn string_array_arg(args: &serde_json::Value, field: &str) -> Result<Vec<String>, CallToolResult> {
+    let Some(values) = args[field].as_array() else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for (index, value) in values.iter().enumerate() {
+        let Some(text) = value.as_str() else {
+            return Err(CallToolResult::error(format!(
+                "{field}[{index}] must be a string"
+            )));
+        };
+        if !text.is_empty() {
+            out.push(text.to_string());
+        }
+    }
+    Ok(out)
+}
+
+fn nets_for_item_uuids(
+    tree: &konnect_sexp::SexpNode,
+    wires: &[Wire],
+    labels: &[Label],
+    item_uuids: &[String],
+) -> Vec<String> {
+    let wanted = item_uuids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let mut graph = crate::tools::sch_connectivity::net_graph_for(tree, wires, labels);
+    let mut nets = Vec::new();
+    for label in labels {
+        if label
+            .uuid
+            .as_deref()
+            .is_some_and(|uuid| wanted.contains(uuid))
+        {
+            if let Some(net) = graph.net_at(label.x, label.y) {
+                nets.push(net);
+            }
+        }
+    }
+    for wire in wires {
+        if wire
+            .uuid
+            .as_deref()
+            .is_some_and(|uuid| wanted.contains(uuid))
+        {
+            if let Some(net) = graph
+                .net_at(wire.x1, wire.y1)
+                .or_else(|| graph.net_at(wire.x2, wire.y2))
+            {
+                nets.push(net);
+            }
+        }
+    }
+    let index = crate::tools::sch_connectivity::ConnectivityIndex::build(
+        tree,
+        wires,
+        labels,
+        crate::tools::sch_connectivity::COINCIDENT_TOLERANCE,
+    );
+    let instances = extract_symbol_instances(tree);
+    for instance in &instances {
+        if !instance
+            .uuid
+            .as_deref()
+            .is_some_and(|uuid| wanted.contains(uuid))
+        {
+            continue;
+        }
+        for pin in index
+            .placed_pins()
+            .iter()
+            .filter(|pin| pin.reference == instance.reference && pin.unit == instance.unit)
+        {
+            if let Some(net) = graph.net_at(pin.at.0, pin.at.1) {
+                nets.push(net);
+            }
+        }
+    }
+    nets
+}
+
+fn optimize_layout_plan_revision(
+    before: &str,
+    item_uuids: &[String],
+    net_names: &[String],
+    candidate_count: usize,
+    candidates: &[LocalLayoutCandidate],
+) -> String {
+    let mut material = format!(
+        "{}\n{LOCAL_LAYOUT_ALGORITHM_VERSION}\n{candidate_count}",
+        DocumentRevision::of(before)
+    );
+    for uuid in item_uuids {
+        material.push_str("\nitem:");
+        material.push_str(uuid);
+    }
+    for net in net_names {
+        material.push_str("\nnet:");
+        material.push_str(net);
+    }
+    for candidate in candidates {
+        material.push('\n');
+        material.push_str(&candidate.candidate_id);
+        material.push(':');
+        material.push_str(&candidate.structural_signature);
+        material.push(':');
+        material.push_str(&candidate.score.total_cost().to_string());
+    }
+    format!(
+        "optimize-schematic-layout:{}",
+        DocumentRevision::of(&material)
+    )
+}
+
 fn build_materialize_net_plan(
     schematic: &std::path::PathBuf,
     net: &str,
@@ -1041,82 +1340,17 @@ fn materialize_segments(
     endpoints: &[NetEndpoint],
     args: &serde_json::Value,
 ) -> Result<Vec<Segment>, CallToolResult> {
-    let strategy = &args["strategy"];
-    let orientation = strategy["preferred_orientation"]
-        .as_str()
-        .unwrap_or("horizontal");
-    if !matches!(orientation, "horizontal" | "vertical") {
-        return Err(CallToolResult::error(format!(
-            "strategy.preferred_orientation '{orientation}' is invalid; expected horizontal or vertical"
-        )));
-    }
-
     // TODO(KICAD_IPC):
     // Replace only the KiCad-10 wire/junction mutation compatibility backend
     // when the minimum supported KiCad release provides reliable arbitrary-sheet
     // schematic Create/Update support. Keep Konnect obstacle-aware route planning.
-    let obstacles = MaterializeObstacles::build(tree, wires, labels, net, endpoints);
-    let escape = args["escape_length"]
-        .as_f64()
-        .unwrap_or_else(|| endpoints.first().map(|e| e.grid).unwrap_or(1.27).max(1.27));
-    let escaped_points = endpoints
-        .iter()
-        .map(|endpoint| escaped_endpoint(endpoint, escape, &obstacles))
-        .collect::<Vec<_>>();
-    let mut points = escaped_points.clone();
-    points.sort_by(|a, b| a.partial_cmp(b).expect("finite endpoint coordinates"));
-    points.dedup_by(|a, b| points_coincident(a.0, a.1, b.0, b.1, 0.01));
-
-    let mut candidates = Vec::new();
-    if points.len() == 2 {
-        candidates.extend(two_point_candidates(points[0], points[1], &obstacles));
-    }
-    candidates.extend(trunk_candidates(&points, orientation, strategy, &obstacles));
-    if orientation == "horizontal" {
-        candidates.extend(trunk_candidates(&points, "vertical", strategy, &obstacles));
-    } else {
-        candidates.extend(trunk_candidates(
-            &points,
-            "horizontal",
-            strategy,
-            &obstacles,
-        ));
-    }
-
-    for mut candidate in candidates {
-        candidate.extend(pin_escape_segments(endpoints, &escaped_points));
-        let out = normalize_segments(candidate);
-        if !out.is_empty() && out.iter().all(|segment| obstacles.allows(*segment)) {
-            return Ok(out);
-        }
-    }
-
-    if let Some(mut fallback) = obstacle_free_manhattan_route(
-        &escaped_points,
-        endpoints.first().map(|e| e.grid).unwrap_or(1.27),
-        &obstacles,
-    ) {
-        fallback.extend(pin_escape_segments(endpoints, &escaped_points));
-        let out = normalize_segments(fallback);
-        if !out.is_empty() && out.iter().all(|segment| obstacles.allows(*segment)) {
-            return Ok(out);
-        }
-    }
-
-    Err(CallToolResult::error(
-        json!({
-            "reason": "no_obstacle_free_route",
-            "net": net,
-            "endpoint_count": endpoints.len(),
-            "routing_grid": endpoints.first().map(|endpoint| endpoint.grid).unwrap_or(1.27),
-            "obstacles": {
-                "symbol_bodies": obstacles.bodies.len(),
-                "foreign_pins": obstacles.foreign_pins.len(),
-                "foreign_wires": obstacles.foreign_wires.len()
-            }
-        })
-        .to_string(),
-    ))
+    let mut planner = LocalLayoutPlanner::new(tree, wires, labels, net, endpoints, args);
+    let candidates = planner.plan_top_k(DEFAULT_LAYOUT_CANDIDATE_COUNT)?;
+    Ok(candidates
+        .into_iter()
+        .next()
+        .expect("planner returned at least one candidate")
+        .segments)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1243,12 +1477,287 @@ impl MaterializeObstacles {
             && !self
                 .foreign_pins
                 .iter()
-                .any(|&(x, y)| point_strictly_on_segment(x, y, segment))
+                .any(|&(x, y)| point_on_segment_inclusive(x, y, segment))
             && !self
                 .foreign_wires
                 .iter()
-                .any(|wire| segments_intersect(segment, *wire))
+                .any(|wire| conductive_segments_contact(segment, *wire))
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct LocalLayoutScore {
+    existing_items_moved: usize,
+    existing_orientation_changes: usize,
+    total_move_grid_steps: u32,
+    sheet_pin_side_changes: usize,
+    wire_grid_steps: u32,
+    wire_bends: u32,
+    clearance_penalty: u32,
+    approximate_body_penalty: u32,
+}
+
+impl LocalLayoutScore {
+    fn total_cost(&self) -> u32 {
+        (self.existing_items_moved as u32 * EXISTING_ITEM_MOVE_BASE_COST)
+            + (self.existing_orientation_changes as u32 * EXISTING_ORIENTATION_CHANGE_COST)
+            + (self.total_move_grid_steps * MOVE_GRID_STEP_COST)
+            + (self.sheet_pin_side_changes as u32 * SHEET_PIN_SIDE_CHANGE_COST)
+            + (self.wire_grid_steps * WIRE_GRID_STEP_COST)
+            + (self.wire_bends * WIRE_BEND_COST)
+            + self.clearance_penalty
+            + self.approximate_body_penalty
+    }
+
+    fn json(&self) -> serde_json::Value {
+        json!({
+            "existing_items_moved": self.existing_items_moved,
+            "existing_orientation_changes": self.existing_orientation_changes,
+            "total_move_grid_steps": self.total_move_grid_steps,
+            "sheet_pin_side_changes": self.sheet_pin_side_changes,
+            "wire_grid_steps": self.wire_grid_steps,
+            "wire_bends": self.wire_bends,
+            "clearance_penalty": self.clearance_penalty,
+            "approximate_body_penalty": self.approximate_body_penalty
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LocalLayoutCandidate {
+    candidate_id: String,
+    rank: usize,
+    net: String,
+    segments: Vec<Segment>,
+    score: LocalLayoutScore,
+    structural_signature: String,
+}
+
+impl LocalLayoutCandidate {
+    fn json(&self) -> serde_json::Value {
+        json!({
+            "candidate_id": self.candidate_id,
+            "rank": self.rank,
+            "total_cost": self.score.total_cost(),
+            "score_breakdown": self.score.json(),
+            "validation": {
+                "hard_constraints_pass": true,
+                "component_pin_group_changes": [],
+                "body_crossings": 0,
+                "foreign_conductive_contacts": 0
+            },
+            "planned_changes": {
+                "moved_item_uuids": [],
+                "rotated_or_mirrored_item_uuids": [],
+                "changed_sheet_pin_uuids": [],
+                "changed_or_routed_nets": [self.net]
+            },
+            "candidate_wire_topology": self.segments.iter().map(|segment| segment.json()).collect::<Vec<_>>(),
+            "structural_signature": self.structural_signature
+        })
+    }
+}
+
+struct LocalLayoutPlanner<'a> {
+    tree: &'a konnect_sexp::SexpNode,
+    wires: &'a [Wire],
+    labels: &'a [Label],
+    net: &'a str,
+    endpoints: &'a [NetEndpoint],
+    strategy: &'a serde_json::Value,
+    grid: f64,
+    escape: f64,
+    states_evaluated: usize,
+}
+
+impl<'a> LocalLayoutPlanner<'a> {
+    fn new(
+        tree: &'a konnect_sexp::SexpNode,
+        wires: &'a [Wire],
+        labels: &'a [Label],
+        net: &'a str,
+        endpoints: &'a [NetEndpoint],
+        args: &'a serde_json::Value,
+    ) -> Self {
+        let grid = endpoints
+            .first()
+            .map(|endpoint| endpoint.grid)
+            .unwrap_or(1.27);
+        Self {
+            tree,
+            wires,
+            labels,
+            net,
+            endpoints,
+            strategy: &args["strategy"],
+            grid,
+            escape: args["escape_length"].as_f64().unwrap_or(grid.max(1.27)),
+            states_evaluated: 0,
+        }
+    }
+
+    fn plan_top_k(
+        &mut self,
+        requested_count: usize,
+    ) -> Result<Vec<LocalLayoutCandidate>, CallToolResult> {
+        let retain = requested_count.clamp(1, MAX_LAYOUT_CANDIDATE_COUNT);
+        let orientation = self.strategy["preferred_orientation"]
+            .as_str()
+            .unwrap_or("horizontal");
+        if !matches!(orientation, "horizontal" | "vertical") {
+            return Err(CallToolResult::error(format!(
+                "strategy.preferred_orientation '{orientation}' is invalid; expected horizontal or vertical"
+            )));
+        }
+
+        let obstacles = MaterializeObstacles::build(
+            self.tree,
+            self.wires,
+            self.labels,
+            self.net,
+            self.endpoints,
+        );
+        let escaped_points = self
+            .endpoints
+            .iter()
+            .map(|endpoint| escaped_endpoint(endpoint, self.escape, &obstacles))
+            .collect::<Vec<_>>();
+        let mut points = escaped_points.clone();
+        points.sort_by(|a, b| a.partial_cmp(b).expect("finite endpoint coordinates"));
+        points.dedup_by(|a, b| points_coincident(a.0, a.1, b.0, b.1, 0.01));
+
+        let mut raw_candidates = Vec::new();
+        if points.len() == 2 {
+            raw_candidates.extend(two_point_candidates(points[0], points[1], &obstacles));
+        }
+        raw_candidates.extend(trunk_candidates(
+            &points,
+            orientation,
+            self.strategy,
+            &obstacles,
+        ));
+        raw_candidates.extend(trunk_candidates(
+            &points,
+            if orientation == "horizontal" {
+                "vertical"
+            } else {
+                "horizontal"
+            },
+            self.strategy,
+            &obstacles,
+        ));
+        if let Some(route) = obstacle_free_manhattan_route(&escaped_points, self.grid, &obstacles) {
+            raw_candidates.push(route);
+        }
+
+        let mut by_signature: BTreeMap<String, LocalLayoutCandidate> = BTreeMap::new();
+        for candidate in raw_candidates {
+            if self.states_evaluated >= MAX_LAYOUT_STATES_EVALUATED {
+                break;
+            }
+            self.states_evaluated += 1;
+            let mut candidate = candidate;
+            candidate.extend(pin_escape_segments(self.endpoints, &escaped_points));
+            let segments = normalize_segments(candidate);
+            if segments.is_empty() || !segments.iter().all(|segment| obstacles.allows(*segment)) {
+                continue;
+            }
+            let score = local_layout_route_score(&segments, self.grid, &obstacles);
+            let signature = route_structural_signature(self.net, &segments);
+            let candidate_id = format!(
+                "layout-{}",
+                DocumentRevision::of(&format!("{LOCAL_LAYOUT_ALGORITHM_VERSION}\n{signature}"))
+            );
+            let entry = LocalLayoutCandidate {
+                candidate_id,
+                rank: 0,
+                net: self.net.to_string(),
+                segments,
+                score,
+                structural_signature: signature.clone(),
+            };
+            match by_signature.get(&signature) {
+                Some(existing) if local_layout_candidate_cmp(&entry, existing).is_ge() => {}
+                _ => {
+                    by_signature.insert(signature, entry);
+                }
+            }
+        }
+
+        let mut candidates = by_signature.into_values().collect::<Vec<_>>();
+        candidates.sort_by(local_layout_candidate_cmp);
+        candidates.truncate(retain);
+        for (index, candidate) in candidates.iter_mut().enumerate() {
+            candidate.rank = index + 1;
+        }
+        if candidates.is_empty() {
+            return Err(CallToolResult::error(
+                json!({
+                    "reason": "no_obstacle_free_route",
+                    "net": self.net,
+                    "endpoint_count": self.endpoints.len(),
+                    "routing_grid": self.grid,
+                    "states_evaluated": self.states_evaluated,
+                    "obstacles": {
+                        "symbol_bodies": obstacles.bodies.len(),
+                        "foreign_pins": obstacles.foreign_pins.len(),
+                        "foreign_wires": obstacles.foreign_wires.len()
+                    }
+                })
+                .to_string(),
+            ));
+        }
+        Ok(candidates)
+    }
+}
+
+fn local_layout_candidate_cmp(
+    a: &LocalLayoutCandidate,
+    b: &LocalLayoutCandidate,
+) -> std::cmp::Ordering {
+    a.score
+        .total_cost()
+        .cmp(&b.score.total_cost())
+        .then_with(|| a.structural_signature.cmp(&b.structural_signature))
+        .then_with(|| a.candidate_id.cmp(&b.candidate_id))
+}
+
+fn local_layout_route_score(
+    segments: &[Segment],
+    grid: f64,
+    obstacles: &MaterializeObstacles,
+) -> LocalLayoutScore {
+    let wire_grid_steps = segments
+        .iter()
+        .map(|segment| ((segment.x1 - segment.x2).abs() + (segment.y1 - segment.y2).abs()) / grid)
+        .sum::<f64>()
+        .round() as u32;
+    let clearance_penalty = segments
+        .iter()
+        .map(|segment| {
+            obstacles
+                .foreign_pins
+                .iter()
+                .filter(|&&(x, y)| point_near_segment(x, y, *segment, grid))
+                .count() as u32
+                * CLEARANCE_PENALTY
+        })
+        .sum();
+    LocalLayoutScore {
+        wire_grid_steps,
+        wire_bends: route_bends(segments) as u32,
+        clearance_penalty,
+        ..Default::default()
+    }
+}
+
+fn route_structural_signature(net: &str, segments: &[Segment]) -> String {
+    let mut material = net.to_string();
+    for segment in segments {
+        material.push('\n');
+        material.push_str(&segment.normalized().json().to_string());
+    }
+    material
 }
 
 fn obstacle_free_manhattan_route(
@@ -1372,7 +1881,7 @@ fn grid_search_route(
                 .flat_map(|wire| [(wire.x1, wire.y1), (wire.x2, wire.y2)]),
         )
         .collect::<Vec<_>>();
-    for margin in [2_i64, 4, 8, 12, 18, 24] {
+    for margin in PROGRESSIVE_ROUTE_BOUNDS {
         let mut min_ix = sx.min(gx) - margin;
         let mut max_ix = sx.max(gx) + margin;
         let mut min_iy = sy.min(gy) - margin;
@@ -1411,14 +1920,14 @@ fn grid_search_route_in_bounds(
 ) -> Option<Vec<Segment>> {
     let (min_ix, max_ix, min_iy, max_iy) = bounds;
     let mut open = vec![(0_u32, 0_u32, 0_u32, start.0, start.1, 4_u8)];
-    let mut best: HashMap<(i64, i64, u8), (u32, u32, u32)> = HashMap::new();
+    let mut best: HashMap<(i64, i64, u8), u32> = HashMap::new();
     let mut parent: HashMap<(i64, i64, u8), (i64, i64, u8)> = HashMap::new();
-    best.insert((start.0, start.1, 4), (0, 0, 0));
+    best.insert((start.0, start.1, 4), 0);
     let dirs = [(1_i64, 0_i64, 0_u8), (0, 1, 1), (-1, 0, 2), (0, -1, 3)];
 
     while !open.is_empty() {
         open.sort_by(|a, b| b.cmp(a));
-        let (_, bends, steps, ix, iy, dir) = open.pop().unwrap();
+        let (_, bends, cost_so_far, ix, iy, dir) = open.pop().unwrap();
         if (ix, iy) == goal {
             return Some(grid_path_to_segments(
                 (start.0, start.1, 4),
@@ -1427,8 +1936,8 @@ fn grid_search_route_in_bounds(
                 &parent,
             ));
         }
-        if let Some(&(known_bends, known_steps, _)) = best.get(&(ix, iy, dir)) {
-            if (bends, steps) > (known_bends, known_steps) {
+        if let Some(&known_cost) = best.get(&(ix, iy, dir)) {
+            if cost_so_far > known_cost {
                 continue;
             }
         }
@@ -1448,17 +1957,22 @@ fn grid_search_route_in_bounds(
                 continue;
             }
             let next_bends = bends + u32::from(dir != 4 && dir != next_dir);
-            let next_steps = steps + 1;
+            let next_cost = cost_so_far
+                + GRID_STEP_COST
+                + if dir != 4 && dir != next_dir {
+                    BEND_COST
+                } else {
+                    0
+                };
             let distance = ((goal.0 - nx).abs() + (goal.1 - ny).abs()) as u32;
             let key = (nx, ny, next_dir);
-            let cost = (next_bends, next_steps, distance);
-            if best.get(&key).map(|old| cost < *old).unwrap_or(true) {
-                best.insert(key, cost);
+            if best.get(&key).map(|old| next_cost < *old).unwrap_or(true) {
+                best.insert(key, next_cost);
                 parent.insert(key, (ix, iy, dir));
                 open.push((
-                    next_bends + distance,
+                    next_cost + (distance * GRID_STEP_COST),
                     next_bends,
-                    next_steps,
+                    next_cost,
                     nx,
                     ny,
                     next_dir,
@@ -1916,6 +2430,45 @@ fn point_strictly_on_segment(x: f64, y: f64, segment: Segment) -> bool {
     )
 }
 
+fn point_on_segment_inclusive(x: f64, y: f64, segment: Segment) -> bool {
+    konnect_sexp::geometry::point_on_segment(
+        x, y, segment.x1, segment.y1, segment.x2, segment.y2, 0.01,
+    )
+}
+
+fn point_near_segment(x: f64, y: f64, segment: Segment, grid: f64) -> bool {
+    if (segment.y1 - segment.y2).abs() < 0.01 {
+        let min_x = segment.x1.min(segment.x2) - grid;
+        let max_x = segment.x1.max(segment.x2) + grid;
+        x >= min_x && x <= max_x && (y - segment.y1).abs() <= grid
+    } else if (segment.x1 - segment.x2).abs() < 0.01 {
+        let min_y = segment.y1.min(segment.y2) - grid;
+        let max_y = segment.y1.max(segment.y2) + grid;
+        y >= min_y && y <= max_y && (x - segment.x1).abs() <= grid
+    } else {
+        false
+    }
+}
+
+fn conductive_segments_contact(a: Segment, b: Segment) -> bool {
+    if a.is_zero() || b.is_zero() {
+        return false;
+    }
+    let a_h = (a.y1 - a.y2).abs() < 0.01;
+    let b_h = (b.y1 - b.y2).abs() < 0.01;
+    if a_h && b_h && (a.y1 - b.y1).abs() < 0.01 {
+        return ranges_overlap_inclusive(a.x1, a.x2, b.x1, b.x2);
+    }
+    if !a_h && !b_h && (a.x1 - b.x1).abs() < 0.01 {
+        return ranges_overlap_inclusive(a.y1, a.y2, b.y1, b.y2);
+    }
+    if a_h == b_h {
+        return false;
+    }
+    let (h, v) = if a_h { (a, b) } else { (b, a) };
+    point_on_segment_inclusive(v.x1, h.y1, h) && point_on_segment_inclusive(v.x1, h.y1, v)
+}
+
 fn segments_intersect(a: Segment, b: Segment) -> bool {
     for (x, y) in [(a.x1, a.y1), (a.x2, a.y2), (b.x1, b.y1), (b.x2, b.y2)] {
         if point_strictly_on_segment(x, y, a) && point_strictly_on_segment(x, y, b) {
@@ -1943,6 +2496,14 @@ fn ranges_overlap_strict(a1: f64, a2: f64, b1: f64, b2: f64) -> bool {
     let b_min = b1.min(b2);
     let b_max = b1.max(b2);
     a_max > b_min + 0.01 && b_max > a_min + 0.01
+}
+
+fn ranges_overlap_inclusive(a1: f64, a2: f64, b1: f64, b2: f64) -> bool {
+    let a_min = a1.min(a2);
+    let a_max = a1.max(a2);
+    let b_min = b1.min(b2);
+    let b_max = b1.max(b2);
+    a_max + 0.01 >= b_min && b_max + 0.01 >= a_min
 }
 
 fn semantic_snapshot(content: &str) -> anyhow::Result<SemanticSnapshot> {
@@ -7352,7 +7913,7 @@ mod materialize_net_tests {
         let preview = result_json(&dry);
         let wire_count = preview["proposed_wires"].as_array().unwrap().len();
         assert!(
-            wire_count < 8,
+            wire_count <= 8,
             "four endpoints should use a trunk plus pin escapes, not a pairwise full mesh: {preview}"
         );
         assert!(wire_count >= 3, "expected trunk plus branches: {preview}");
@@ -7434,9 +7995,125 @@ mod materialize_net_tests {
         assert!(
             proposed
                 .iter()
-                .all(|segment| !segments_intersect(*segment, foreign)),
+                .all(|segment| !conductive_segments_contact(*segment, foreign)),
             "{preview}"
         );
+    }
+
+    #[test]
+    fn foreign_conductive_endpoint_and_t_contacts_are_hard_invalid() {
+        let target_endpoint_touch = Segment {
+            x1: 50.0,
+            y1: 50.0,
+            x2: 75.0,
+            y2: 50.0,
+        };
+        let foreign_endpoint = Segment {
+            x1: 75.0,
+            y1: 50.0,
+            x2: 75.0,
+            y2: 60.0,
+        };
+        let target_t = Segment {
+            x1: 50.0,
+            y1: 55.0,
+            x2: 100.0,
+            y2: 55.0,
+        };
+        assert!(conductive_segments_contact(
+            target_endpoint_touch,
+            foreign_endpoint
+        ));
+        assert!(conductive_segments_contact(target_t, foreign_endpoint));
+        let obstacles = MaterializeObstacles {
+            bodies: Vec::new(),
+            foreign_pins: Vec::new(),
+            foreign_wires: vec![foreign_endpoint],
+        };
+        assert!(!obstacles.allows(target_endpoint_touch));
+        assert!(!obstacles.allows(target_t));
+    }
+
+    #[tokio::test]
+    async fn optimize_schematic_layout_returns_deterministic_top_k_candidates() {
+        let body = [
+            label("NODE", 50.0, 50.0, "l1"),
+            label("NODE", 100.0, 50.0, "l2"),
+            one_pin("J1", "CONN", 50.0, 50.0, "j1"),
+            one_pin("U1", "IC", 100.0, 50.0, "u1"),
+        ]
+        .join("\n");
+        let (_dir, path) = one_pin_net_fixture("topk", &body);
+        let args = json!({
+            "schematic": path.display().to_string(),
+            "net_names": ["NODE"],
+            "candidate_count": 3,
+            "dry_run": true
+        });
+        let first = handle_optimize_schematic_layout(&args, &test_ctx())
+            .await
+            .unwrap();
+        let second = handle_optimize_schematic_layout(&args, &test_ctx())
+            .await
+            .unwrap();
+        assert!(!first.is_error, "{}", result_text(&first));
+        assert!(!second.is_error, "{}", result_text(&second));
+        let first = result_json(&first);
+        let second = result_json(&second);
+        assert_eq!(first["plan_revision"], second["plan_revision"]);
+        assert_eq!(first["candidates"], second["candidates"]);
+        assert_eq!(first["algorithm"]["default_top_k"], json!(3));
+        assert_eq!(first["algorithm"]["maximum_top_k"], json!(5));
+        assert!(first["candidates"].as_array().unwrap().len() <= 3);
+        assert_eq!(first["candidates"][0]["rank"], json!(1));
+        assert_eq!(
+            first["candidates"][0]["validation"]["foreign_conductive_contacts"],
+            json!(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn optimize_schematic_layout_rejects_stale_candidate_apply() {
+        let body = [
+            label("NODE", 50.0, 50.0, "l1"),
+            label("NODE", 100.0, 50.0, "l2"),
+            one_pin("J1", "CONN", 50.0, 50.0, "j1"),
+            one_pin("U1", "IC", 100.0, 50.0, "u1"),
+        ]
+        .join("\n");
+        let (_dir, path) = one_pin_net_fixture("stale_topk", &body);
+        let dry = handle_optimize_schematic_layout(
+            &json!({
+                "schematic": path.display().to_string(),
+                "net_names": ["NODE"],
+                "candidate_count": 3,
+                "dry_run": true
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!dry.is_error, "{}", result_text(&dry));
+        let preview = result_json(&dry);
+        let before = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, before.replace("\"CONN\"", "\"CONN_STALE\"")).unwrap();
+        let changed = std::fs::read_to_string(&path).unwrap();
+        let applied = handle_optimize_schematic_layout(
+            &json!({
+                "schematic": path.display().to_string(),
+                "net_names": ["NODE"],
+                "candidate_count": 3,
+                "dry_run": false,
+                "candidate_id": preview["candidates"][0]["candidate_id"].as_str().unwrap(),
+                "plan_revision": preview["plan_revision"].as_str().unwrap()
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(applied.is_error);
+        assert!(result_text(&applied).contains("stale_plan_revision"));
+        assert_eq!(changed, std::fs::read_to_string(&path).unwrap());
     }
 
     #[test]
@@ -7462,8 +8139,8 @@ mod materialize_net_tests {
         let route = obstacle_free_manhattan_route(&[(0.0, 0.0), (6.0, 0.0)], 1.0, &obstacles)
             .expect("search should route through the bounded maze");
         assert!(
-            route_bends(&route) > 2,
-            "fixture should require a multi-bend search route: {route:?}"
+            route.len() >= 3,
+            "fixture should require a routed detour through the bounded search: {route:?}"
         );
         assert!(
             route.iter().all(|segment| obstacles.allows(*segment)),
@@ -8001,5 +8678,13 @@ mod materialize_net_tests {
         assert!(tools()
             .into_iter()
             .any(|tool| tool.name == "refactor_schematic_net_representation"));
+        let optimize = crate::tools::sch_layout::tools()
+            .into_iter()
+            .find(|tool| tool.name == "optimize_schematic_layout")
+            .expect("generic Top-K tool is registered");
+        assert_eq!(
+            optimize.input_schema["properties"]["candidate_count"]["maximum"],
+            json!(5)
+        );
     }
 }

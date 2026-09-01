@@ -68,7 +68,7 @@ Konnect/
 │   │           ├── stdio.rs         # Line-by-line JSON-RPC over stdin/stdout (default)
 │   │           └── http.rs          # Streamable HTTP: POST + GET (SSE) on /mcp (transport = "http" / "both")
 │   │
-│   ├── konnect-core/          # All tool logic (19 toolsets)
+│   ├── konnect-core/          # All tool logic (20 toolsets)
 │   │   └── src/
 │   │       ├── mcp/
 │   │       │   ├── protocol.rs      # MCP JSON-RPC 2.0 types
@@ -85,6 +85,7 @@ Konnect/
 │   │           ├── project.rs        # 7 tools (incl. open_schematic_viewer)
 │   │           ├── sch_components.rs # 20 tools (component placement with lib_symbols embedding)
 │   │           ├── sch_wiring.rs     # 22 tools (incl. connect_pins, power symbol embedding)
+│   │           ├── sch_layout.rs     # 1 tool (deterministic local Top-K layout planning)
 │   │           ├── sch_analysis.rs   # 15 tools (union-find net graph, connectivity)
 │   │           ├── sch_batch.rs      # 14 tools (single-read/single-write atomic operations)
 │   │           ├── sch_export.rs     # 7 tools (SVG/PDF/netlist/ERC/PCB sync)
@@ -318,7 +319,7 @@ Source: [`crates/konnect-core/src/observability.rs`](crates/konnect-core/src/obs
 
 ## Tool Routing (Starter Kit + On-Demand Loading)
 
-`tools/list` never carries all 216 tools (222 with the 6 meta-tools) by default. Measured against the current catalogue that listing is ~34K tokens of tool schemas, and they sit in every request for the whole task — not once per listing, which is what an earlier version of this section claimed. The starter baseline is ~2.2K.
+`tools/list` never carries all 217 tools (223 with the 6 meta-tools) by default. Measured against the current catalogue that listing is ~34K tokens of tool schemas, and they sit in every request for the whole task — not once per listing, which is what an earlier version of this section claimed. The starter baseline is ~2.2K.
 
 The lazy path works like this:
 
@@ -334,7 +335,7 @@ The lazy path works like this:
 
   | tool | purpose |
   |---|---|
-  | `list_available_tools` | browse all 216, names-only by default; `toolset=` or `search=` for descriptions |
+  | `list_available_tools` | browse all 217, names-only by default; `toolset=` or `search=` for descriptions |
   | `get_tool_schema` | fetch one tool's real input schema on demand (also resolves meta-tools) |
   | `execute_konnect_tool` | run any registered tool by name, loaded or not |
 
@@ -421,10 +422,10 @@ convention for other `kicad-cli`-calling code.
 
 ## Current Stats
 
-- **19 toolsets, 216 tools** + 6 meta-tools (4 routing + 2 observability — see `tool-directory.md`)
+- **20 toolsets, 217 tools** + 6 meta-tools (4 routing + 2 observability — see `tool-directory.md`)
 - With `--no-dispatcher-tools`: 20 tools / ~2.2K tokens (starter kit + meta-tools)
-- Default for every client: 23 tools / ~3.0K tokens (starter kit + meta-tools + 3 dispatcher tools, all 216 reachable on demand)
-- Full-catalog `tools/list` (`eager_toolsets`): 222 tools (216 registered + 6 meta) / ~34K tokens
+- Default for every client: 23 tools / ~3.0K tokens (starter kit + meta-tools + 3 dispatcher tools, all 217 reachable on demand)
+- Full-catalog `tools/list` (`eager_toolsets`): 223 tools (217 registered + 6 meta) / ~34K tokens
 - **0 IPC stubs** (all protobuf methods implemented)
 - **0 unimplemented tools**
 - **Specctra DSN/SES are PCB-editor operations**, not `kicad-cli` commands. Konnect
