@@ -725,6 +725,7 @@ impl Segment {
 
 #[derive(Debug, Clone)]
 struct NetEndpoint {
+    kind: NetEndpointKind,
     reference: String,
     unit: u32,
     pin_number: String,
@@ -739,9 +740,28 @@ struct NetEndpoint {
     attachment_depends_on_off_grid_position: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NetEndpointKind {
+    ComponentPin,
+    SheetPin {
+        sheet_uuid: String,
+        sheet_name: String,
+        pin_uuid: String,
+    },
+}
+
 impl NetEndpoint {
     fn key(&self) -> String {
-        format!("{}:{}:{}", self.reference, self.unit, self.pin_number)
+        match &self.kind {
+            NetEndpointKind::ComponentPin => {
+                format!("{}:{}:{}", self.reference, self.unit, self.pin_number)
+            }
+            NetEndpointKind::SheetPin {
+                sheet_uuid,
+                pin_uuid,
+                ..
+            } => format!("sheet:{sheet_uuid}:{pin_uuid}"),
+        }
     }
 
     fn json(&self) -> serde_json::Value {
@@ -756,7 +776,79 @@ impl NetEndpoint {
             "grid": self.grid,
             "on_grid": self.on_grid,
             "nearest_grid_position": { "x": self.nearest_grid_x, "y": self.nearest_grid_y },
-            "attachment_depends_on_off_grid_position": self.attachment_depends_on_off_grid_position
+            "attachment_depends_on_off_grid_position": self.attachment_depends_on_off_grid_position,
+            "kind": match &self.kind {
+                NetEndpointKind::ComponentPin => json!("component_pin"),
+                NetEndpointKind::SheetPin { sheet_uuid, sheet_name, pin_uuid } => json!({
+                    "type": "sheet_pin",
+                    "sheet_uuid": sheet_uuid,
+                    "sheet_name": sheet_name,
+                    "pin_uuid": pin_uuid
+                }),
+            }
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum SheetPinSide {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+impl SheetPinSide {
+    fn rotation(self) -> f64 {
+        match self {
+            Self::Left => 180.0,
+            Self::Right => 0.0,
+            Self::Top => 90.0,
+            Self::Bottom => 270.0,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Left => "LEFT",
+            Self::Right => "RIGHT",
+            Self::Top => "TOP",
+            Self::Bottom => "BOTTOM",
+        }
+    }
+
+    fn is_vertical_edge(self) -> bool {
+        matches!(self, Self::Left | Self::Right)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SheetPinChange {
+    sheet_uuid: String,
+    sheet_name: String,
+    pin_uuid: String,
+    pin_name: String,
+    from_side: SheetPinSide,
+    to_side: SheetPinSide,
+    from_x: f64,
+    from_y: f64,
+    to_x: f64,
+    to_y: f64,
+    rotation: f64,
+}
+
+impl SheetPinChange {
+    fn json(&self) -> serde_json::Value {
+        json!({
+            "sheet_uuid": self.sheet_uuid,
+            "sheet_name": self.sheet_name,
+            "pin_uuid": self.pin_uuid,
+            "pin_name": self.pin_name,
+            "from_side": self.from_side.as_str(),
+            "to_side": self.to_side.as_str(),
+            "from": {"x": self.from_x, "y": self.from_y},
+            "to": {"x": self.to_x, "y": self.to_y},
+            "rotation": self.rotation
         })
     }
 }
@@ -776,6 +868,7 @@ struct MaterializeNetPlan {
     existing_wires: Vec<Wire>,
     labels: Vec<Label>,
     segments: Vec<Segment>,
+    sheet_pin_changes: Vec<SheetPinChange>,
     removable_local_labels: Vec<(f64, f64)>,
     remove_redundant_local_labels: bool,
     before_snapshot: SemanticSnapshot,
@@ -811,6 +904,7 @@ impl MaterializeNetPlan {
             })).collect::<Vec<_>>(),
             "candidate_wire_topology": self.segments.iter().map(|segment| segment.json()).collect::<Vec<_>>(),
             "candidate_wire_count": self.segments.len(),
+            "candidate_sheet_pin_changes": self.sheet_pin_changes.iter().map(SheetPinChange::json).collect::<Vec<_>>(),
             "remove_redundant_local_labels": self.remove_redundant_local_labels,
             "labels_that_would_be_removed": self.removable_local_labels.iter().map(|(x, y)| json!({"x": x, "y": y})).collect::<Vec<_>>(),
             "labels_removed": labels_removed,
@@ -958,7 +1052,12 @@ pub(crate) async fn handle_optimize_schematic_layout(
         )));
     };
 
-    let final_content = apply_segments(plan.before.clone(), &candidate.segments)?;
+    let base_content = apply_sheet_pin_changes_to_content(
+        &plan.schematic,
+        &plan.before,
+        &candidate.sheet_pin_changes,
+    )?;
+    let final_content = apply_segments(base_content, &candidate.segments)?;
     validate_semantic_snapshot(
         &plan.before_snapshot,
         &final_content,
@@ -1011,7 +1110,9 @@ fn build_optimize_layout_plan(
         if endpoints.len() < 2 {
             continue;
         }
-        let mut planner = LocalLayoutPlanner::new(&tree, &wires, &labels, net, &endpoints, args);
+        let mut planner = LocalLayoutPlanner::new(
+            &before, schematic, &tree, &wires, &labels, net, &endpoints, args,
+        );
         all_candidates.extend(planner.plan_top_k(requested_count)?);
     }
     all_candidates.sort_by(local_layout_candidate_cmp);
@@ -1194,6 +1295,7 @@ fn build_materialize_net_plan(
         }
         if graph.net_at(placed.at.0, placed.at.1).as_deref() == Some(net) {
             endpoints.push(NetEndpoint {
+                kind: NetEndpointKind::ComponentPin,
                 reference: placed.reference.clone(),
                 unit: placed.unit,
                 pin_number: placed.pin.number.clone(),
@@ -1214,6 +1316,9 @@ fn build_materialize_net_plan(
             });
         }
     }
+    if selected_keys.is_none() {
+        endpoints.extend(sheet_pin_endpoints_for(&tree, &mut graph, net, grid));
+    }
     endpoints.sort_by(|a, b| a.key().cmp(&b.key()));
     if endpoints.len() < 2 {
         return Err(CallToolResult::error(format!(
@@ -1221,12 +1326,18 @@ fn build_materialize_net_plan(
         )));
     }
 
-    let segments = materialize_segments(&tree, &wires, &labels, net, &endpoints, args)?;
+    let candidate = materialize_candidate(
+        &before, schematic, &tree, &wires, &labels, net, &endpoints, args,
+    )?;
     let before_snapshot =
         semantic_snapshot(&before).map_err(|error| CallToolResult::error(error.to_string()))?;
-    let mut final_content = segments
+    let mut final_content =
+        apply_sheet_pin_changes_to_content(schematic, &before, &candidate.sheet_pin_changes)
+            .map_err(|error| CallToolResult::error(error.to_string()))?;
+    final_content = candidate
+        .segments
         .iter()
-        .try_fold(before.clone(), |content, segment| {
+        .try_fold(final_content, |content, segment| {
             let tree =
                 parse_sexp(&content).map_err(|error| CallToolResult::error(error.to_string()))?;
             let current_wires = extract_wires(&tree);
@@ -1266,7 +1377,8 @@ fn build_materialize_net_plan(
     let plan_revision = materialize_plan_revision(
         &before,
         net,
-        &segments,
+        &candidate.segments,
+        &candidate.sheet_pin_changes,
         remove_redundant_local_labels,
         &endpoints,
     );
@@ -1277,7 +1389,8 @@ fn build_materialize_net_plan(
         endpoints,
         existing_wires,
         labels: labels_for_net,
-        segments,
+        segments: candidate.segments,
+        sheet_pin_changes: candidate.sheet_pin_changes,
         removable_local_labels,
         remove_redundant_local_labels,
         before_snapshot,
@@ -1332,25 +1445,27 @@ fn requested_materialize_pin_keys(
     Ok(Some(keys))
 }
 
-fn materialize_segments(
+fn materialize_candidate(
+    before: &str,
+    schematic: &Path,
     tree: &konnect_sexp::SexpNode,
     wires: &[Wire],
     labels: &[Label],
     net: &str,
     endpoints: &[NetEndpoint],
     args: &serde_json::Value,
-) -> Result<Vec<Segment>, CallToolResult> {
+) -> Result<LocalLayoutCandidate, CallToolResult> {
     // TODO(KICAD_IPC):
     // Replace only the KiCad-10 wire/junction mutation compatibility backend
     // when the minimum supported KiCad release provides reliable arbitrary-sheet
     // schematic Create/Update support. Keep Konnect obstacle-aware route planning.
-    let mut planner = LocalLayoutPlanner::new(tree, wires, labels, net, endpoints, args);
+    let mut planner =
+        LocalLayoutPlanner::new(before, schematic, tree, wires, labels, net, endpoints, args);
     let candidates = planner.plan_top_k(DEFAULT_LAYOUT_CANDIDATE_COUNT)?;
     Ok(candidates
         .into_iter()
         .next()
-        .expect("planner returned at least one candidate")
-        .segments)
+        .expect("planner returned at least one candidate"))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1427,11 +1542,7 @@ impl MaterializeObstacles {
                 }
             }
         }
-        bodies.extend(
-            sheet_body_obstacles(tree)
-                .into_iter()
-                .map(|r| r.padded(0.01)),
-        );
+        bodies.extend(sheet_body_obstacles(tree));
 
         let foreign_pins = index
             .placed_pins()
@@ -1529,6 +1640,7 @@ struct LocalLayoutCandidate {
     rank: usize,
     net: String,
     segments: Vec<Segment>,
+    sheet_pin_changes: Vec<SheetPinChange>,
     score: LocalLayoutScore,
     structural_signature: String,
 }
@@ -1549,9 +1661,10 @@ impl LocalLayoutCandidate {
             "planned_changes": {
                 "moved_item_uuids": [],
                 "rotated_or_mirrored_item_uuids": [],
-                "changed_sheet_pin_uuids": [],
+                "changed_sheet_pin_uuids": self.sheet_pin_changes.iter().map(|change| change.pin_uuid.clone()).collect::<Vec<_>>(),
                 "changed_or_routed_nets": [self.net]
             },
+            "sheet_pin_changes": self.sheet_pin_changes.iter().map(SheetPinChange::json).collect::<Vec<_>>(),
             "candidate_wire_topology": self.segments.iter().map(|segment| segment.json()).collect::<Vec<_>>(),
             "structural_signature": self.structural_signature
         })
@@ -1559,9 +1672,8 @@ impl LocalLayoutCandidate {
 }
 
 struct LocalLayoutPlanner<'a> {
-    tree: &'a konnect_sexp::SexpNode,
-    wires: &'a [Wire],
-    labels: &'a [Label],
+    before: &'a str,
+    schematic: &'a Path,
     net: &'a str,
     endpoints: &'a [NetEndpoint],
     strategy: &'a serde_json::Value,
@@ -1572,9 +1684,11 @@ struct LocalLayoutPlanner<'a> {
 
 impl<'a> LocalLayoutPlanner<'a> {
     fn new(
-        tree: &'a konnect_sexp::SexpNode,
-        wires: &'a [Wire],
-        labels: &'a [Label],
+        before: &'a str,
+        schematic: &'a Path,
+        _tree: &'a konnect_sexp::SexpNode,
+        _wires: &'a [Wire],
+        _labels: &'a [Label],
         net: &'a str,
         endpoints: &'a [NetEndpoint],
         args: &'a serde_json::Value,
@@ -1584,9 +1698,8 @@ impl<'a> LocalLayoutPlanner<'a> {
             .map(|endpoint| endpoint.grid)
             .unwrap_or(1.27);
         Self {
-            tree,
-            wires,
-            labels,
+            before,
+            schematic,
             net,
             endpoints,
             strategy: &args["strategy"],
@@ -1610,76 +1723,97 @@ impl<'a> LocalLayoutPlanner<'a> {
             )));
         }
 
-        let obstacles = MaterializeObstacles::build(
-            self.tree,
-            self.wires,
-            self.labels,
-            self.net,
-            self.endpoints,
-        );
-        let escaped_points = self
-            .endpoints
-            .iter()
-            .map(|endpoint| escaped_endpoint(endpoint, self.escape, &obstacles))
-            .collect::<Vec<_>>();
-        let mut points = escaped_points.clone();
-        points.sort_by(|a, b| a.partial_cmp(b).expect("finite endpoint coordinates"));
-        points.dedup_by(|a, b| points_coincident(a.0, a.1, b.0, b.1, 0.01));
-
-        let mut raw_candidates = Vec::new();
-        if points.len() == 2 {
-            raw_candidates.extend(two_point_candidates(points[0], points[1], &obstacles));
-        }
-        raw_candidates.extend(trunk_candidates(
-            &points,
-            orientation,
-            self.strategy,
-            &obstacles,
-        ));
-        raw_candidates.extend(trunk_candidates(
-            &points,
-            if orientation == "horizontal" {
-                "vertical"
-            } else {
-                "horizontal"
-            },
-            self.strategy,
-            &obstacles,
-        ));
-        if let Some(route) = obstacle_free_manhattan_route(&escaped_points, self.grid, &obstacles) {
-            raw_candidates.push(route);
-        }
-
         let mut by_signature: BTreeMap<String, LocalLayoutCandidate> = BTreeMap::new();
-        for candidate in raw_candidates {
-            if self.states_evaluated >= MAX_LAYOUT_STATES_EVALUATED {
-                break;
-            }
-            self.states_evaluated += 1;
-            let mut candidate = candidate;
-            candidate.extend(pin_escape_segments(self.endpoints, &escaped_points));
-            let segments = normalize_segments(candidate);
-            if segments.is_empty() || !segments.iter().all(|segment| obstacles.allows(*segment)) {
-                continue;
-            }
-            let score = local_layout_route_score(&segments, self.grid, &obstacles);
-            let signature = route_structural_signature(self.net, &segments);
-            let candidate_id = format!(
-                "layout-{}",
-                DocumentRevision::of(&format!("{LOCAL_LAYOUT_ALGORITHM_VERSION}\n{signature}"))
+        let mut obstacle_counts = (0usize, 0usize, 0usize);
+        for sheet_pin_changes in self.sheet_pin_layout_states()? {
+            let state_content =
+                apply_sheet_pin_changes_to_content(self.schematic, self.before, &sheet_pin_changes)
+                    .map_err(|error| CallToolResult::error(error.to_string()))?;
+            let state_tree = parse_sexp(&state_content)
+                .map_err(|error| CallToolResult::error(error.to_string()))?;
+            let state_wires = extract_wires(&state_tree);
+            let state_labels = konnect_sexp::schematic::extract_all_net_labels(&state_tree);
+            let state_endpoints =
+                endpoints_with_sheet_pin_changes(self.endpoints, &sheet_pin_changes);
+            let obstacles = MaterializeObstacles::build(
+                &state_tree,
+                &state_wires,
+                &state_labels,
+                self.net,
+                &state_endpoints,
             );
-            let entry = LocalLayoutCandidate {
-                candidate_id,
-                rank: 0,
-                net: self.net.to_string(),
-                segments,
-                score,
-                structural_signature: signature.clone(),
-            };
-            match by_signature.get(&signature) {
-                Some(existing) if local_layout_candidate_cmp(&entry, existing).is_ge() => {}
-                _ => {
-                    by_signature.insert(signature, entry);
+            obstacle_counts = (
+                obstacle_counts.0.max(obstacles.bodies.len()),
+                obstacle_counts.1.max(obstacles.foreign_pins.len()),
+                obstacle_counts.2.max(obstacles.foreign_wires.len()),
+            );
+            let escaped_points = state_endpoints
+                .iter()
+                .map(|endpoint| escaped_endpoint(endpoint, self.escape, &obstacles))
+                .collect::<Vec<_>>();
+            let mut points = escaped_points.clone();
+            points.sort_by(|a, b| a.partial_cmp(b).expect("finite endpoint coordinates"));
+            points.dedup_by(|a, b| points_coincident(a.0, a.1, b.0, b.1, 0.01));
+
+            let mut raw_candidates = Vec::new();
+            if points.len() == 2 {
+                raw_candidates.extend(two_point_candidates(points[0], points[1], &obstacles));
+            }
+            raw_candidates.extend(trunk_candidates(
+                &points,
+                orientation,
+                self.strategy,
+                &obstacles,
+            ));
+            raw_candidates.extend(trunk_candidates(
+                &points,
+                if orientation == "horizontal" {
+                    "vertical"
+                } else {
+                    "horizontal"
+                },
+                self.strategy,
+                &obstacles,
+            ));
+            if let Some(route) =
+                obstacle_free_manhattan_route(&escaped_points, self.grid, &obstacles)
+            {
+                raw_candidates.push(route);
+            }
+
+            for candidate in raw_candidates {
+                if self.states_evaluated >= MAX_LAYOUT_STATES_EVALUATED {
+                    break;
+                }
+                self.states_evaluated += 1;
+                let mut candidate = candidate;
+                candidate.extend(pin_escape_segments(&state_endpoints, &escaped_points));
+                let segments = normalize_segments(candidate);
+                if segments.is_empty() || !segments.iter().all(|segment| obstacles.allows(*segment))
+                {
+                    continue;
+                }
+                let mut score = local_layout_route_score(&segments, self.grid, &obstacles);
+                score.sheet_pin_side_changes = sheet_pin_changes.len();
+                let signature = route_structural_signature(self.net, &segments, &sheet_pin_changes);
+                let candidate_id = format!(
+                    "layout-{}",
+                    DocumentRevision::of(&format!("{LOCAL_LAYOUT_ALGORITHM_VERSION}\n{signature}"))
+                );
+                let entry = LocalLayoutCandidate {
+                    candidate_id,
+                    rank: 0,
+                    net: self.net.to_string(),
+                    segments,
+                    sheet_pin_changes: sheet_pin_changes.clone(),
+                    score,
+                    structural_signature: signature.clone(),
+                };
+                match by_signature.get(&signature) {
+                    Some(existing) if local_layout_candidate_cmp(&entry, existing).is_ge() => {}
+                    _ => {
+                        by_signature.insert(signature, entry);
+                    }
                 }
             }
         }
@@ -1699,15 +1833,25 @@ impl<'a> LocalLayoutPlanner<'a> {
                     "routing_grid": self.grid,
                     "states_evaluated": self.states_evaluated,
                     "obstacles": {
-                        "symbol_bodies": obstacles.bodies.len(),
-                        "foreign_pins": obstacles.foreign_pins.len(),
-                        "foreign_wires": obstacles.foreign_wires.len()
+                        "symbol_bodies": obstacle_counts.0,
+                        "foreign_pins": obstacle_counts.1,
+                        "foreign_wires": obstacle_counts.2
                     }
                 })
                 .to_string(),
             ));
         }
         Ok(candidates)
+    }
+
+    fn sheet_pin_layout_states(&self) -> Result<Vec<Vec<SheetPinChange>>, CallToolResult> {
+        let mut states = vec![Vec::new()];
+        let changes =
+            peer_facing_sheet_pin_changes(self.before, self.schematic, self.endpoints, self.grid)?;
+        if !changes.is_empty() {
+            states.push(changes);
+        }
+        Ok(states)
     }
 }
 
@@ -1751,8 +1895,354 @@ fn local_layout_route_score(
     }
 }
 
-fn route_structural_signature(net: &str, segments: &[Segment]) -> String {
+fn endpoints_with_sheet_pin_changes(
+    endpoints: &[NetEndpoint],
+    changes: &[SheetPinChange],
+) -> Vec<NetEndpoint> {
+    endpoints
+        .iter()
+        .cloned()
+        .map(|mut endpoint| {
+            if let NetEndpointKind::SheetPin { pin_uuid, .. } = &endpoint.kind {
+                if let Some(change) = changes.iter().find(|change| &change.pin_uuid == pin_uuid) {
+                    endpoint.x = change.to_x;
+                    endpoint.y = change.to_y;
+                    endpoint.orientation_degrees = change.rotation;
+                    endpoint.on_grid = point_on_grid(change.to_x, change.to_y, endpoint.grid);
+                    endpoint.nearest_grid_x = snap_point(change.to_x, change.to_y, endpoint.grid).0;
+                    endpoint.nearest_grid_y = snap_point(change.to_x, change.to_y, endpoint.grid).1;
+                }
+            }
+            endpoint
+        })
+        .collect()
+}
+
+fn apply_sheet_pin_changes_to_content(
+    schematic: &Path,
+    content: &str,
+    changes: &[SheetPinChange],
+) -> anyhow::Result<String> {
+    if changes.is_empty() {
+        return Ok(content.to_string());
+    }
+    let mut sch = write_temp_and_load(schematic, content)?;
+    for change in changes {
+        let sheet = sch
+            .sheets
+            .by_uuid_mut(&change.sheet_uuid)
+            .ok_or_else(|| anyhow::anyhow!("Sheet '{}' not found", change.sheet_uuid))?;
+        let pin = sheet
+            .pins
+            .iter_mut()
+            .find(|pin| pin.uuid == change.pin_uuid)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Pin '{}' not found on sheet '{}'",
+                    change.pin_uuid,
+                    change.sheet_uuid
+                )
+            })?;
+        pin.at.x = change.to_x;
+        pin.at.y = change.to_y;
+        pin.at.rotation = Some(change.rotation);
+    }
+    Ok(sch.to_source())
+}
+
+fn peer_facing_sheet_pin_changes(
+    before: &str,
+    schematic: &Path,
+    endpoints: &[NetEndpoint],
+    grid: f64,
+) -> Result<Vec<SheetPinChange>, CallToolResult> {
+    let sch = write_temp_and_load(schematic, before)
+        .map_err(|error| CallToolResult::error(error.to_string()))?;
+    let mut sheet_endpoints = endpoints
+        .iter()
+        .filter_map(|endpoint| match &endpoint.kind {
+            NetEndpointKind::SheetPin {
+                sheet_uuid,
+                sheet_name,
+                pin_uuid,
+            } => Some((
+                sheet_uuid.clone(),
+                sheet_name.clone(),
+                pin_uuid.clone(),
+                endpoint.pin_name.clone(),
+            )),
+            NetEndpointKind::ComponentPin => None,
+        })
+        .collect::<Vec<_>>();
+    sheet_endpoints.sort();
+    sheet_endpoints.dedup();
+    if sheet_endpoints.len() < 2 {
+        return Ok(Vec::new());
+    }
+
+    let mut raw_changes = Vec::new();
+    for (sheet_uuid, sheet_name, pin_uuid, pin_name) in &sheet_endpoints {
+        let Some(sheet) = sch.sheets.by_uuid(sheet_uuid) else {
+            continue;
+        };
+        let Some(peer) = sheet_endpoints
+            .iter()
+            .filter(|(peer_uuid, _, _, _)| peer_uuid != sheet_uuid)
+            .filter_map(|(peer_uuid, _, _, _)| sch.sheets.by_uuid(peer_uuid))
+            .min_by(|a, b| {
+                sheet_center_distance(sheet, a)
+                    .partial_cmp(&sheet_center_distance(sheet, b))
+                    .expect("finite sheet distance")
+            })
+        else {
+            continue;
+        };
+        let desired = peer_facing_side(sheet, peer);
+        let Some(pin) = sheet.pins.iter().find(|pin| pin.uuid == *pin_uuid) else {
+            continue;
+        };
+        let Some(current) = sheet_pin_side(sheet, pin.at.x, pin.at.y) else {
+            continue;
+        };
+        if current == desired {
+            continue;
+        }
+        raw_changes.push((
+            sheet_uuid.clone(),
+            sheet_name.clone(),
+            pin_uuid.clone(),
+            pin_name.clone(),
+            desired,
+        ));
+    }
+    if raw_changes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut by_sheet_side: BTreeMap<(String, SheetPinSide), Vec<(String, String, String)>> =
+        BTreeMap::new();
+    for (sheet_uuid, sheet_name, pin_uuid, pin_name, desired) in raw_changes {
+        by_sheet_side
+            .entry((sheet_uuid, desired))
+            .or_default()
+            .push((sheet_name, pin_uuid, pin_name));
+    }
+
+    let mut changes = Vec::new();
+    for ((sheet_uuid, side), mut pins) in by_sheet_side {
+        let sheet = sch
+            .sheets
+            .by_uuid(&sheet_uuid)
+            .ok_or_else(|| CallToolResult::error(format!("Sheet '{sheet_uuid}' not found")))?;
+        pins.sort_by(|(_, a_uuid, a_name), (_, b_uuid, b_name)| {
+            let a_pin = sheet.pins.iter().find(|pin| pin.uuid == *a_uuid);
+            let b_pin = sheet.pins.iter().find(|pin| pin.uuid == *b_uuid);
+            let a_axis = a_pin
+                .map(|pin| sheet_pin_order_axis(pin, side))
+                .unwrap_or(0.0);
+            let b_axis = b_pin
+                .map(|pin| sheet_pin_order_axis(pin, side))
+                .unwrap_or(0.0);
+            a_axis
+                .partial_cmp(&b_axis)
+                .expect("finite sheet pin order")
+                .then_with(|| a_name.cmp(b_name))
+                .then_with(|| a_uuid.cmp(b_uuid))
+        });
+        let occupied = sheet
+            .pins
+            .iter()
+            .filter(|pin| {
+                !pins.iter().any(|(_, uuid, _)| uuid == &pin.uuid)
+                    && sheet_pin_side(sheet, pin.at.x, pin.at.y) == Some(side)
+            })
+            .map(|pin| sheet_pin_order_axis(pin, side))
+            .collect::<Vec<_>>();
+        let desired_axes = pins
+            .iter()
+            .map(|(_, uuid, _)| {
+                sheet
+                    .pins
+                    .iter()
+                    .find(|pin| pin.uuid == *uuid)
+                    .map(|pin| sheet_pin_order_axis(pin, side))
+                    .unwrap_or(0.0)
+            })
+            .collect::<Vec<_>>();
+        let placed_axes = nearest_legal_edge_axes(sheet, side, &desired_axes, &occupied, grid);
+        for ((sheet_name, pin_uuid, pin_name), axis) in pins.into_iter().zip(placed_axes) {
+            let pin = sheet
+                .pins
+                .iter()
+                .find(|pin| pin.uuid == pin_uuid)
+                .ok_or_else(|| {
+                    CallToolResult::error(format!(
+                        "Pin '{pin_uuid}' not found on sheet '{sheet_uuid}'"
+                    ))
+                })?;
+            let from_side = sheet_pin_side(sheet, pin.at.x, pin.at.y).ok_or_else(|| {
+                CallToolResult::error(format!(
+                    "Pin '{}' on sheet '{}' is not on a sheet edge",
+                    pin.name, sheet_name
+                ))
+            })?;
+            let (to_x, to_y) = sheet_pin_position_on_side(sheet, side, axis);
+            changes.push(SheetPinChange {
+                sheet_uuid: sheet_uuid.clone(),
+                sheet_name,
+                pin_uuid,
+                pin_name,
+                from_side,
+                to_side: side,
+                from_x: pin.at.x,
+                from_y: pin.at.y,
+                to_x,
+                to_y,
+                rotation: side.rotation(),
+            });
+        }
+    }
+    changes.sort_by(|a, b| {
+        a.sheet_uuid
+            .cmp(&b.sheet_uuid)
+            .then_with(|| a.pin_uuid.cmp(&b.pin_uuid))
+    });
+    Ok(changes)
+}
+
+fn sheet_center(sheet: &cse::Sheet) -> (f64, f64) {
+    (
+        sheet.at.x + sheet.width / 2.0,
+        sheet.at.y + sheet.height / 2.0,
+    )
+}
+
+fn sheet_center_distance(a: &cse::Sheet, b: &cse::Sheet) -> f64 {
+    let (ax, ay) = sheet_center(a);
+    let (bx, by) = sheet_center(b);
+    (ax - bx).abs() + (ay - by).abs()
+}
+
+fn peer_facing_side(sheet: &cse::Sheet, peer: &cse::Sheet) -> SheetPinSide {
+    let (sx, sy) = sheet_center(sheet);
+    let (px, py) = sheet_center(peer);
+    let dx = px - sx;
+    let dy = py - sy;
+    if dx.abs() >= dy.abs() {
+        if dx > 0.0 {
+            SheetPinSide::Right
+        } else {
+            SheetPinSide::Left
+        }
+    } else if dy > 0.0 {
+        SheetPinSide::Bottom
+    } else {
+        SheetPinSide::Top
+    }
+}
+
+fn sheet_pin_side(sheet: &cse::Sheet, x: f64, y: f64) -> Option<SheetPinSide> {
+    if (x - sheet.at.x).abs() < 0.01
+        && y >= sheet.at.y - 0.01
+        && y <= sheet.at.y + sheet.height + 0.01
+    {
+        Some(SheetPinSide::Left)
+    } else if (x - (sheet.at.x + sheet.width)).abs() < 0.01
+        && y >= sheet.at.y - 0.01
+        && y <= sheet.at.y + sheet.height + 0.01
+    {
+        Some(SheetPinSide::Right)
+    } else if (y - sheet.at.y).abs() < 0.01
+        && x >= sheet.at.x - 0.01
+        && x <= sheet.at.x + sheet.width + 0.01
+    {
+        Some(SheetPinSide::Top)
+    } else if (y - (sheet.at.y + sheet.height)).abs() < 0.01
+        && x >= sheet.at.x - 0.01
+        && x <= sheet.at.x + sheet.width + 0.01
+    {
+        Some(SheetPinSide::Bottom)
+    } else {
+        None
+    }
+}
+
+fn sheet_pin_order_axis(pin: &cse::SheetPin, side: SheetPinSide) -> f64 {
+    if side.is_vertical_edge() {
+        pin.at.y
+    } else {
+        pin.at.x
+    }
+}
+
+fn sheet_pin_position_on_side(sheet: &cse::Sheet, side: SheetPinSide, axis: f64) -> (f64, f64) {
+    match side {
+        SheetPinSide::Left => (sheet.at.x, axis),
+        SheetPinSide::Right => (sheet.at.x + sheet.width, axis),
+        SheetPinSide::Top => (axis, sheet.at.y),
+        SheetPinSide::Bottom => (axis, sheet.at.y + sheet.height),
+    }
+}
+
+fn nearest_legal_edge_axes(
+    sheet: &cse::Sheet,
+    side: SheetPinSide,
+    desired_axes: &[f64],
+    occupied_axes: &[f64],
+    grid: f64,
+) -> Vec<f64> {
+    let (min_axis, max_axis) = if side.is_vertical_edge() {
+        (sheet.at.y + grid, sheet.at.y + sheet.height - grid)
+    } else {
+        (sheet.at.x + grid, sheet.at.x + sheet.width - grid)
+    };
+    let min_i = grid_index(min_axis, grid);
+    let max_i = grid_index(max_axis, grid);
+    let mut used = occupied_axes
+        .iter()
+        .map(|axis| grid_index(*axis, grid))
+        .collect::<HashSet<_>>();
+    let mut out = Vec::new();
+    for desired in desired_axes {
+        let preferred = grid_index((*desired).clamp(min_axis, max_axis), grid);
+        let mut chosen = None;
+        for delta in 0..=(max_i - min_i).abs() + desired_axes.len() as i64 + 2 {
+            for candidate in [preferred - delta, preferred + delta] {
+                if candidate < min_i || candidate > max_i || used.contains(&candidate) {
+                    continue;
+                }
+                chosen = Some(candidate);
+                break;
+            }
+            if chosen.is_some() {
+                break;
+            }
+        }
+        let chosen = chosen.unwrap_or(preferred.clamp(min_i, max_i));
+        used.insert(chosen);
+        out.push(grid_coord(chosen, grid));
+    }
+    out
+}
+
+fn route_structural_signature(
+    net: &str,
+    segments: &[Segment],
+    changes: &[SheetPinChange],
+) -> String {
     let mut material = net.to_string();
+    for change in changes {
+        material.push('\n');
+        material.push_str(&format!(
+            "sheet-pin:{}:{}:{}:{}:{}:{}",
+            change.sheet_uuid,
+            change.pin_uuid,
+            change.from_side.as_str(),
+            change.to_side.as_str(),
+            cse::types::fmt_f64(change.to_x),
+            cse::types::fmt_f64(change.to_y)
+        ));
+    }
     for segment in segments {
         material.push('\n');
         material.push_str(&segment.normalized().json().to_string());
@@ -2675,6 +3165,7 @@ fn materialize_plan_revision(
     before: &str,
     net: &str,
     segments: &[Segment],
+    sheet_pin_changes: &[SheetPinChange],
     remove_redundant_local_labels: bool,
     endpoints: &[NetEndpoint],
 ) -> String {
@@ -2691,6 +3182,10 @@ fn materialize_plan_revision(
     for endpoint in endpoints {
         material.push('\n');
         material.push_str(&endpoint.key());
+    }
+    for change in sheet_pin_changes {
+        material.push('\n');
+        material.push_str(&change.json().to_string());
     }
     for segment in segments {
         material.push('\n');
@@ -3798,6 +4293,7 @@ fn net_endpoints_for(
         }
         if graph.net_at(placed.at.0, placed.at.1).as_deref() == Some(net) {
             endpoints.push(NetEndpoint {
+                kind: NetEndpointKind::ComponentPin,
                 reference: placed.reference.clone(),
                 unit: placed.unit,
                 pin_number: placed.pin.number.clone(),
@@ -3818,8 +4314,76 @@ fn net_endpoints_for(
             });
         }
     }
+    if selected_keys.is_none() {
+        endpoints.extend(sheet_pin_endpoints_for(tree, &mut graph, net, grid));
+    }
     endpoints.sort_by(|a, b| a.key().cmp(&b.key()));
     Ok(endpoints)
+}
+
+fn sheet_pin_endpoints_for(
+    tree: &konnect_sexp::SexpNode,
+    graph: &mut crate::tools::sch_connectivity::NetGraph,
+    net: &str,
+    grid: f64,
+) -> Vec<NetEndpoint> {
+    let mut endpoints = Vec::new();
+    for sheet_node in tree.find_all("sheet") {
+        let Some((sheet_x, sheet_y, _)) = parse_at(sheet_node) else {
+            continue;
+        };
+        let Some(size) = sheet_node.find("size") else {
+            continue;
+        };
+        let (Some(width), Some(height)) = (size.get_f64(1), size.get_f64(2)) else {
+            continue;
+        };
+        let Some(sheet_uuid) = sheet_node.find_str("uuid") else {
+            continue;
+        };
+        let sheet_name = property_value_in_node(sheet_node, "Sheetname").unwrap_or(sheet_uuid);
+        for pin_node in sheet_node.find_all("pin") {
+            let Some(pin_name) = pin_node.get(1).and_then(|node| node.as_str()) else {
+                continue;
+            };
+            let Some((pin_x, pin_y, rotation)) = parse_at(pin_node) else {
+                continue;
+            };
+            let Some(pin_uuid) = pin_node.find_str("uuid") else {
+                continue;
+            };
+            if pin_x < sheet_x - 0.01
+                || pin_x > sheet_x + width + 0.01
+                || pin_y < sheet_y - 0.01
+                || pin_y > sheet_y + height + 0.01
+            {
+                continue;
+            }
+            if graph.net_at(pin_x, pin_y).as_deref() != Some(net) {
+                continue;
+            }
+            endpoints.push(NetEndpoint {
+                kind: NetEndpointKind::SheetPin {
+                    sheet_uuid: sheet_uuid.to_string(),
+                    sheet_name: sheet_name.to_string(),
+                    pin_uuid: pin_uuid.to_string(),
+                },
+                reference: sheet_name.to_string(),
+                unit: 0,
+                pin_number: pin_name.to_string(),
+                pin_name: pin_name.to_string(),
+                x: pin_x,
+                y: pin_y,
+                orientation_degrees: rotation,
+                grid,
+                on_grid: point_on_grid(pin_x, pin_y, grid),
+                nearest_grid_x: snap_point(pin_x, pin_y, grid).0,
+                nearest_grid_y: snap_point(pin_x, pin_y, grid).1,
+                attachment_depends_on_off_grid_position: false,
+            });
+        }
+    }
+    endpoints
 }
 
 fn apply_segments(content: String, segments: &[Segment]) -> anyhow::Result<String> {
@@ -7295,6 +7859,96 @@ mod materialize_net_tests {
         )
     }
 
+    fn horizontal_sheet_fixture(
+        name: &str,
+        right_side_correct: bool,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("{name}.kicad_sch"));
+        let (right_x, right_rot, wire_right_x) = if right_side_correct {
+            (90.0, 180.0, 90.0)
+        } else {
+            (120.0, 0.0, 120.0)
+        };
+        std::fs::write(
+            &path,
+            format!(
+                r#"(kicad_sch
+  (version 20250610)
+  (generator "konnect-test")
+  (uuid "root")
+  (paper "A4")
+  (lib_symbols)
+  (sheet (at 20 20) (size 30 30) (uuid "left-sheet")
+    (property "Sheetname" "LEFT" (at 20 19 0))
+    (property "Sheetfile" "left.kicad_sch" (at 20 51 0))
+    (pin "SIG_A" output (at 50 25 0) (uuid "left-a"))
+    (pin "SIG_B" output (at 50 30 0) (uuid "left-b"))
+    (pin "SIG_C" output (at 50 35 0) (uuid "left-c"))
+    (pin "KEEP" output (at 20 45 180) (uuid "left-keep"))
+  )
+  (sheet (at 90 20) (size 30 30) (uuid "right-sheet")
+    (property "Sheetname" "RIGHT" (at 90 19 0))
+    (property "Sheetfile" "right.kicad_sch" (at 90 51 0))
+    (pin "SIG_A" input (at {right_x} 25 {right_rot}) (uuid "right-a"))
+    (pin "SIG_B" input (at {right_x} 30 {right_rot}) (uuid "right-b"))
+    (pin "SIG_C" input (at {right_x} 35 {right_rot}) (uuid "right-c"))
+    (pin "KEEP" input (at 120 45 0) (uuid "right-keep"))
+  )
+  (label "SIG_A" (at 55 25 0) (effects (font (size 1.27 1.27)) (justify left bottom)) (uuid "label-a"))
+  (label "SIG_B" (at 55 30 0) (effects (font (size 1.27 1.27)) (justify left bottom)) (uuid "label-b"))
+  (label "SIG_C" (at 55 35 0) (effects (font (size 1.27 1.27)) (justify left bottom)) (uuid "label-c"))
+  (wire (pts (xy 50 25) (xy {wire_right_x} 25)) (uuid "wire-a"))
+  (wire (pts (xy 50 30) (xy {wire_right_x} 30)) (uuid "wire-b"))
+  (wire (pts (xy 50 35) (xy {wire_right_x} 35)) (uuid "wire-c"))
+)"#
+            ),
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    fn vertical_sheet_fixture(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("{name}.kicad_sch"));
+        std::fs::write(
+            &path,
+            r#"(kicad_sch
+  (version 20250610)
+  (generator "konnect-test")
+  (uuid "root")
+  (paper "A4")
+  (lib_symbols)
+  (sheet (at 40 20) (size 30 30) (uuid "top-sheet")
+    (property "Sheetname" "TOP" (at 40 19 0))
+    (property "Sheetfile" "top.kicad_sch" (at 40 51 0))
+    (pin "SIG_V" output (at 45 50 270) (uuid "top-v"))
+  )
+  (sheet (at 40 90) (size 30 30) (uuid "bottom-sheet")
+    (property "Sheetname" "BOTTOM" (at 40 89 0))
+    (property "Sheetfile" "bottom.kicad_sch" (at 40 121 0))
+    (pin "SIG_V" input (at 45 120 270) (uuid "bottom-v"))
+  )
+  (label "SIG_V" (at 45 60 0) (effects (font (size 1.27 1.27)) (justify left bottom)) (uuid "label-v"))
+  (wire (pts (xy 45 50) (xy 45 120)) (uuid "wire-v"))
+)"#,
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    fn sheet_pin_at(content: &str, uuid: &str) -> (f64, f64, f64) {
+        let tree = parse_sexp(content).unwrap();
+        for sheet in tree.find_all("sheet") {
+            for pin in sheet.find_all("pin") {
+                if pin.find_str("uuid") == Some(uuid) {
+                    return parse_at(pin).unwrap();
+                }
+            }
+        }
+        panic!("sheet pin {uuid} not found");
+    }
+
     fn placed_power(net: &str, reference: &str, x: f64, y: f64, uuid: &str) -> String {
         format!(
             r##"  (symbol
@@ -8070,6 +8724,202 @@ mod materialize_net_tests {
             first["candidates"][0]["validation"]["foreign_conductive_contacts"],
             json!(0)
         );
+    }
+
+    #[tokio::test]
+    async fn optimize_schematic_layout_offers_horizontal_peer_facing_sheet_pin_state() {
+        let (_dir, path) = horizontal_sheet_fixture("sheet_horizontal", false);
+        let args = json!({
+            "schematic": path.display().to_string(),
+            "net_names": ["SIG_A"],
+            "candidate_count": 5,
+            "dry_run": true
+        });
+        let result = handle_optimize_schematic_layout(&args, &test_ctx())
+            .await
+            .unwrap();
+        assert!(!result.is_error, "{}", result_text(&result));
+        let body = result_json(&result);
+        let candidate = body["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| {
+                !candidate["sheet_pin_changes"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            })
+            .expect("expected a sheet-pin side candidate");
+        let changes = candidate["sheet_pin_changes"].as_array().unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0]["pin_uuid"], json!("right-a"));
+        assert_eq!(changes[0]["from_side"], json!("RIGHT"));
+        assert_eq!(changes[0]["to_side"], json!("LEFT"));
+        assert_eq!(changes[0]["to"], json!({"x": 90.0, "y": 25.4}));
+        assert_eq!(
+            candidate["score_breakdown"]["sheet_pin_side_changes"],
+            json!(1)
+        );
+        assert!(candidate["structural_signature"]
+            .as_str()
+            .unwrap()
+            .contains("sheet-pin:right-sheet:right-a:RIGHT:LEFT"));
+    }
+
+    #[tokio::test]
+    async fn optimize_schematic_layout_applies_selected_sheet_pin_state() {
+        let (_dir, path) = horizontal_sheet_fixture("sheet_apply", false);
+        let dry_args = json!({
+            "schematic": path.display().to_string(),
+            "net_names": ["SIG_A"],
+            "candidate_count": 5,
+            "dry_run": true
+        });
+        let dry = handle_optimize_schematic_layout(&dry_args, &test_ctx())
+            .await
+            .unwrap();
+        assert!(!dry.is_error, "{}", result_text(&dry));
+        let dry_body = result_json(&dry);
+        let candidate = dry_body["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| {
+                !candidate["sheet_pin_changes"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            })
+            .unwrap();
+        let apply_args = json!({
+            "schematic": path.display().to_string(),
+            "net_names": ["SIG_A"],
+            "candidate_count": 5,
+            "candidate_id": candidate["candidate_id"],
+            "plan_revision": dry_body["plan_revision"],
+            "dry_run": false
+        });
+        let applied = handle_optimize_schematic_layout(&apply_args, &test_ctx())
+            .await
+            .unwrap();
+        assert!(!applied.is_error, "{}", result_text(&applied));
+        let content = std::fs::read_to_string(path).unwrap();
+        assert_eq!(sheet_pin_at(&content, "right-a"), (90.0, 25.4, 180.0));
+        assert_eq!(sheet_pin_at(&content, "right-keep"), (120.0, 45.0, 0.0));
+    }
+
+    #[tokio::test]
+    async fn materialize_schematic_net_uses_sheet_pin_side_candidate() {
+        let (_dir, path) = horizontal_sheet_fixture("sheet_materialize", false);
+        let result = handle_materialize_schematic_net(
+            &json!({
+                "schematic": path.display().to_string(),
+                "net": "SIG_A",
+                "dry_run": true
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{}", result_text(&result));
+        let body = result_json(&result);
+        let changes = body["candidate_sheet_pin_changes"].as_array().unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0]["pin_uuid"], json!("right-a"));
+        assert_eq!(changes[0]["to_side"], json!("LEFT"));
+        assert!(body["plan_revision"]
+            .as_str()
+            .unwrap()
+            .starts_with("materialize-schematic-net:"));
+    }
+
+    #[tokio::test]
+    async fn optimize_schematic_layout_offers_vertical_peer_facing_sheet_pin_state() {
+        let (_dir, path) = vertical_sheet_fixture("sheet_vertical");
+        let args = json!({
+            "schematic": path.display().to_string(),
+            "net_names": ["SIG_V"],
+            "candidate_count": 5,
+            "dry_run": true
+        });
+        let result = handle_optimize_schematic_layout(&args, &test_ctx())
+            .await
+            .unwrap();
+        assert!(!result.is_error, "{}", result_text(&result));
+        let body = result_json(&result);
+        let candidate = body["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| {
+                !candidate["sheet_pin_changes"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            })
+            .expect("expected a sheet-pin side candidate");
+        let changes = candidate["sheet_pin_changes"].as_array().unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0]["pin_uuid"], json!("bottom-v"));
+        assert_eq!(changes[0]["from_side"], json!("BOTTOM"));
+        assert_eq!(changes[0]["to_side"], json!("TOP"));
+        assert_eq!(changes[0]["to"], json!({"x": 44.45, "y": 90.0}));
+    }
+
+    #[tokio::test]
+    async fn already_correct_sheet_pins_do_not_create_side_state() {
+        let (_dir, path) = horizontal_sheet_fixture("sheet_correct", true);
+        let args = json!({
+            "schematic": path.display().to_string(),
+            "net_names": ["SIG_A"],
+            "candidate_count": 5,
+            "dry_run": true
+        });
+        let result = handle_optimize_schematic_layout(&args, &test_ctx())
+            .await
+            .unwrap();
+        assert!(!result.is_error, "{}", result_text(&result));
+        let body = result_json(&result);
+        assert!(body["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|candidate| candidate["sheet_pin_changes"]
+                .as_array()
+                .unwrap()
+                .is_empty()));
+    }
+
+    #[test]
+    fn multi_signal_sheet_peer_interface_moves_coherently() {
+        let (_dir, path) = horizontal_sheet_fixture("sheet_multi", false);
+        let (before, tree) = read_schematic(&path).unwrap();
+        let wires = extract_wires(&tree);
+        let labels = konnect_sexp::schematic::extract_all_net_labels(&tree);
+        let grid = 1.27;
+        let mut endpoints = Vec::new();
+        for net in ["SIG_A", "SIG_B", "SIG_C"] {
+            endpoints.extend(net_endpoints_for(&tree, net, &json!({}), grid).unwrap());
+        }
+        let changes = peer_facing_sheet_pin_changes(&before, &path, &endpoints, grid).unwrap();
+        assert_eq!(
+            changes
+                .iter()
+                .map(|change| change.pin_uuid.as_str())
+                .collect::<Vec<_>>(),
+            vec!["right-a", "right-b", "right-c"]
+        );
+        assert!(changes
+            .iter()
+            .all(|change| change.to_side == SheetPinSide::Left));
+        assert_eq!(
+            changes.iter().map(|change| change.to_y).collect::<Vec<_>>(),
+            vec![25.4, 30.48, 35.56]
+        );
+        assert!(!changes.iter().any(|change| change.pin_uuid == "right-keep"));
+        assert!(!wires.is_empty());
+        assert!(!labels.is_empty());
     }
 
     #[tokio::test]
