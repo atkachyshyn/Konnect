@@ -1091,9 +1091,32 @@ fn materialize_segments(
         }
     }
 
-    Err(CallToolResult::error(format!(
-        "no obstacle-safe Manhattan materialization route found for net '{net}'"
-    )))
+    if let Some(mut fallback) = obstacle_free_manhattan_route(
+        &escaped_points,
+        endpoints.first().map(|e| e.grid).unwrap_or(1.27),
+        &obstacles,
+    ) {
+        fallback.extend(pin_escape_segments(endpoints, &escaped_points));
+        let out = normalize_segments(fallback);
+        if !out.is_empty() && out.iter().all(|segment| obstacles.allows(*segment)) {
+            return Ok(out);
+        }
+    }
+
+    Err(CallToolResult::error(
+        json!({
+            "reason": "no_obstacle_free_route",
+            "net": net,
+            "endpoint_count": endpoints.len(),
+            "routing_grid": endpoints.first().map(|endpoint| endpoint.grid).unwrap_or(1.27),
+            "obstacles": {
+                "symbol_bodies": obstacles.bodies.len(),
+                "foreign_pins": obstacles.foreign_pins.len(),
+                "foreign_wires": obstacles.foreign_wires.len()
+            }
+        })
+        .to_string(),
+    ))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1226,6 +1249,278 @@ impl MaterializeObstacles {
                 .iter()
                 .any(|wire| segments_intersect(segment, *wire))
     }
+}
+
+fn obstacle_free_manhattan_route(
+    points: &[(f64, f64)],
+    grid: f64,
+    obstacles: &MaterializeObstacles,
+) -> Option<Vec<Segment>> {
+    let mut gateways = Vec::new();
+    let mut gateway_segments = Vec::new();
+    for &point in points {
+        let gateway = if point_on_grid(point.0, point.1, grid) {
+            point
+        } else {
+            let snapped = snap_point(point.0, point.1, grid);
+            let mut candidates = two_point_candidates(point, snapped, obstacles);
+            candidates.sort_by(candidate_route_cmp);
+            let candidate = candidates
+                .into_iter()
+                .find(|segments| segments.iter().all(|segment| obstacles.allows(*segment)))?;
+            gateway_segments.extend(candidate);
+            snapped
+        };
+        gateways.push(gateway);
+    }
+    gateways.sort_by(|a, b| a.partial_cmp(b).expect("finite route point"));
+    gateways.dedup_by(|a, b| points_coincident(a.0, a.1, b.0, b.1, 0.01));
+    if gateways.len() < 2 {
+        return Some(normalize_segments(gateway_segments));
+    }
+
+    let mut tree_points = vec![gateways[0]];
+    let mut tree_segments = Vec::new();
+    for &target in gateways.iter().skip(1) {
+        let mut choices = tree_points
+            .iter()
+            .filter_map(|&tree_point| {
+                grid_search_route(target, tree_point, grid, obstacles)
+                    .map(|route| (tree_point, route))
+            })
+            .collect::<Vec<_>>();
+        choices.sort_by(|(_, a), (_, b)| candidate_route_cmp(a, b));
+        let (_, route) = choices.into_iter().next()?;
+        for segment in &route {
+            tree_points.push((segment.x1, segment.y1));
+            tree_points.push((segment.x2, segment.y2));
+        }
+        tree_segments.extend(route);
+        tree_points.sort_by(|a, b| a.partial_cmp(b).expect("finite tree point"));
+        tree_points.dedup_by(|a, b| points_coincident(a.0, a.1, b.0, b.1, 0.01));
+    }
+    gateway_segments.extend(tree_segments);
+    let out = normalize_segments(gateway_segments);
+    if out.iter().all(|segment| obstacles.allows(*segment)) {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+fn candidate_route_cmp(a: &Vec<Segment>, b: &Vec<Segment>) -> std::cmp::Ordering {
+    route_score(a).cmp(&route_score(b))
+}
+
+fn route_score(segments: &[Segment]) -> (usize, i64, i64, i64) {
+    let bends = route_bends(segments);
+    let length = segments
+        .iter()
+        .map(|s| ((s.x1 - s.x2).abs() + (s.y1 - s.y2).abs()) * 1000.0)
+        .sum::<f64>()
+        .round() as i64;
+    let min_x = segments
+        .iter()
+        .flat_map(|s| [s.x1, s.x2])
+        .fold(f64::INFINITY, f64::min);
+    let min_y = segments
+        .iter()
+        .flat_map(|s| [s.y1, s.y2])
+        .fold(f64::INFINITY, f64::min);
+    (
+        bends,
+        length,
+        (min_x * 1000.0).round() as i64,
+        (min_y * 1000.0).round() as i64,
+    )
+}
+
+fn route_bends(segments: &[Segment]) -> usize {
+    segments
+        .windows(2)
+        .filter(|pair| segment_direction(pair[0]) != segment_direction(pair[1]))
+        .count()
+}
+
+fn segment_direction(segment: Segment) -> u8 {
+    if (segment.x1 - segment.x2).abs() < 0.01 {
+        1
+    } else {
+        0
+    }
+}
+
+fn grid_search_route(
+    start: (f64, f64),
+    goal: (f64, f64),
+    grid: f64,
+    obstacles: &MaterializeObstacles,
+) -> Option<Vec<Segment>> {
+    let sx = grid_index(start.0, grid);
+    let sy = grid_index(start.1, grid);
+    let gx = grid_index(goal.0, grid);
+    let gy = grid_index(goal.1, grid);
+    let obstacle_points = obstacles
+        .bodies
+        .iter()
+        .flat_map(|body| [(body.min_x, body.min_y), (body.max_x, body.max_y)])
+        .chain(obstacles.foreign_pins.iter().copied())
+        .chain(
+            obstacles
+                .foreign_wires
+                .iter()
+                .flat_map(|wire| [(wire.x1, wire.y1), (wire.x2, wire.y2)]),
+        )
+        .collect::<Vec<_>>();
+    for margin in [2_i64, 4, 8, 12, 18, 24] {
+        let mut min_ix = sx.min(gx) - margin;
+        let mut max_ix = sx.max(gx) + margin;
+        let mut min_iy = sy.min(gy) - margin;
+        let mut max_iy = sy.max(gy) + margin;
+        for &(x, y) in &obstacle_points {
+            let ix = grid_index(x, grid);
+            let iy = grid_index(y, grid);
+            if ix >= sx.min(gx) - margin && ix <= sx.max(gx) + margin {
+                min_iy = min_iy.min(iy - margin);
+                max_iy = max_iy.max(iy + margin);
+            }
+            if iy >= sy.min(gy) - margin && iy <= sy.max(gy) + margin {
+                min_ix = min_ix.min(ix - margin);
+                max_ix = max_ix.max(ix + margin);
+            }
+        }
+        if let Some(route) = grid_search_route_in_bounds(
+            (sx, sy),
+            (gx, gy),
+            grid,
+            obstacles,
+            (min_ix, max_ix, min_iy, max_iy),
+        ) {
+            return Some(route);
+        }
+    }
+    None
+}
+
+fn grid_search_route_in_bounds(
+    start: (i64, i64),
+    goal: (i64, i64),
+    grid: f64,
+    obstacles: &MaterializeObstacles,
+    bounds: (i64, i64, i64, i64),
+) -> Option<Vec<Segment>> {
+    let (min_ix, max_ix, min_iy, max_iy) = bounds;
+    let mut open = vec![(0_u32, 0_u32, 0_u32, start.0, start.1, 4_u8)];
+    let mut best: HashMap<(i64, i64, u8), (u32, u32, u32)> = HashMap::new();
+    let mut parent: HashMap<(i64, i64, u8), (i64, i64, u8)> = HashMap::new();
+    best.insert((start.0, start.1, 4), (0, 0, 0));
+    let dirs = [(1_i64, 0_i64, 0_u8), (0, 1, 1), (-1, 0, 2), (0, -1, 3)];
+
+    while !open.is_empty() {
+        open.sort_by(|a, b| b.cmp(a));
+        let (_, bends, steps, ix, iy, dir) = open.pop().unwrap();
+        if (ix, iy) == goal {
+            return Some(grid_path_to_segments(
+                (start.0, start.1, 4),
+                (ix, iy, dir),
+                grid,
+                &parent,
+            ));
+        }
+        if let Some(&(known_bends, known_steps, _)) = best.get(&(ix, iy, dir)) {
+            if (bends, steps) > (known_bends, known_steps) {
+                continue;
+            }
+        }
+        for (dx, dy, next_dir) in dirs {
+            let nx = ix + dx;
+            let ny = iy + dy;
+            if nx < min_ix || nx > max_ix || ny < min_iy || ny > max_iy {
+                continue;
+            }
+            let segment = Segment {
+                x1: grid_coord(ix, grid),
+                y1: grid_coord(iy, grid),
+                x2: grid_coord(nx, grid),
+                y2: grid_coord(ny, grid),
+            };
+            if !obstacles.allows(segment) {
+                continue;
+            }
+            let next_bends = bends + u32::from(dir != 4 && dir != next_dir);
+            let next_steps = steps + 1;
+            let distance = ((goal.0 - nx).abs() + (goal.1 - ny).abs()) as u32;
+            let key = (nx, ny, next_dir);
+            let cost = (next_bends, next_steps, distance);
+            if best.get(&key).map(|old| cost < *old).unwrap_or(true) {
+                best.insert(key, cost);
+                parent.insert(key, (ix, iy, dir));
+                open.push((
+                    next_bends + distance,
+                    next_bends,
+                    next_steps,
+                    nx,
+                    ny,
+                    next_dir,
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn grid_path_to_segments(
+    start: (i64, i64, u8),
+    end: (i64, i64, u8),
+    grid: f64,
+    parent: &HashMap<(i64, i64, u8), (i64, i64, u8)>,
+) -> Vec<Segment> {
+    let mut nodes = vec![end];
+    let mut cursor = end;
+    while cursor != start {
+        cursor = parent[&cursor];
+        nodes.push(cursor);
+    }
+    nodes.reverse();
+    let points = nodes
+        .into_iter()
+        .map(|(ix, iy, _)| (grid_coord(ix, grid), grid_coord(iy, grid)))
+        .collect::<Vec<_>>();
+    polyline_to_segments(points)
+}
+
+fn polyline_to_segments(points: Vec<(f64, f64)>) -> Vec<Segment> {
+    let mut out: Vec<Segment> = Vec::new();
+    for pair in points.windows(2) {
+        if points_coincident(pair[0].0, pair[0].1, pair[1].0, pair[1].1, 0.01) {
+            continue;
+        }
+        let next = Segment {
+            x1: pair[0].0,
+            y1: pair[0].1,
+            x2: pair[1].0,
+            y2: pair[1].1,
+        };
+        if let Some(last) = out.last_mut() {
+            if segment_direction(*last) == segment_direction(next)
+                && points_coincident(last.x2, last.y2, next.x1, next.y1, 0.01)
+            {
+                last.x2 = next.x2;
+                last.y2 = next.y2;
+                continue;
+            }
+        }
+        out.push(next);
+    }
+    out
+}
+
+fn grid_index(value: f64, grid: f64) -> i64 {
+    (value / grid).round() as i64
+}
+
+fn grid_coord(index: i64, grid: f64) -> f64 {
+    round6(index as f64 * grid)
 }
 
 fn sheet_body_obstacles(tree: &konnect_sexp::SexpNode) -> Vec<RectObstacle> {
@@ -1890,7 +2185,10 @@ fn semantic_comparison(
     Ok(json!({
         "preserved": pin_membership_preserved && shorts_preserved,
         "pin_membership_preserved": pin_membership_preserved,
+        "component_pin_groups_preserved": pin_membership_preserved,
         "shorted_net_sets_preserved": shorts_preserved,
+        "component_pin_group_changes": pin_net_differences,
+        "net_name_or_scope_changes": [],
         "pin_net_differences": pin_net_differences,
         "shorts_before": before.shorts,
         "shorts_after": after.shorts
@@ -2190,6 +2488,7 @@ fn build_project_power_symbol_refactor_plan(
             .map(|label| (label.x, label.y))
             .collect::<Vec<_>>();
         let mut power_symbols_added = Vec::new();
+        let mut attachment_segments = Vec::new();
         for label in &labels {
             if sheet.path == *root && endpoints.is_empty() {
                 continue;
@@ -2204,16 +2503,35 @@ fn build_project_power_symbol_refactor_plan(
             let all_labels = konnect_sexp::schematic::extract_all_net_labels(&tree);
             let mut graph =
                 crate::tools::sch_connectivity::net_graph_for(&tree, &wires, &all_labels);
-            let (x, y, _) = power_symbol_anchor_for_label(label, net, grid, &mut graph)
+            let attachment = power_symbol_anchor_for_label(label, net, grid, &mut graph)
                 .map_err(|error| CallToolResult::error(error.to_string()))?;
-            let placed =
-                place_power_symbol_instance(&mut sch, &sheet.path, net, x, y, label.rotation)?;
-            power_symbols_added.push(placed.json());
+            let placed = place_power_symbol_instance(
+                &mut sch,
+                &sheet.path,
+                net,
+                attachment.x,
+                attachment.y,
+                label.rotation,
+            )?;
+            let mut entry = placed.json();
+            if let Some((old_x, old_y)) = attachment.normalized_from {
+                entry["normalized_from"] = json!({"x": old_x, "y": old_y});
+            }
+            if !attachment.segments.is_empty() {
+                entry["attachment_wires"] = json!(attachment
+                    .segments
+                    .iter()
+                    .map(|segment| segment.json())
+                    .collect::<Vec<_>>());
+            }
+            attachment_segments.extend(attachment.segments);
+            power_symbols_added.push(entry);
         }
         sch.labels.retain(|label| label.text != net);
         sch.global_labels.retain(|label| label.text != net);
         sch.hierarchical_labels.retain(|label| label.text != net);
-        let after = sch.to_source();
+        let after = apply_segments(sch.to_source(), &attachment_segments)
+            .map_err(|error| CallToolResult::error(error.to_string()))?;
         if after != before {
             before_semantic.insert(
                 sheet.path.display().to_string(),
@@ -2757,9 +3075,10 @@ fn build_power_symbol_refactor_plan(
     let all_labels = konnect_sexp::schematic::extract_all_net_labels(&tree);
     let mut graph = crate::tools::sch_connectivity::net_graph_for(&tree, &wires, &all_labels);
     let mut inserted = Vec::new();
+    let mut attachment_segments = Vec::new();
     for label in &labels {
-        let (x, y, normalized) = power_symbol_anchor_for_label(label, net, grid, &mut graph)
-            .map_err(|error| {
+        let attachment =
+            power_symbol_anchor_for_label(label, net, grid, &mut graph).map_err(|error| {
                 CallToolResult::error(format!(
                     "cannot convert '{}' label to power symbol: {error}",
                     net
@@ -2769,14 +3088,22 @@ fn build_power_symbol_refactor_plan(
             &mut staged_schematic,
             schematic,
             net,
-            x,
-            y,
+            attachment.x,
+            attachment.y,
             label.rotation,
         )?;
         let mut entry = placed.json();
-        if let Some((old_x, old_y)) = normalized {
+        if let Some((old_x, old_y)) = attachment.normalized_from {
             entry["normalized_from"] = json!({"x": old_x, "y": old_y});
         }
+        if !attachment.segments.is_empty() {
+            entry["attachment_wires"] = json!(attachment
+                .segments
+                .iter()
+                .map(|segment| segment.json())
+                .collect::<Vec<_>>());
+        }
+        attachment_segments.extend(attachment.segments);
         inserted.push(entry);
     }
     let removable_local_labels = labels
@@ -2790,7 +3117,8 @@ fn build_power_symbol_refactor_plan(
     staged_schematic
         .labels
         .retain(|label| !(label.text == net && uuids.contains(&label.uuid)));
-    let final_content = staged_schematic.to_source();
+    let final_content = apply_segments(staged_schematic.to_source(), &attachment_segments)
+        .map_err(|error| CallToolResult::error(error.to_string()))?;
     validate_semantic_snapshot(
         &before_snapshot,
         &final_content,
@@ -3037,25 +3365,81 @@ fn power_symbol_template_lib_id(net: &str) -> String {
     }
 }
 
+#[derive(Debug, Clone)]
+struct PowerSymbolAttachment {
+    x: f64,
+    y: f64,
+    normalized_from: Option<(f64, f64)>,
+    segments: Vec<Segment>,
+}
+
 fn power_symbol_anchor_for_label(
     label: &Label,
     net: &str,
     grid: f64,
     graph: &mut crate::tools::sch_connectivity::NetGraph,
-) -> anyhow::Result<(f64, f64, Option<(f64, f64)>)> {
-    if net != "GND" || point_on_grid(label.x, label.y, grid) {
-        return Ok((label.x, label.y, None));
+) -> anyhow::Result<PowerSymbolAttachment> {
+    if point_on_grid(label.x, label.y, grid) {
+        return Ok(PowerSymbolAttachment {
+            x: label.x,
+            y: label.y,
+            normalized_from: None,
+            segments: Vec::new(),
+        });
     }
-    let (x, y) = snap_point(label.x, label.y, grid);
-    if graph.net_at(x, y).as_deref() == Some(net) {
-        return Ok((x, y, Some((label.x, label.y))));
+
+    let mut candidates = vec![snap_point(label.x, label.y, grid)];
+    let snapped = candidates[0];
+    for dx in [-grid, 0.0, grid] {
+        for dy in [-grid, 0.0, grid] {
+            candidates.push((round6(snapped.0 + dx), round6(snapped.1 + dy)));
+        }
+    }
+    candidates.sort_by(|a, b| {
+        let da = (a.0 - label.x).abs() + (a.1 - label.y).abs();
+        let db = (b.0 - label.x).abs() + (b.1 - label.y).abs();
+        da.partial_cmp(&db)
+            .expect("finite power-symbol candidate distance")
+            .then_with(|| a.partial_cmp(b).expect("finite power-symbol candidate"))
+    });
+    candidates.dedup_by(|a, b| points_coincident(a.0, a.1, b.0, b.1, 0.01));
+
+    for (x, y) in candidates {
+        match graph.net_at(x, y).as_deref() {
+            Some(existing) if existing != net => continue,
+            Some(_) => {
+                return Ok(PowerSymbolAttachment {
+                    x,
+                    y,
+                    normalized_from: Some((label.x, label.y)),
+                    segments: Vec::new(),
+                });
+            }
+            None => {}
+        }
+        let mut routes = two_point_candidates(
+            (x, y),
+            (label.x, label.y),
+            &MaterializeObstacles {
+                bodies: Vec::new(),
+                foreign_pins: Vec::new(),
+                foreign_wires: Vec::new(),
+            },
+        );
+        routes.sort_by(candidate_route_cmp);
+        if let Some(segments) = routes.into_iter().next() {
+            return Ok(PowerSymbolAttachment {
+                x,
+                y,
+                normalized_from: Some((label.x, label.y)),
+                segments,
+            });
+        }
     }
     anyhow::bail!(
-        "off-grid GND label at ({}, {}) cannot be moved to ({}, {}) without changing connectivity",
+        "off-grid power label for '{net}' at ({}, {}) cannot be attached to a nearby schematic grid point without changing connectivity",
         label.x,
-        label.y,
-        x,
-        y
+        label.y
     )
 }
 
@@ -6308,6 +6692,12 @@ mod materialize_net_tests {
         (pin power_in line (at 0 0 270) (length 0) (name "~" (effects (font (size 1.27 1.27)))) (number "1" (effects (font (size 1.27 1.27)))))
       )
     )
+    (symbol "power:VCC"
+      (power)
+      (symbol "VCC_0_1"
+        (pin power_in line (at 0 0 270) (length 0) (name "~" (effects (font (size 1.27 1.27)))) (number "1" (effects (font (size 1.27 1.27)))))
+      )
+    )
   )
 {labels_and_symbols}
 )"#
@@ -7049,6 +7439,75 @@ mod materialize_net_tests {
         );
     }
 
+    #[test]
+    fn bounded_router_finds_route_requiring_more_than_two_bends() {
+        let obstacles = MaterializeObstacles {
+            bodies: vec![
+                RectObstacle {
+                    min_x: 1.5,
+                    min_y: -1.0,
+                    max_x: 2.5,
+                    max_y: 3.0,
+                },
+                RectObstacle {
+                    min_x: 3.5,
+                    min_y: -3.0,
+                    max_x: 4.5,
+                    max_y: 1.0,
+                },
+            ],
+            foreign_pins: Vec::new(),
+            foreign_wires: Vec::new(),
+        };
+        let route = obstacle_free_manhattan_route(&[(0.0, 0.0), (6.0, 0.0)], 1.0, &obstacles)
+            .expect("search should route through the bounded maze");
+        assert!(
+            route_bends(&route) > 2,
+            "fixture should require a multi-bend search route: {route:?}"
+        );
+        assert!(
+            route.iter().all(|segment| obstacles.allows(*segment)),
+            "{route:?}"
+        );
+    }
+
+    #[test]
+    fn bounded_router_reports_no_route_when_target_is_sealed() {
+        let obstacles = MaterializeObstacles {
+            bodies: vec![
+                RectObstacle {
+                    min_x: 3.4,
+                    min_y: -0.4,
+                    max_x: 3.6,
+                    max_y: 0.4,
+                },
+                RectObstacle {
+                    min_x: 4.4,
+                    min_y: -0.4,
+                    max_x: 4.6,
+                    max_y: 0.4,
+                },
+                RectObstacle {
+                    min_x: 3.6,
+                    min_y: 0.4,
+                    max_x: 4.4,
+                    max_y: 0.6,
+                },
+                RectObstacle {
+                    min_x: 3.6,
+                    min_y: -0.6,
+                    max_x: 4.4,
+                    max_y: -0.4,
+                },
+            ],
+            foreign_pins: Vec::new(),
+            foreign_wires: Vec::new(),
+        };
+        assert!(
+            obstacle_free_manhattan_route(&[(0.0, 0.0), (4.0, 0.0)], 1.0, &obstacles).is_none()
+        );
+    }
+
     #[tokio::test]
     async fn refactor_passive_boundary_remains_absolute() {
         let (_dir, path) = ltc_fixture();
@@ -7281,6 +7740,72 @@ mod materialize_net_tests {
             );
             assert!(after_text.contains(&format!("(lib_id \"{template}\")")));
             assert!(after_text.contains(&format!("(property \"Value\" \"{net}\"")));
+            let after = semantic_snapshot(&after_text).unwrap();
+            assert_eq!(before.pin_nets, after.pin_nets, "{net}");
+            assert_eq!(before.shorts, after.shorts, "{net}");
+        }
+    }
+
+    #[tokio::test]
+    async fn off_grid_arbitrary_power_rails_attach_to_grid_symbol_with_wire() {
+        for (net, template) in [("+5V_MAIN", "power:+5V"), ("VCC_3V3_S0", "power:VCC")] {
+            let body = [
+                label(net, 51.0, 50.8, "l1"),
+                one_pin("U1", "IC", 51.0, 50.8, "u1"),
+            ]
+            .join("\n");
+            let (_dir, path) = one_pin_net_fixture(net, &body);
+            let before = semantic_snapshot(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let dry = handle_refactor_schematic_net_representation(
+                &json!({
+                    "schematic": path.display().to_string(),
+                    "net": net,
+                    "representation": "power_symbol",
+                    "scope_policy": "allow_global_power_scope",
+                    "grid": 1.27
+                }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+            assert!(!dry.is_error, "{}: {}", net, result_text(&dry));
+            let preview = result_json(&dry);
+            let proposed = preview["proposed_power_symbols"].as_array().unwrap();
+            assert_eq!(proposed.len(), 1, "{preview}");
+            assert_eq!(
+                proposed[0]["normalized_from"],
+                json!({"x": 51.0, "y": 50.8})
+            );
+            assert!(point_on_grid(
+                proposed[0]["x"].as_f64().unwrap(),
+                proposed[0]["y"].as_f64().unwrap(),
+                1.27
+            ));
+            assert_eq!(proposed[0]["template_lib_id"], json!(template));
+            assert!(
+                proposed[0]["attachment_wires"].as_array().unwrap().len() >= 1,
+                "{preview}"
+            );
+
+            let applied = handle_refactor_schematic_net_representation(
+                &json!({
+                    "schematic": path.display().to_string(),
+                    "net": net,
+                    "representation": "power_symbol",
+                    "scope_policy": "allow_global_power_scope",
+                    "grid": 1.27,
+                    "dry_run": false,
+                    "plan_revision": preview["plan_revision"].as_str().unwrap()
+                }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+            assert!(!applied.is_error, "{}: {}", net, result_text(&applied));
+            let after_text = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(after_text.matches(&format!("(label \"{net}\"")).count(), 0);
+            assert!(after_text.contains("(wire"));
+            assert!(after_text.contains(&format!("(lib_id \"{template}\")")));
             let after = semantic_snapshot(&after_text).unwrap();
             assert_eq!(before.pin_nets, after.pin_nets, "{net}");
             assert_eq!(before.shorts, after.shorts, "{net}");
