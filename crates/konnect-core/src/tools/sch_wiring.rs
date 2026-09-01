@@ -11,6 +11,7 @@ use crate::tools::{
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
+    commit_file_transaction,
     geometry::{points_coincident, snap_point},
     parser::parse_sexp,
     schematic::{
@@ -23,10 +24,11 @@ use konnect_sexp::{
         find_direct_child_blocks, find_enclosing_block, read_consistent, write_atomic_if_unchanged,
         SexpEdit,
     },
-    DocumentRevision,
+    DocumentRevision, FileTransition,
 };
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 pub fn tools() -> Vec<ToolDef> {
     vec![
@@ -456,6 +458,11 @@ pub fn tools() -> Vec<ToolDef> {
                         "type": "string",
                         "enum": ["wired_local", "expand_coincident_connection", "power_symbol", "scope_diagnostic"],
                         "default": "wired_local"
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["sheet", "project"],
+                        "default": "sheet"
                     },
                     "pins": {
                         "type": "array",
@@ -1045,8 +1052,9 @@ fn materialize_segments(
     }
 
     // TODO(KICAD_IPC):
-    // Replace this KiCad 10 compatibility router when native schematic APIs can
-    // reliably create validated arbitrary-sheet wires by typed item IDs.
+    // Replace only the KiCad-10 wire/junction mutation compatibility backend
+    // when the minimum supported KiCad release provides reliable arbitrary-sheet
+    // schematic Create/Update support. Keep Konnect obstacle-aware route planning.
     let obstacles = MaterializeObstacles::build(tree, wires, labels, net, endpoints);
     let escape = args["escape_length"]
         .as_f64()
@@ -1963,7 +1971,7 @@ fn normalized_kicad_netlist_groups(netlist: &str) -> anyhow::Result<BTreeSet<Vec
             .collect::<Vec<_>>();
         pins.sort();
         pins.dedup();
-        if pins.len() > 1 {
+        if !pins.is_empty() {
             groups.insert(pins);
         }
     }
@@ -1985,6 +1993,71 @@ struct RefactorNetPlan {
     final_content: String,
     plan_revision: String,
     warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ProjectSheet {
+    path: PathBuf,
+    parent_path: Option<PathBuf>,
+    parent_sheet_uuid: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ProjectFilePlan {
+    path: PathBuf,
+    before: String,
+    after: String,
+    power_symbols_added: Vec<serde_json::Value>,
+    ordinary_labels_removed: usize,
+    hierarchical_labels_removed: usize,
+    global_labels_removed: usize,
+    sheet_pins_removed: usize,
+    wires_removed: usize,
+    endpoints_before: Vec<NetEndpoint>,
+}
+
+#[derive(Debug, Clone)]
+struct ProjectRefactorPlan {
+    root: PathBuf,
+    net: String,
+    representation: String,
+    participating_sheets: Vec<PathBuf>,
+    files: Vec<ProjectFilePlan>,
+    before_semantic: BTreeMap<String, SemanticSnapshot>,
+    final_semantic: BTreeMap<String, SemanticSnapshot>,
+    plan_revision: String,
+    kicad_validation_available: bool,
+    warnings: Vec<String>,
+}
+
+impl ProjectRefactorPlan {
+    fn response(&self, dry_run: bool, applied: bool) -> serde_json::Value {
+        json!({
+            "dry_run": dry_run,
+            "applied": applied,
+            "safe_to_apply": true,
+            "scope": "project",
+            "root_schematic": self.root.display().to_string(),
+            "target_net": self.net,
+            "representation": self.representation,
+            "participating_sheets": self.participating_sheets.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+            "touched_files": self.files.iter().map(|file| file.path.display().to_string()).collect::<Vec<_>>(),
+            "power_symbols_to_add": self.files.iter().flat_map(|file| file.power_symbols_added.clone()).collect::<Vec<_>>(),
+            "ordinary_labels_to_remove": self.files.iter().map(|file| json!({"schematic": file.path.display().to_string(), "count": file.ordinary_labels_removed})).collect::<Vec<_>>(),
+            "hierarchical_labels_to_remove": self.files.iter().map(|file| json!({"schematic": file.path.display().to_string(), "count": file.hierarchical_labels_removed})).collect::<Vec<_>>(),
+            "global_labels_to_remove": self.files.iter().map(|file| json!({"schematic": file.path.display().to_string(), "count": file.global_labels_removed})).collect::<Vec<_>>(),
+            "sheet_pins_to_remove": self.files.iter().map(|file| json!({"schematic": file.path.display().to_string(), "count": file.sheet_pins_removed})).collect::<Vec<_>>(),
+            "obsolete_parent_root_wires_to_remove": self.files.iter().map(|file| json!({"schematic": file.path.display().to_string(), "count": file.wires_removed})).collect::<Vec<_>>(),
+            "geometry_normalizations": [],
+            "before_endpoint_summary": self.files.iter().map(|file| json!({"schematic": file.path.display().to_string(), "component_pins": file.endpoints_before.iter().map(NetEndpoint::json).collect::<Vec<_>>() })).collect::<Vec<_>>(),
+            "before_konnect_component_pin_membership": self.before_semantic.keys().collect::<Vec<_>>(),
+            "predicted_final_component_pin_membership": self.final_semantic.keys().collect::<Vec<_>>(),
+            "warnings": self.warnings,
+            "project_plan_revision": self.plan_revision,
+            "plan_revision": self.plan_revision,
+            "kicad_validation_available": self.kicad_validation_available
+        })
+    }
 }
 
 impl RefactorNetPlan {
@@ -2011,6 +2084,429 @@ impl RefactorNetPlan {
     }
 }
 
+async fn handle_project_power_symbol_refactor(
+    root: &PathBuf,
+    net: &str,
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let plan = match build_project_power_symbol_refactor_plan(root, net, args, ctx) {
+        Ok(plan) => plan,
+        Err(error) => return Ok(error),
+    };
+    let dry_run = args["dry_run"].as_bool().unwrap_or(true);
+    if dry_run {
+        return Ok(CallToolResult::json(&plan.response(true, false)));
+    }
+    if ctx.config.kicad_cli.trim().is_empty() {
+        return Ok(CallToolResult::error(
+            "project-scope power migration requires kicad-cli validation",
+        ));
+    }
+    let supplied_revision = args["plan_revision"].as_str().unwrap_or_default();
+    if supplied_revision != plan.plan_revision {
+        return Ok(CallToolResult::error(format!(
+            "plan_revision mismatch; rerun dry_run and apply exactly '{}'",
+            plan.plan_revision
+        )));
+    }
+    validate_project_semantic_snapshots(&plan)?;
+    validate_project_kicad_netlist(ctx, &plan).await?;
+
+    // TODO(KICAD_IPC):
+    // Replace the KiCad-10 multi-file schematic hierarchy mutation backend when
+    // the minimum supported KiCad release provides reliable arbitrary-sheet
+    // hierarchy mutation, typed schematic deletion, and project-wide
+    // transactional save semantics. Keep Konnect's project-level migration
+    // planning and validation.
+    let transitions = plan
+        .files
+        .iter()
+        .map(|file| FileTransition::replace(&file.path, &file.before, &file.after))
+        .collect::<Vec<_>>();
+    commit_file_transaction(parent_dir(&plan.root), transitions)?;
+    Ok(CallToolResult::json(&plan.response(false, true)))
+}
+
+fn build_project_power_symbol_refactor_plan(
+    root: &PathBuf,
+    net: &str,
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> Result<ProjectRefactorPlan, CallToolResult> {
+    let allow_global_scope_change = args["allow_global_scope_change"].as_bool().unwrap_or(false);
+    let scope_policy = args["scope_policy"]
+        .as_str()
+        .unwrap_or(if allow_global_scope_change {
+            "allow_global_power_scope"
+        } else {
+            "preserve_existing_scope"
+        });
+    if scope_policy != "allow_global_power_scope" {
+        return Err(CallToolResult::error(format!(
+            "converting net '{net}' to power symbols changes to KiCad global power-symbol scope; rerun with scope_policy='allow_global_power_scope'"
+        )));
+    }
+
+    let sheets = discover_project_sheets(root)?;
+    let grid = args["grid"].as_f64().unwrap_or(1.27);
+    let mut child_hier_removed: HashSet<(PathBuf, String)> = HashSet::new();
+    let mut touched = Vec::new();
+    let mut before_semantic = BTreeMap::new();
+    let mut final_semantic = BTreeMap::new();
+    let mut removed_sheet_pin_positions: HashMap<PathBuf, Vec<(f64, f64)>> = HashMap::new();
+
+    for sheet in &sheets {
+        let before = read_consistent(&sheet.path)
+            .map_err(|error| CallToolResult::error(error.to_string()))?;
+        let tree = parse_sexp(&before).map_err(|error| CallToolResult::error(error.to_string()))?;
+        let mut sch = cse::Schematic::load(&sheet.path)
+            .map_err(|error| CallToolResult::error(error.to_string()))?;
+        let labels = konnect_sexp::schematic::extract_labels(&tree)
+            .into_iter()
+            .filter(|label| label.net == net)
+            .collect::<Vec<_>>();
+        let ordinary = labels
+            .iter()
+            .filter(|label| label.kind == LabelKind::NetLabel)
+            .count();
+        let global = labels
+            .iter()
+            .filter(|label| label.kind == LabelKind::GlobalLabel)
+            .count();
+        let hierarchical = labels
+            .iter()
+            .filter(|label| label.kind == LabelKind::HierarchicalLabel)
+            .count();
+        if hierarchical > 0 {
+            if let (Some(parent), Some(uuid)) = (&sheet.parent_path, &sheet.parent_sheet_uuid) {
+                child_hier_removed.insert((parent.clone(), uuid.clone()));
+            }
+        }
+        let endpoints = net_endpoints_for(&tree, net, args, grid)?;
+        let existing_power = konnect_sexp::schematic::extract_all_net_labels(&tree)
+            .into_iter()
+            .filter(|label| label.net == net && label.kind == LabelKind::PowerSymbol)
+            .map(|label| (label.x, label.y))
+            .collect::<Vec<_>>();
+        let mut power_symbols_added = Vec::new();
+        for label in &labels {
+            if sheet.path == *root && endpoints.is_empty() {
+                continue;
+            }
+            if existing_power
+                .iter()
+                .any(|(x, y)| points_coincident(*x, *y, label.x, label.y, 0.01))
+            {
+                continue;
+            }
+            let wires = extract_wires(&tree);
+            let all_labels = konnect_sexp::schematic::extract_all_net_labels(&tree);
+            let mut graph =
+                crate::tools::sch_connectivity::net_graph_for(&tree, &wires, &all_labels);
+            let (x, y, _) = power_symbol_anchor_for_label(label, net, grid, &mut graph)
+                .map_err(|error| CallToolResult::error(error.to_string()))?;
+            let placed =
+                place_power_symbol_instance(&mut sch, &sheet.path, net, x, y, label.rotation)?;
+            power_symbols_added.push(placed.json());
+        }
+        sch.labels.retain(|label| label.text != net);
+        sch.global_labels.retain(|label| label.text != net);
+        sch.hierarchical_labels.retain(|label| label.text != net);
+        let after = sch.to_source();
+        if after != before {
+            before_semantic.insert(
+                sheet.path.display().to_string(),
+                semantic_snapshot(&before)
+                    .map_err(|error| CallToolResult::error(error.to_string()))?,
+            );
+            final_semantic.insert(
+                sheet.path.display().to_string(),
+                semantic_snapshot(&after)
+                    .map_err(|error| CallToolResult::error(error.to_string()))?,
+            );
+            touched.push(ProjectFilePlan {
+                path: sheet.path.clone(),
+                before,
+                after,
+                power_symbols_added,
+                ordinary_labels_removed: ordinary,
+                hierarchical_labels_removed: hierarchical,
+                global_labels_removed: global,
+                sheet_pins_removed: 0,
+                wires_removed: 0,
+                endpoints_before: endpoints,
+            });
+        }
+    }
+
+    for (parent_path, sheet_uuid) in child_hier_removed {
+        let index = match touched.iter().position(|file| file.path == parent_path) {
+            Some(index) => index,
+            None => {
+                let before = read_consistent(&parent_path)
+                    .map_err(|error| CallToolResult::error(error.to_string()))?;
+                touched.push(ProjectFilePlan {
+                    path: parent_path.clone(),
+                    before: before.clone(),
+                    after: before,
+                    power_symbols_added: Vec::new(),
+                    ordinary_labels_removed: 0,
+                    hierarchical_labels_removed: 0,
+                    global_labels_removed: 0,
+                    sheet_pins_removed: 0,
+                    wires_removed: 0,
+                    endpoints_before: Vec::new(),
+                });
+                touched.len() - 1
+            }
+        };
+        let mut sch = write_temp_and_load(&touched[index].path, &touched[index].after)
+            .map_err(|error| CallToolResult::error(error.to_string()))?;
+        let mut removed = Vec::new();
+        for sheet in sch
+            .sheets
+            .iter_mut()
+            .filter(|sheet| sheet.uuid == sheet_uuid)
+        {
+            let before_len = sheet.pins.len();
+            sheet.pins.retain(|pin| {
+                let keep = pin.name != net;
+                if !keep {
+                    removed.push(pin.position());
+                }
+                keep
+            });
+            touched[index].sheet_pins_removed += before_len - sheet.pins.len();
+        }
+        if !removed.is_empty() {
+            removed_sheet_pin_positions
+                .entry(touched[index].path.clone())
+                .or_default()
+                .extend(removed);
+            touched[index].after = sch.to_source();
+        }
+    }
+
+    for file in &mut touched {
+        if let Some(positions) = removed_sheet_pin_positions.get(&file.path) {
+            let mut sch = write_temp_and_load(&file.path, &file.after)
+                .map_err(|error| CallToolResult::error(error.to_string()))?;
+            let before_len = sch.wires.len();
+            sch.wires.retain(|wire| {
+                let a = positions
+                    .iter()
+                    .any(|(x, y)| points_coincident(*x, *y, wire.start.0, wire.start.1, 0.01));
+                let b = positions
+                    .iter()
+                    .any(|(x, y)| points_coincident(*x, *y, wire.end.0, wire.end.1, 0.01));
+                !(a && b)
+            });
+            file.wires_removed = before_len - sch.wires.len();
+            file.after = sch.to_source();
+        }
+        parse_sexp(&file.after).map_err(|error| CallToolResult::error(error.to_string()))?;
+        before_semantic.insert(
+            file.path.display().to_string(),
+            semantic_snapshot(&file.before)
+                .map_err(|error| CallToolResult::error(error.to_string()))?,
+        );
+        final_semantic.insert(
+            file.path.display().to_string(),
+            semantic_snapshot(&file.after)
+                .map_err(|error| CallToolResult::error(error.to_string()))?,
+        );
+    }
+
+    touched.retain(|file| file.before != file.after);
+    if touched.is_empty() {
+        return Err(CallToolResult::error(format!(
+            "project scope found no target-net hierarchy or labels for '{net}'"
+        )));
+    }
+    touched.sort_by(|a, b| a.path.cmp(&b.path));
+    let participating_sheets = sheets
+        .iter()
+        .map(|sheet| sheet.path.clone())
+        .collect::<Vec<_>>();
+    let plan_revision = project_plan_revision(net, scope_policy, &touched);
+    Ok(ProjectRefactorPlan {
+        root: root.clone(),
+        net: net.to_string(),
+        representation: "power_symbol".to_string(),
+        participating_sheets,
+        files: touched,
+        before_semantic,
+        final_semantic,
+        plan_revision,
+        kicad_validation_available: !ctx.config.kicad_cli.trim().is_empty(),
+        warnings: vec![
+            "KiCad power symbols have global power-rail scope; conversion required explicit scope_policy approval.".to_string(),
+        ],
+    })
+}
+
+fn parent_dir(path: &Path) -> PathBuf {
+    path.parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn discover_project_sheets(root: &PathBuf) -> Result<Vec<ProjectSheet>, CallToolResult> {
+    fn visit(
+        path: PathBuf,
+        parent_path: Option<PathBuf>,
+        parent_sheet_uuid: Option<String>,
+        out: &mut Vec<ProjectSheet>,
+        seen: &mut HashSet<PathBuf>,
+    ) -> Result<(), CallToolResult> {
+        let canonical = path
+            .canonicalize()
+            .map_err(|error| CallToolResult::error(error.to_string()))?;
+        if !seen.insert(canonical.clone()) {
+            return Ok(());
+        }
+        out.push(ProjectSheet {
+            path: canonical.clone(),
+            parent_path,
+            parent_sheet_uuid,
+        });
+        let sch = cse::Schematic::load(&canonical)
+            .map_err(|error| CallToolResult::error(error.to_string()))?;
+        let base = parent_dir(&canonical);
+        for sheet in sch.sheets.iter() {
+            let child = resolve_sheet_path(&base, sheet.file());
+            visit(
+                child,
+                Some(canonical.clone()),
+                Some(sheet.uuid.clone()),
+                out,
+                seen,
+            )?;
+        }
+        Ok(())
+    }
+
+    let mut sheets = Vec::new();
+    let mut seen = HashSet::new();
+    visit(root.clone(), None, None, &mut sheets, &mut seen)?;
+    Ok(sheets)
+}
+
+fn resolve_sheet_path(base: &Path, sheet_file: &str) -> PathBuf {
+    let path = PathBuf::from(sheet_file);
+    if path.is_absolute() {
+        path
+    } else {
+        base.join(path)
+    }
+}
+
+fn write_temp_and_load(path: &Path, content: &str) -> anyhow::Result<cse::Schematic> {
+    let temp = tempfile::tempdir()?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("schematic has no file name"))?;
+    let temp_path = temp.path().join(name);
+    std::fs::write(&temp_path, content)?;
+    cse::Schematic::load(&temp_path).map_err(anyhow::Error::from)
+}
+
+fn project_plan_revision(net: &str, scope_policy: &str, files: &[ProjectFilePlan]) -> String {
+    let mut material = format!("{net}\npower_symbol\nproject\n{scope_policy}");
+    for file in files {
+        material.push('\n');
+        material.push_str(&file.path.display().to_string());
+        material.push('\n');
+        material.push_str(&DocumentRevision::of(&file.before).to_string());
+        material.push('\n');
+        material.push_str(&file.power_symbols_added.len().to_string());
+        material.push(':');
+        material.push_str(&file.ordinary_labels_removed.to_string());
+        material.push(':');
+        material.push_str(&file.hierarchical_labels_removed.to_string());
+        material.push(':');
+        material.push_str(&file.sheet_pins_removed.to_string());
+        material.push(':');
+        material.push_str(&file.wires_removed.to_string());
+    }
+    format!(
+        "refactor-schematic-net-project:{}",
+        DocumentRevision::of(&material)
+    )
+}
+
+fn validate_project_semantic_snapshots(plan: &ProjectRefactorPlan) -> anyhow::Result<()> {
+    for file in &plan.files {
+        let before = plan
+            .before_semantic
+            .get(&file.path.display().to_string())
+            .ok_or_else(|| anyhow::anyhow!("missing semantic before snapshot"))?;
+        validate_semantic_snapshot(before, &file.after, "project final transaction")?;
+    }
+    Ok(())
+}
+
+async fn validate_project_kicad_netlist(
+    ctx: &ToolContext,
+    plan: &ProjectRefactorPlan,
+) -> anyhow::Result<()> {
+    let before = kicad_netlist_component_groups_for_project(&ctx.config.kicad_cli, &plan.root, &[])
+        .await
+        .map_err(|error| anyhow::anyhow!("KiCad project netlist BEFORE export failed: {error}"))?;
+    let overrides = plan
+        .files
+        .iter()
+        .map(|file| (file.path.clone(), file.after.clone()))
+        .collect::<Vec<_>>();
+    let after =
+        kicad_netlist_component_groups_for_project(&ctx.config.kicad_cli, &plan.root, &overrides)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("KiCad project netlist AFTER export failed: {error}")
+            })?;
+    if before != after {
+        anyhow::bail!("KiCad project netlist component-pin membership changed final transaction");
+    }
+    Ok(())
+}
+
+async fn kicad_netlist_component_groups_for_project(
+    kicad_cli: &str,
+    root: &Path,
+    overrides: &[(PathBuf, String)],
+) -> anyhow::Result<BTreeSet<Vec<String>>> {
+    let temp = tempfile::tempdir()?;
+    let source_dir = parent_dir(root);
+    for entry in std::fs::read_dir(&source_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name() else {
+            continue;
+        };
+        if matches!(
+            path.extension().and_then(|ext| ext.to_str()),
+            Some("kicad_sch" | "kicad_pro")
+        ) {
+            std::fs::copy(&path, temp.path().join(name))?;
+        }
+    }
+    for (path, content) in overrides {
+        let name = path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("schematic has no file name"))?;
+        std::fs::write(temp.path().join(name), content)?;
+    }
+    let root_name = root
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("root schematic has no file name"))?;
+    let temp_root = temp.path().join(root_name);
+    let netlist_path = temp.path().join("project-snapshot.net");
+    crate::tools::cli::export_netlist(kicad_cli, &temp_root, &netlist_path, "kicadsexpr").await?;
+    let netlist = std::fs::read_to_string(&netlist_path)?;
+    normalized_kicad_netlist_groups(&netlist)
+}
+
 async fn handle_refactor_schematic_net_representation(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -2023,6 +2519,19 @@ async fn handle_refactor_schematic_net_representation(
     let representation = args["representation"].as_str().unwrap_or("wired_local");
     if representation == "scope_diagnostic" {
         return inspect_net_representation_scope(&schematic, &net);
+    }
+    let scope = args["scope"].as_str().unwrap_or("sheet");
+    if scope == "project" {
+        if representation != "power_symbol" {
+            return Ok(CallToolResult::error(format!(
+                "project scope supports representation='power_symbol', not '{representation}'"
+            )));
+        }
+        return handle_project_power_symbol_refactor(&schematic, &net, args, ctx).await;
+    } else if scope != "sheet" {
+        return Ok(CallToolResult::error(format!(
+            "scope '{scope}' is invalid; expected sheet or project"
+        )));
     }
     let dry_run = args["dry_run"].as_bool().unwrap_or(true);
     let plan = match build_refactor_net_plan(&schematic, &net, representation, args) {
@@ -2241,20 +2750,14 @@ fn build_power_symbol_refactor_plan(
             "net '{net}' has no ordinary labels to convert"
         )));
     }
-    let template_lib_id = power_symbol_template_lib_id(net);
-    let mut staged = if embedded_power_symbol_available(&tree, &template_lib_id) {
-        before.clone()
-    } else {
-        ensure_staged_power_symbol_definition(before.clone(), &template_lib_id)
-            .map_err(|error| CallToolResult::error(error.to_string()))?
-    };
+    let mut staged_schematic = cse::Schematic::load(schematic)
+        .map_err(|error| CallToolResult::error(error.to_string()))?;
     let grid = args["grid"].as_f64().unwrap_or(1.27);
     let wires = extract_wires(&tree);
     let all_labels = konnect_sexp::schematic::extract_all_net_labels(&tree);
     let mut graph = crate::tools::sch_connectivity::net_graph_for(&tree, &wires, &all_labels);
     let mut inserted = Vec::new();
-    for (index, label) in labels.iter().enumerate() {
-        let reference = next_power_reference_for_content(&staged, index + 1);
+    for label in &labels {
         let (x, y, normalized) = power_symbol_anchor_for_label(label, net, grid, &mut graph)
             .map_err(|error| {
                 CallToolResult::error(format!(
@@ -2262,25 +2765,32 @@ fn build_power_symbol_refactor_plan(
                     net
                 ))
             })?;
-        let block =
-            staged_power_symbol_block(&template_lib_id, net, &reference, x, y, label.rotation);
-        staged = insert_direct_child_before_sheet_instances(staged, &block);
-        inserted.push(json!({
-            "reference": reference,
-            "template_lib_id": template_lib_id,
-            "net": net,
-            "x": x,
-            "y": y,
-            "rotation": label.rotation
-            ,"normalized_from": normalized.map(|(old_x, old_y)| json!({"x": old_x, "y": old_y}))
-        }));
+        let placed = place_power_symbol_instance(
+            &mut staged_schematic,
+            schematic,
+            net,
+            x,
+            y,
+            label.rotation,
+        )?;
+        let mut entry = placed.json();
+        if let Some((old_x, old_y)) = normalized {
+            entry["normalized_from"] = json!({"x": old_x, "y": old_y});
+        }
+        inserted.push(entry);
     }
     let removable_local_labels = labels
         .iter()
         .map(|label| (label.x, label.y))
         .collect::<Vec<_>>();
-    let (final_content, _) = remove_plain_labels_at(staged, net, &removable_local_labels)
-        .map_err(|error| CallToolResult::error(error.to_string()))?;
+    let uuids = labels
+        .iter()
+        .map(|label| label.uuid.clone().unwrap_or_default())
+        .collect::<HashSet<_>>();
+    staged_schematic
+        .labels
+        .retain(|label| !(label.text == net && uuids.contains(&label.uuid)));
+    let final_content = staged_schematic.to_source();
     validate_semantic_snapshot(
         &before_snapshot,
         &final_content,
@@ -2527,13 +3037,6 @@ fn power_symbol_template_lib_id(net: &str) -> String {
     }
 }
 
-fn power_symbol_template_name(template_lib_id: &str) -> &str {
-    template_lib_id
-        .split_once(':')
-        .map(|(_, symbol)| symbol)
-        .unwrap_or(template_lib_id)
-}
-
 fn power_symbol_anchor_for_label(
     label: &Label,
     net: &str,
@@ -2554,85 +3057,6 @@ fn power_symbol_anchor_for_label(
         x,
         y
     )
-}
-
-fn embedded_power_symbol_available(tree: &konnect_sexp::SexpNode, template_lib_id: &str) -> bool {
-    tree.find("lib_symbols")
-        .map(|lib_symbols| {
-            lib_symbols.find_all("symbol").into_iter().any(|symbol| {
-                symbol.get(1).and_then(|value| value.as_str()) == Some(template_lib_id)
-                    && symbol.find("power").is_some()
-            })
-        })
-        .unwrap_or(false)
-}
-
-fn ensure_staged_power_symbol_definition(
-    mut content: String,
-    template_lib_id: &str,
-) -> anyhow::Result<String> {
-    let Some(start) = find_block_starts(&content, "lib_symbols")
-        .into_iter()
-        .next()
-    else {
-        anyhow::bail!("schematic has no lib_symbols block for staging {template_lib_id}");
-    };
-    let Some((_, end)) = find_balanced_block(&content, start) else {
-        anyhow::bail!("lib_symbols block is malformed");
-    };
-    let definition = staged_power_lib_symbol_definition(template_lib_id);
-    content.insert_str(end - 1, &definition);
-    Ok(content)
-}
-
-fn staged_power_lib_symbol_definition(template_lib_id: &str) -> String {
-    let symbol_name = power_symbol_template_name(template_lib_id);
-    format!(
-        "\n    (symbol \"{template_lib_id}\"\n      (power)\n      (property \"Reference\" \"#PWR\" (at 0 0 0) (effects (font (size 1.27 1.27))) (hide yes))\n      (property \"Value\" \"{symbol_name}\" (at 0 -3.81 0) (effects (font (size 1.27 1.27))))\n      (symbol \"{symbol_name}_0_1\"\n        (pin power_in line (at 0 0 270) (length 0)\n          (name \"~\" (effects (font (size 1.27 1.27))))\n          (number \"1\" (effects (font (size 1.27 1.27))))\n        )\n      )\n    )"
-    )
-}
-
-fn next_power_reference_for_content(content: &str, offset: usize) -> String {
-    let mut highest = 0u32;
-    let mut rest = content;
-    while let Some(index) = rest.find("#PWR") {
-        rest = &rest[index + 4..];
-        let digits = rest
-            .chars()
-            .take_while(|ch| ch.is_ascii_digit())
-            .collect::<String>();
-        if let Ok(value) = digits.parse::<u32>() {
-            highest = highest.max(value);
-        }
-    }
-    format!("#PWR{:03}", highest + offset as u32)
-}
-
-fn staged_power_symbol_block(
-    template_lib_id: &str,
-    net: &str,
-    reference: &str,
-    x: f64,
-    y: f64,
-    rotation: f64,
-) -> String {
-    let x = cse::types::fmt_f64(x);
-    let y = cse::types::fmt_f64(y);
-    let rotation = cse::types::fmt_f64(rotation);
-    format!(
-        "\n  (symbol\n    (lib_id \"{template_lib_id}\")\n    (at {x} {y} {rotation})\n    (unit 1)\n    (exclude_from_sim no)\n    (in_bom yes)\n    (on_board yes)\n    (dnp no)\n    (uuid \"{}\")\n    (property \"Reference\" \"{reference}\" (at {x} {y} 0) (hide yes))\n    (property \"Value\" \"{net}\" (at {x} {y} 0))\n  )",
-        uuid::Uuid::new_v4()
-    )
-}
-
-fn insert_direct_child_before_sheet_instances(mut content: String, block: &str) -> String {
-    let insert_at = find_block_starts(&content, "sheet_instances")
-        .into_iter()
-        .next()
-        .or_else(|| content.rfind(')'))
-        .unwrap_or(content.len());
-    content.insert_str(insert_at, block);
-    content
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
@@ -3647,39 +4071,47 @@ fn next_pwr_number(sch: &cse::Schematic) -> u32 {
     (1u32..).find(|n| !used.contains(n)).unwrap_or(1)
 }
 
-async fn handle_add_power_symbol(
-    args: &serde_json::Value,
-    _ctx: &ToolContext,
-) -> anyhow::Result<CallToolResult> {
-    let sch_path = get_path(args, "schematic")?;
-    let power_net = match require_str(args, "power_net") {
-        Ok(v) => v.to_string(),
-        Err(e) => return Ok(e),
-    };
-    let x = match require_f64(args, "x") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let y = match require_f64(args, "y") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let rotation = opt_f64(args, "rotation").unwrap_or(0.0);
+#[derive(Debug, Clone)]
+struct PlacedPowerSymbol {
+    reference: String,
+    template_lib_id: String,
+    value: String,
+    x: f64,
+    y: f64,
+    rotation: f64,
+}
 
-    let mut sch = cse::Schematic::load(&sch_path)?;
+impl PlacedPowerSymbol {
+    fn json(&self) -> serde_json::Value {
+        json!({
+            "reference": self.reference,
+            "template_lib_id": self.template_lib_id,
+            "net": self.value,
+            "x": self.x,
+            "y": self.y,
+            "rotation": self.rotation
+        })
+    }
+}
 
-    let pwr_ref = format!("#PWR{:03}", next_pwr_number(&sch));
-
+fn place_power_symbol_instance(
+    sch: &mut cse::Schematic,
+    sch_path: &Path,
+    value: &str,
+    x: f64,
+    y: f64,
+    rotation: f64,
+) -> Result<PlacedPowerSymbol, CallToolResult> {
     // KiCad resolves the symbol body from lib_id, but the global rail name
     // comes from the placed instance's Value field. Custom rails therefore use
     // a stock power-symbol template and keep the requested rail in Value.
-    let lib_id = power_symbol_template_lib_id(&power_net);
-    let src = crate::tools::library::KiCadSymbolSource::for_file(&sch_path);
-    if !cse::library::ensure_lib_symbol(&mut sch, &lib_id, &src) {
-        return Ok(crate::tools::lib_symbol_not_found_error(&lib_id, &src));
+    let lib_id = power_symbol_template_lib_id(value);
+    let src = crate::tools::library::KiCadSymbolSource::for_file(sch_path);
+    if !cse::library::ensure_lib_symbol(sch, &lib_id, &src) {
+        return Err(crate::tools::lib_symbol_not_found_error(&lib_id, &src));
     }
 
-    // Build the Symbol struct
+    let pwr_ref = format!("#PWR{:03}", next_pwr_number(sch));
     let mut sym = cse::Symbol::new(lib_id.clone(), x, y);
     sym.at.rotation = Some(rotation);
     sym.unit = 1;
@@ -3687,15 +4119,9 @@ async fn handle_add_power_symbol(
     sym.on_board = true;
     sym.uuid = uuid::Uuid::new_v4().to_string();
 
-    // Property (at …) is absolute sheet coords — same as add_schematic_component.
-    // Bare Property::new writes no (at); KiCad then defaults to (0,0) and every
-    // #PWR piles up in the top-left corner. Hide Reference like eeschema does
-    // (property-level `(hide yes)`, matching what KiCad 10 itself writes).
-    //
-    // The library anchors matter most here: GND anchors Value below the
-    // graphic but VCC/+5V/+3V3 anchor it above, so one fixed offset cannot
-    // suit both (#101).
-    let anchors = cse::library::field_anchors(&sch, &lib_id);
+    // Property (at …) is absolute sheet coords. Library field anchors keep GND
+    // and VCC-family labels positioned the way the stock symbols expect.
+    let anchors = cse::library::field_anchors(sch, &lib_id);
     let t = konnect_sexp::geometry::PinTransform {
         comp_x: x,
         comp_y: y,
@@ -3720,7 +4146,7 @@ async fn handle_add_power_symbol(
     ));
     sym.properties.push(positioned(
         "Value",
-        &power_net,
+        value,
         val_x,
         val_y,
         val_rot,
@@ -3732,28 +4158,61 @@ async fn handle_add_power_symbol(
     sym.properties
         .push(positioned("Datasheet", "", x, y, 0.0, true, centred));
 
-    // Instance entry, keyed to the root sheet UUID like eeschema writes it —
-    // without a resolvable "/<root-uuid>" path KiCAD's netlister drops the
-    // symbol from net formation.
-    let root_uuid = crate::tools::ensure_root_uuid(&mut sch);
+    let root_uuid = crate::tools::ensure_root_uuid(sch);
     sym.set_instance_path(
-        &project_name_for(&sch_path),
+        &project_name_for(sch_path),
         &format!("/{}", root_uuid),
         &pwr_ref,
         1,
     );
 
     sch.add_symbol(sym);
+    Ok(PlacedPowerSymbol {
+        reference: pwr_ref,
+        template_lib_id: lib_id,
+        value: value.to_string(),
+        x,
+        y,
+        rotation,
+    })
+}
+
+async fn handle_add_power_symbol(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let power_net = match require_str(args, "power_net") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let x = match require_f64(args, "x") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let y = match require_f64(args, "y") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let rotation = opt_f64(args, "rotation").unwrap_or(0.0);
+
+    let mut sch = cse::Schematic::load(&sch_path)?;
+
+    let placed = match place_power_symbol_instance(&mut sch, &sch_path, &power_net, x, y, rotation)
+    {
+        Ok(placed) => placed,
+        Err(error) => return Ok(error),
+    };
     sch.overwrite()?;
 
     // A power pin landing mid-segment on an existing wire needs a junction
     // dot, or KiCad ERC reports it as not connected.
-    let junctions_added = crate::tools::add_pin_midwire_junctions(&sch_path, &pwr_ref)?;
+    let junctions_added = crate::tools::add_pin_midwire_junctions(&sch_path, &placed.reference)?;
 
     Ok(CallToolResult::json(&json!({
         "added_power": power_net,
-        "template_lib_id": lib_id,
-        "reference": pwr_ref,
+        "template_lib_id": placed.template_lib_id,
+        "reference": placed.reference,
         "x": x, "y": y,
         "junctions_added": junctions_added.iter().map(|(x, y)| json!({"x": x, "y": y})).collect::<Vec<_>>()
     })))
@@ -5964,6 +6423,343 @@ mod materialize_net_tests {
                 y2: wire["y2"].as_f64().unwrap(),
             })
             .collect()
+    }
+
+    fn test_ctx_with_kicad_cli(kicad_cli: &str) -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: kicad_cli.to_string(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+                dispatcher_tools: false,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    fn project_power_fixture(
+        rail: &str,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let other_rail = if rail == "+5V_MAIN" {
+            "VCC_3V3_S0"
+        } else {
+            "+5V_MAIN"
+        };
+        let root = dir.path().join("fixture.kicad_sch");
+        let power = dir.path().join("power.kicad_sch");
+        let core = dir.path().join("core.kicad_sch");
+        std::fs::write(dir.path().join("fixture.kicad_pro"), "{}\n").unwrap();
+        std::fs::write(
+            &root,
+            format!(
+                r#"(kicad_sch
+  (version 20250610)
+  (generator "konnect-test")
+  (uuid "root")
+  (paper "A4")
+  (lib_symbols)
+  (sheet (at 20 20) (size 30 20) (uuid "sheet-power")
+    (property "Sheetname" "Power" (at 20 19.2 0))
+    (property "Sheetfile" "power.kicad_sch" (at 20 40.4 0))
+    (pin "{rail}" output (at 50 25 0) (uuid "pin-power-rail"))
+    (pin "{other_rail}" output (at 50 27.5 0) (uuid "pin-power-other"))
+    (pin "USB_SIGNAL" passive (at 50 30 0) (uuid "pin-power-usb"))
+  )
+  (sheet (at 80 20) (size 30 20) (uuid "sheet-core")
+    (property "Sheetname" "Core" (at 80 19.2 0))
+    (property "Sheetfile" "core.kicad_sch" (at 80 40.4 0))
+    (pin "{rail}" input (at 80 25 180) (uuid "pin-core-rail"))
+    (pin "{other_rail}" input (at 80 27.5 180) (uuid "pin-core-other"))
+    (pin "USB_SIGNAL" passive (at 80 30 180) (uuid "pin-core-usb"))
+  )
+  (wire (pts (xy 50 25) (xy 80 25)) (uuid "wire-rail"))
+  (wire (pts (xy 50 27.5) (xy 80 27.5)) (uuid "wire-other"))
+  (wire (pts (xy 50 30) (xy 80 30)) (uuid "wire-usb"))
+  (sheet_instances (path "/" (page "1")))
+)"#
+            ),
+        )
+        .unwrap();
+        let child = |name: &str, label_kind: &str, refs: &[&str]| -> String {
+            let symbols = refs
+                .iter()
+                .enumerate()
+                .map(|(index, reference)| {
+                    let x = 40.0 + (index as f64 * 20.0);
+                    one_pin(reference, "LOAD", x, 50.0, &format!("{name}-{reference}"))
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                r##"(kicad_sch
+  (version 20250610)
+  (generator "konnect-test")
+  (uuid "{name}-uuid")
+  (paper "A4")
+  (lib_symbols
+    (symbol "Test:P"
+      (symbol "P_1_1"
+        (pin passive line (at 0 0 180) (length 0) (name "~" (effects (font (size 1.27 1.27)))) (number "1" (effects (font (size 1.27 1.27)))))
+      )
+    )
+    (symbol "power:+5V"
+      (power)
+      (property "Reference" "#PWR" (at 0 -3.81 0) (effects (font (size 1.27 1.27))) (hide yes))
+      (property "Value" "+5V" (at 0 3.556 0) (effects (font (size 1.27 1.27))))
+      (symbol "+5V_0_1"
+        (pin power_in line (at 0 0 270) (length 0) (name "~" (effects (font (size 1.27 1.27)))) (number "1" (effects (font (size 1.27 1.27)))))
+      )
+    )
+    (symbol "power:VCC"
+      (power)
+      (property "Reference" "#PWR" (at 0 -3.81 0) (effects (font (size 1.27 1.27))) (hide yes))
+      (property "Value" "VCC" (at 0 3.556 0) (effects (font (size 1.27 1.27))))
+      (symbol "VCC_0_1"
+        (pin power_in line (at 0 0 270) (length 0) (name "~" (effects (font (size 1.27 1.27)))) (number "1" (effects (font (size 1.27 1.27)))))
+      )
+    )
+  )
+  ({label_kind} "{rail}" (shape passive) (at 40 50 0) (effects (font (size 1.27 1.27)) (justify left)) (uuid "{name}-rail-label"))
+  (hierarchical_label "{other_rail}" (shape passive) (at 40 55 0) (effects (font (size 1.27 1.27)) (justify left)) (uuid "{name}-other-label"))
+  (hierarchical_label "USB_SIGNAL" (shape passive) (at 40 60 0) (effects (font (size 1.27 1.27)) (justify left)) (uuid "{name}-usb-label"))
+{symbols}
+)"##
+            )
+        };
+        std::fs::write(&power, child("power", "hierarchical_label", &["R14"])).unwrap();
+        std::fs::write(&core, child("core", "hierarchical_label", &["U1", "U2"])).unwrap();
+        (dir, root, power, core)
+    }
+
+    #[test]
+    fn normalized_kicad_netlist_groups_preserves_singletons() {
+        let netlist = r#"(export
+  (nets
+    (net (code "1") (name "GROUP_A")
+      (node (ref "R1") (pin "1"))
+      (node (ref "R2") (pin "1"))
+    )
+    (net (code "2") (name "GROUP_B")
+      (node (ref "U1") (pin "6"))
+    )
+  )
+)"#;
+        let groups = normalized_kicad_netlist_groups(netlist).unwrap();
+        assert!(groups.contains(&vec!["R1.1".to_string(), "R2.1".to_string()]));
+        assert!(groups.contains(&vec!["U1.6".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn project_scope_power_refactor_plans_hierarchy_cleanup_without_root_decoration() {
+        let (_dir, root, _power, _core) = project_power_fixture("+5V_MAIN");
+        let dry = handle_refactor_schematic_net_representation(
+            &json!({
+                "schematic": root.display().to_string(),
+                "net": "+5V_MAIN",
+                "representation": "power_symbol",
+                "scope": "project",
+                "scope_policy": "allow_global_power_scope",
+                "dry_run": true
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!dry.is_error, "{}", result_text(&dry));
+        let body = result_json(&dry);
+        assert_eq!(body["scope"], json!("project"));
+        assert_eq!(body["kicad_validation_available"], json!(false));
+        assert_eq!(
+            body["power_symbols_to_add"].as_array().unwrap().len(),
+            2,
+            "{body}"
+        );
+        assert!(body["power_symbols_to_add"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|symbol| symbol["template_lib_id"] == "power:+5V"));
+        assert!(
+            body["sheet_pins_to_remove"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["count"].as_u64().unwrap())
+                .sum::<u64>()
+                >= 2
+        );
+        assert!(
+            body["obsolete_parent_root_wires_to_remove"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["count"].as_u64().unwrap())
+                .sum::<u64>()
+                >= 1
+        );
+        let root_before = std::fs::read_to_string(&root).unwrap();
+        assert!(root_before.contains("VCC_3V3_S0"));
+        assert!(root_before.contains("USB_SIGNAL"));
+    }
+
+    #[tokio::test]
+    async fn project_scope_power_refactor_rejects_stale_child_revision_before_writing() {
+        let (_dir, root, _power, core) = project_power_fixture("VCC_3V3_S0");
+        let dry = handle_refactor_schematic_net_representation(
+            &json!({
+                "schematic": root.display().to_string(),
+                "net": "VCC_3V3_S0",
+                "representation": "power_symbol",
+                "scope": "project",
+                "scope_policy": "allow_global_power_scope",
+                "dry_run": true
+            }),
+            &test_ctx_with_kicad_cli("/bin/false"),
+        )
+        .await
+        .unwrap();
+        assert!(!dry.is_error, "{}", result_text(&dry));
+        let body = result_json(&dry);
+        let root_before = std::fs::read_to_string(&root).unwrap();
+        let core_before = std::fs::read_to_string(&core).unwrap();
+        std::fs::write(&core, core_before.replace("USB_SIGNAL", "USB_SIGNAL_STALE")).unwrap();
+
+        let applied = handle_refactor_schematic_net_representation(
+            &json!({
+                "schematic": root.display().to_string(),
+                "net": "VCC_3V3_S0",
+                "representation": "power_symbol",
+                "scope": "project",
+                "scope_policy": "allow_global_power_scope",
+                "dry_run": false,
+                "plan_revision": body["plan_revision"].as_str().unwrap()
+            }),
+            &test_ctx_with_kicad_cli("/bin/false"),
+        )
+        .await
+        .unwrap();
+        assert!(applied.is_error);
+        assert!(result_text(&applied).contains("plan_revision mismatch"));
+        assert_eq!(std::fs::read_to_string(&root).unwrap(), root_before);
+        assert!(std::fs::read_to_string(&core)
+            .unwrap()
+            .contains("USB_SIGNAL_STALE"));
+    }
+
+    #[tokio::test]
+    async fn project_scope_power_refactor_apply_requires_kicad_cli() {
+        let (_dir, root, _power, _core) = project_power_fixture("+5V_MAIN");
+        let dry = handle_refactor_schematic_net_representation(
+            &json!({
+                "schematic": root.display().to_string(),
+                "net": "+5V_MAIN",
+                "representation": "power_symbol",
+                "scope": "project",
+                "scope_policy": "allow_global_power_scope",
+                "dry_run": true
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!dry.is_error, "{}", result_text(&dry));
+        let body = result_json(&dry);
+
+        let applied = handle_refactor_schematic_net_representation(
+            &json!({
+                "schematic": root.display().to_string(),
+                "net": "+5V_MAIN",
+                "representation": "power_symbol",
+                "scope": "project",
+                "scope_policy": "allow_global_power_scope",
+                "dry_run": false,
+                "plan_revision": body["plan_revision"].as_str().unwrap()
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(applied.is_error);
+        assert_eq!(
+            result_text(&applied),
+            "project-scope power migration requires kicad-cli validation"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn project_scope_power_refactor_applies_with_real_kicad_cli() {
+        let kicad_cli = "/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli";
+        if !std::path::Path::new(kicad_cli).exists() {
+            eprintln!("skipping: {kicad_cli} not found");
+            return;
+        }
+        for rail in ["+5V_MAIN", "VCC_3V3_S0"] {
+            let (_dir, root, power, core) = project_power_fixture(rail);
+            let ctx = test_ctx_with_kicad_cli(kicad_cli);
+            let dry = handle_refactor_schematic_net_representation(
+                &json!({
+                    "schematic": root.display().to_string(),
+                    "net": rail,
+                    "representation": "power_symbol",
+                    "scope": "project",
+                    "scope_policy": "allow_global_power_scope",
+                    "dry_run": true
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert!(!dry.is_error, "{rail}: {}", result_text(&dry));
+            let body = result_json(&dry);
+            let applied = handle_refactor_schematic_net_representation(
+                &json!({
+                    "schematic": root.display().to_string(),
+                    "net": rail,
+                    "representation": "power_symbol",
+                    "scope": "project",
+                    "scope_policy": "allow_global_power_scope",
+                    "dry_run": false,
+                    "plan_revision": body["plan_revision"].as_str().unwrap()
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert!(!applied.is_error, "{rail}: {}", result_text(&applied));
+            let root_after = std::fs::read_to_string(&root).unwrap();
+            assert!(!root_after.contains(&format!("\"{rail}\" output")));
+            assert!(!root_after.contains(&format!("\"{rail}\" input")));
+            assert!(!root_after.contains("wire-rail"));
+            assert!(root_after.contains("USB_SIGNAL"));
+            let other_rail = if rail == "+5V_MAIN" {
+                "VCC_3V3_S0"
+            } else {
+                "+5V_MAIN"
+            };
+            assert!(root_after.contains(other_rail));
+            assert!(root_after.contains("wire-other"));
+            assert!(root_after.contains("wire-usb"));
+            assert!(!root_after.contains(&format!("(property \"Value\" \"{rail}\"")));
+            for child in [power, core] {
+                let child_after = std::fs::read_to_string(child).unwrap();
+                assert!(!child_after.contains(&format!("hierarchical_label \"{rail}\"")));
+                assert!(child_after.contains(&format!("(property \"Value\" \"{rail}\"")));
+                assert!(!child_after.contains(&format!("power:{rail}")));
+                assert!(child_after.contains(other_rail));
+                assert!(child_after.contains("USB_SIGNAL"));
+            }
+        }
     }
 
     #[tokio::test]
