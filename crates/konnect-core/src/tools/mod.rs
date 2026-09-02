@@ -1357,7 +1357,7 @@ pub fn sheet_instance_context(
 }
 
 /// The `.kicad_pro` governing `file`, from its own directory upwards.
-fn nearest_kicad_pro(file: &std::path::Path) -> Option<std::path::PathBuf> {
+pub(crate) fn nearest_kicad_pro(file: &std::path::Path) -> Option<std::path::PathBuf> {
     file.parent()?.ancestors().find_map(|dir| {
         std::fs::read_dir(dir).ok()?.find_map(|entry| {
             let path = entry.ok()?.path();

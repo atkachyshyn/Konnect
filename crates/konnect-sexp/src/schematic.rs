@@ -801,7 +801,7 @@ pub fn extract_lib_pins_for_unit(sym_node: &SexpNode, unit: u32) -> Vec<LibPin> 
     let mut out = Vec::new();
     for pin in sym_node.find_all("pin") {
         if let Some(lib_pin) = parse_lib_pin(pin) {
-            out.push(lib_pin);
+            out.extend(expand_multi_number_lib_pin(lib_pin));
         }
     }
     for sub in sym_node.find_all("symbol") {
@@ -832,13 +832,75 @@ pub fn parse_subsymbol_unit(name: &str) -> Option<u32> {
 fn collect_pins_recursive(node: &SexpNode, out: &mut Vec<LibPin>) {
     for pin in node.find_all("pin") {
         if let Some(lib_pin) = parse_lib_pin(pin) {
-            out.push(lib_pin);
+            out.extend(expand_multi_number_lib_pin(lib_pin));
         }
     }
     // Recurse into unit/body-style sub-symbols ("R_1_1", "R_1_0", …).
     for sub in node.find_all("symbol") {
         collect_pins_recursive(sub, out);
     }
+}
+
+/// Expand KiCad 10's compact stacked-pin number syntax into the individual
+/// logical/physical pin numbers it represents. A declaration such as
+/// `[1-3]`, `[1,2,3]`, or `[1-2,3]` is electrically equivalent to separate
+/// pins 1, 2, and 3 stacked at the same location.
+///
+/// Pin numbers are not restricted to integers, so comma-separated literal
+/// tokens are preserved (`[A1,A2]`). Numeric `N-M` tokens expand inclusively;
+/// anything else containing a dash is retained literally rather than guessed.
+fn expand_pin_number_spec(number: &str) -> Vec<String> {
+    let Some(inner) = number.strip_prefix('[').and_then(|value| value.strip_suffix(']')) else {
+        return vec![number.to_string()];
+    };
+
+    let mut expanded = Vec::new();
+    for token in inner.split(',').map(str::trim).filter(|token| !token.is_empty()) {
+        let numeric_range = token.split_once('-').and_then(|(start, end)| {
+            let start = start.trim().parse::<i64>().ok()?;
+            let end = end.trim().parse::<i64>().ok()?;
+            Some((start, end))
+        });
+        if let Some((start, end)) = numeric_range {
+            if start <= end {
+                expanded.extend((start..=end).map(|value| value.to_string()));
+            } else {
+                expanded.extend((end..=start).rev().map(|value| value.to_string()));
+            }
+        } else {
+            expanded.push(token.to_string());
+        }
+    }
+
+    if expanded.is_empty() {
+        return vec![number.to_string()];
+    }
+
+    // Preserve KiCad's declaration order. Sorting strings here makes numeric
+    // ranges such as `[1-12]` come back as 1,10,11,12,2,... which is harmless
+    // electrically but wrong for every caller that presents pins to a human.
+    let mut deduped = Vec::with_capacity(expanded.len());
+    for number in expanded {
+        if !deduped.contains(&number) {
+            deduped.push(number);
+        }
+    }
+    deduped
+}
+
+fn expand_multi_number_lib_pin(pin: LibPin) -> Vec<LibPin> {
+    expand_pin_number_spec(&pin.number)
+        .into_iter()
+        .map(|number| LibPin {
+            number,
+            name: pin.name.clone(),
+            electrical_type: pin.electrical_type.clone(),
+            local_x: pin.local_x,
+            local_y: pin.local_y,
+            rotation: pin.rotation,
+            length: pin.length,
+        })
+        .collect()
 }
 
 fn parse_lib_pin(node: &SexpNode) -> Option<LibPin> {
@@ -1288,6 +1350,36 @@ mod unit_pin_tests {
         assert_eq!(
             numbers(&extract_lib_pins(sym)),
             vec!["1", "2", "3", "4", "5", "6", "7", "8"]
+        );
+    }
+
+    #[test]
+    fn kicad10_multi_number_pin_expands_to_logical_stacked_pins() {
+        for (spec, expected) in [
+            ("[1-3]", vec!["1", "2", "3"]),
+            ("[1,2,3]", vec!["1", "2", "3"]),
+            ("[1-2,3]", vec!["1", "2", "3"]),
+            ("[A1,A2]", vec!["A1", "A2"]),
+        ] {
+            let root = parse_sexp(&format!(
+                r#"(kicad_symbol_lib
+  (symbol "TEST"
+    (pin passive line (at 0 0 0) (length 0)
+      (name "STACK" (effects (font (size 1.27 1.27))))
+      (number "{spec}" (effects (font (size 1.27 1.27)))))))"#
+            ))
+            .unwrap();
+            let pins = extract_lib_pins(root.find("symbol").unwrap());
+            assert_eq!(numbers(&pins), expected, "{spec}");
+            assert!(pins.iter().all(|pin| pin.local_x == 0.0 && pin.local_y == 0.0));
+        }
+    }
+
+    #[test]
+    fn multi_number_pin_preserves_declaration_order() {
+        assert_eq!(
+            expand_pin_number_spec("[1-12]"),
+            (1..=12).map(|number| number.to_string()).collect::<Vec<_>>()
         );
     }
 

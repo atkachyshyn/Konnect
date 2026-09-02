@@ -15,6 +15,38 @@ use std::time::Instant;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, info, warn};
 
+const PROTOCOL_VERSION_META_KEY: &str = "io.modelcontextprotocol/protocolVersion";
+const SERVER_INFO_META_KEY: &str = "io.modelcontextprotocol/serverInfo";
+
+fn request_protocol_version(req: &JsonRpcRequest) -> Option<&str> {
+    req.params
+        .as_ref()?
+        .get("_meta")?
+        .get(PROTOCOL_VERSION_META_KEY)?
+        .as_str()
+}
+
+fn is_modern_request(req: &JsonRpcRequest) -> bool {
+    req.method == "server/discover"
+        || request_protocol_version(req) == Some(super::server::MODERN_PROTOCOL_VERSION)
+}
+
+fn modern_complete_result(mut value: Value, cacheable: bool) -> Value {
+    let Value::Object(ref mut object) = value else {
+        return value;
+    };
+    object.insert("resultType".to_string(), json!("complete"));
+    object.insert(
+        "_meta".to_string(),
+        json!({ (SERVER_INFO_META_KEY): McpServerState::server_info_json() }),
+    );
+    if cacheable {
+        object.insert("ttlMs".to_string(), json!(0));
+        object.insert("cacheScope".to_string(), json!("private"));
+    }
+    value
+}
+
 /// Clone-able handle to the MCP request handler.
 /// Multiple transports (STDIO + HTTP) share the same handler.
 #[derive(Clone)]
@@ -122,27 +154,64 @@ impl McpHandler {
         match req.method.as_str() {
             // ── Lifecycle ──────────────────────────────────────────────────
             "initialize" => {
-                let result = McpServerState::build_initialize_result();
+                let requested_version = req
+                    .params
+                    .as_ref()
+                    .and_then(|params| params.get("protocolVersion"))
+                    .and_then(Value::as_str);
+                // When dispatcher tools are exposed the callable surface is stable:
+                // every domain tool is reachable through execute_konnect_tool without
+                // changing tools/list. Do not advertise listChanged in that mode —
+                // clients otherwise open a GET/SSE notification channel that is both
+                // unnecessary and, for stateless remote clients, can block tool calls.
+                let result = McpServerState::build_initialize_result(
+                    requested_version,
+                    !self.ctx.config.dispatcher_tools,
+                );
                 Ok(Some(serde_json::to_value(result)?))
             }
+            "server/discover" => Ok(Some(json!({
+                "resultType": "complete",
+                "supportedVersions": [super::server::MODERN_PROTOCOL_VERSION],
+                "capabilities": { "tools": {} },
+                "_meta": {
+                    (SERVER_INFO_META_KEY): McpServerState::server_info_json()
+                },
+                "ttlMs": 0,
+                "cacheScope": "private"
+            }))),
             "notifications/initialized" => Ok(None),
             "ping" => Ok(Some(json!({}))),
 
             // ── Tool listing ───────────────────────────────────────────────
             "tools/list" => {
-                // Meta-tools (always visible) + all domain tools (pre-loaded at startup)
-                let mut tools = meta_tools::meta_tool_descriptions();
-                if self.ctx.config.dispatcher_tools {
+                // A deliberately tiny schema surface for diagnosing strict MCP
+                // clients. This is opt-in and never changes normal discovery.
+                let diagnostic_minimal =
+                    std::env::var_os("KONNECT_DIAGNOSTIC_MINIMAL_TOOLS").is_some();
+                let mut tools = if diagnostic_minimal {
+                    meta_tools::diagnostic_tool_descriptions()
+                } else {
+                    meta_tools::meta_tool_descriptions()
+                };
+                if !diagnostic_minimal && self.ctx.config.dispatcher_tools {
                     tools.extend(meta_tools::dispatcher_tool_descriptions());
                 }
-                for def in self.ctx.router.active_tools().await {
-                    tools.push(def.to_mcp_description());
+                if !diagnostic_minimal {
+                    for def in self.ctx.router.active_tools().await {
+                        tools.push(def.to_mcp_description());
+                    }
                 }
                 let result = ListToolsResult {
                     tools,
                     next_cursor: None,
                 };
-                Ok(Some(serde_json::to_value(result)?))
+                let value = serde_json::to_value(result)?;
+                Ok(Some(if is_modern_request(req) {
+                    modern_complete_result(value, true)
+                } else {
+                    value
+                }))
             }
 
             // ── Tool execution ─────────────────────────────────────────────
@@ -151,7 +220,12 @@ impl McpHandler {
                     serde_json::from_value(req.params.clone().unwrap_or(Value::Null))?;
 
                 let call_result = self.execute_tool(&params).await;
-                Ok(Some(serde_json::to_value(call_result)?))
+                let value = serde_json::to_value(call_result)?;
+                Ok(Some(if is_modern_request(req) {
+                    modern_complete_result(value, false)
+                } else {
+                    value
+                }))
             }
 
             // ── Unimplemented MCP methods ──────────────────────────────────
@@ -448,6 +522,14 @@ impl McpHandler {
     }
 
     async fn notify_tools_list_changed(&self) {
+        // Dispatcher mode deliberately advertises tools.listChanged=false: its
+        // public tool surface is stable and all domain tools remain reachable
+        // through execute_konnect_tool. Emitting an unadvertised notification
+        // would violate that contract and can provoke unnecessary GET/SSE setup.
+        if self.ctx.config.dispatcher_tools {
+            return;
+        }
+
         let notification = JsonRpcNotification::new(TOOLS_LIST_CHANGED, None);
         let Ok(json) = serde_json::to_string(&notification) else {
             return;
@@ -544,6 +626,107 @@ fn result_content_bytes(result: &CallToolResult) -> usize {
             ToolContent::Image { data, .. } => data.len(),
         })
         .sum()
+}
+
+#[cfg(test)]
+mod protocol_era_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    async fn handler() -> McpHandler {
+        McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: false,
+            dispatcher_tools: true,
+        })
+        .await
+        .expect("handler builds")
+    }
+
+    #[tokio::test]
+    async fn legacy_initialize_echoes_supported_requested_version() {
+        let response = handler()
+            .await
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": {"name": "test", "version": "1"}
+                }
+            }))
+            .await
+            .expect("initialize responds");
+        let result = response.result.unwrap();
+        assert_eq!(result["protocolVersion"], "2025-11-25");
+        assert_eq!(
+            result["capabilities"]["tools"]["listChanged"],
+            false,
+            "dispatcher mode has a stable callable surface and must not require an SSE list-change channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn modern_discover_advertises_stateless_protocol() {
+        let response = handler()
+            .await
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": "discover",
+                "method": "server/discover",
+                "params": {
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": {}
+                    }
+                }
+            }))
+            .await
+            .expect("discover responds");
+        let result = response.result.unwrap();
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(result["supportedVersions"], json!(["2026-07-28"]));
+        assert_eq!(result["capabilities"]["tools"], json!({}));
+        assert_eq!(
+            result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+            "konnect"
+        );
+    }
+
+    #[tokio::test]
+    async fn modern_tools_list_has_complete_and_cache_metadata() {
+        let response = handler()
+            .await
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list",
+                "params": {
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": {}
+                    }
+                }
+            }))
+            .await
+            .expect("tools/list responds");
+        let result = response.result.unwrap();
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(result["ttlMs"], 0);
+        assert_eq!(result["cacheScope"], "private");
+        assert!(result["tools"].as_array().is_some());
+        assert_eq!(
+            result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+            "konnect"
+        );
+    }
 }
 
 /// A missing *path* argument must reach the caller as `invalid_argument`

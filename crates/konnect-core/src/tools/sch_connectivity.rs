@@ -96,13 +96,14 @@ impl PointIndex {
     }
 }
 
-/// Wires bucketed by the coordinate they hold constant: a horizontal wire can
-/// only be met in its own row, a vertical one in its own column. Mirrors
-/// `point_on_segment`, which answers `false` for anything diagonal.
+/// Axis-aligned wires use fast row/column buckets. Arbitrary-angle KiCad wires
+/// are retained in a fallback list and tested with the same general
+/// `point_on_segment` predicate.
 struct WireIndex<'a> {
     tol: f64,
     rows: HashMap<i64, Vec<&'a Wire>>,
     columns: HashMap<i64, Vec<&'a Wire>>,
+    arbitrary: Vec<&'a Wire>,
 }
 
 impl<'a> WireIndex<'a> {
@@ -115,6 +116,7 @@ impl<'a> WireIndex<'a> {
             tol,
             rows: HashMap::new(),
             columns: HashMap::new(),
+            arbitrary: Vec::new(),
         };
         for wire in wires {
             if (wire.x1 - wire.x2).abs() < tol {
@@ -129,6 +131,8 @@ impl<'a> WireIndex<'a> {
                     .entry(bucket(wire.y1, tol))
                     .or_default()
                     .push(wire);
+            } else {
+                index.arbitrary.push(wire);
             }
         }
         index
@@ -143,6 +147,7 @@ impl<'a> WireIndex<'a> {
             let row = self.rows.get(&(cell_y + delta)).into_iter().flatten();
             column.chain(row)
         })
+        .chain(self.arbitrary.iter())
     }
 
     /// Every wire that actually passes through `(x, y)`.
@@ -457,14 +462,48 @@ impl<'a> ConnectivityIndex<'a> {
         self.label_points.contains(x, y)
     }
 
-    /// How many pins lie at `(x, y)`. A point that is itself a pin counts
-    /// itself, so two or more means pins are stacked — a legal connection.
-    pub(crate) fn pins_at(&self, x: f64, y: f64) -> usize {
-        self.pin_points.count_at(x, y)
-    }
-
     pub(crate) fn has_pin(&self, x: f64, y: f64) -> bool {
         self.pin_points.contains(x, y)
+    }
+
+    /// Pins at this coordinate that are allowed to participate in a KiCad pin
+    /// stack. Intrinsic `no_connect` pins are isolated from coincident siblings.
+    /// A schematic no-connect flag breaks the entire stack into separate nets.
+    pub(crate) fn connectable_pins_at(&self, x: f64, y: f64) -> usize {
+        if self.has_no_connect(x, y) {
+            return 0;
+        }
+        self.placed_pins
+            .iter()
+            .filter(|placed| placed.pin.electrical_type != "no_connect")
+            .filter(|placed| {
+                points_coincident(x, y, placed.at.0, placed.at.1, self.pin_points.tol)
+            })
+            .count()
+    }
+
+    pub(crate) fn has_connectable_pin(&self, x: f64, y: f64) -> bool {
+        self.connectable_pins_at(x, y) > 0
+    }
+
+    /// Resolve one logical pin's named net without letting an NC-stacked pin
+    /// inherit the coordinate's shared net identity.
+    pub(crate) fn net_for_pin_at(
+        &self,
+        graph: &mut NetGraph,
+        electrical_type: &str,
+        x: f64,
+        y: f64,
+    ) -> Option<String> {
+        if electrical_type == "no_connect" || self.has_no_connect(x, y) {
+            None
+        } else {
+            graph.net_at(x, y)
+        }
+    }
+
+    pub(crate) fn net_for_pin(&self, graph: &mut NetGraph, placed: &PlacedPin) -> Option<String> {
+        self.net_for_pin_at(graph, &placed.pin.electrical_type, placed.at.0, placed.at.1)
     }
 
     pub(crate) fn has_sheet_pin(&self, x: f64, y: f64) -> bool {
@@ -502,7 +541,7 @@ impl<'a> ConnectivityIndex<'a> {
         self.has_wire_end(x, y)
             || self.has_label(x, y)
             || self.has_sheet_pin(x, y)
-            || self.pins_at(x, y) >= 2
+            || self.connectable_pins_at(x, y) >= 2
             || (self.has_junction(x, y) && self.on_wire(x, y))
     }
 
@@ -581,6 +620,32 @@ mod agreement_tests {
         format!("(kicad_sch\n\t(version 20260306)\n\t(generator \"eeschema\")\n\t(uuid \"root\")\n{LIB}{body}\t(sheet_instances (path \"/\" (page \"1\")))\n)\n")
     }
 
+    fn mixed_stack_schematic() -> String {
+        r#"(kicad_sch
+  (version 20260306)
+  (generator "eeschema")
+  (uuid "root")
+  (lib_symbols
+    (symbol "Test:STACK"
+      (symbol "STACK_1_1"
+        (pin passive line (at 0 0 0) (length 2.54) (name "SIG") (number "1"))
+        (pin no_connect line (at 0 0 0) (length 2.54) (name "NC") (number "2"))
+      )
+    )
+  )
+  (symbol
+    (lib_id "Test:STACK")
+    (at 100 80 0)
+    (unit 1)
+    (uuid "stack")
+    (property "Reference" "U1" (at 100 80 0))
+    (property "Value" "STACK" (at 100 82 0))
+  )
+  (sheet_instances (path "/" (page "1")))
+)
+"#.to_string()
+    }
+
     /// U1 —— wire —— sheet pin. Both ends of the wire are terminated, and every
     /// tool has to say so: `validate_wire_connections` used to report the
     /// sheet-pin end as floating because sheet pins were not in its item set.
@@ -615,6 +680,33 @@ mod agreement_tests {
 
         let components = call("validate_component_connections", &sch, json!({})).await;
         assert_eq!(components["unconnected_count"], 0, "{components}");
+    }
+
+    #[tokio::test]
+    async fn intrinsic_no_connect_pin_breaks_a_two_pin_stack() {
+        let sch = mixed_stack_schematic();
+        let orphans = call("find_orphan_items", &sch, json!({})).await;
+        assert_eq!(orphans["orphan_count"], 1, "{orphans}");
+        assert_eq!(orphans["orphans"][0]["pin"], "1");
+        assert_eq!(orphans["orphans"][0]["type"], "unconnected_pin");
+
+        let components = call("validate_component_connections", &sch, json!({})).await;
+        assert_eq!(components["unconnected_count"], 1, "{components}");
+        assert_eq!(components["unconnected_pins"][0]["pin"], "1");
+    }
+
+    #[test]
+    fn no_connect_flag_breaks_an_ordinary_pin_stack() {
+        let sch = schematic(&format!(
+            "{}{}\t(no_connect (at 100 80) (uuid \"nc\"))\n",
+            symbol("U1", "u1", 100.0, 80.0),
+            symbol("U2", "u2", 100.0, 80.0),
+        ));
+        let (tree, wires, labels) = index_for(&sch);
+        let index = ConnectivityIndex::build(&tree, &wires, &labels, COINCIDENT_TOLERANCE);
+        assert_eq!(index.placed_pins().len(), 2);
+        assert_eq!(index.connectable_pins_at(100.0, 80.0), 0);
+        assert!(!index.attaches_pin(100.0, 80.0));
     }
 
     /// A lone pin is unconnected for both tools — the agreement has to hold in
@@ -676,9 +768,25 @@ mod agreement_tests {
         (tree, wires, labels)
     }
 
-    /// The graph now attaches at the index's tolerance instead of a hardcoded
-    /// 0.01, so a label 0.03 mm off a wire joins that wire's net when the
-    /// caller asked for 0.05 and stays an island when it asked for 0.01.
+    /// Arbitrary-angle wires participate in both point attachment queries and
+    /// semantic net naming, not just in geometric rendering.
+    #[test]
+    fn diagonal_wire_participates_in_net_graph_and_index() {
+        let sch = schematic(
+            "\t(wire\n\t\t(pts (xy 100 80) (xy 120 100))\n\t\t(uuid \"diag\")\n\t)\n\t(label \"NETD\"\n\t\t(at 110 90 0)\n\t\t(uuid \"ld\")\n\t)\n",
+        );
+        let (tree, wires, labels) = index_for(&sch);
+        let index = ConnectivityIndex::build(&tree, &wires, &labels, COINCIDENT_TOLERANCE);
+        assert!(index.on_wire(110.0, 90.0));
+        assert!(index.on_wire_interior(110.0, 90.0));
+        let mut graph = net_graph_for(&tree, &wires, &labels);
+        assert_eq!(graph.net_at(100.0, 80.0), Some("NETD".to_string()));
+        assert_eq!(graph.net_at(120.0, 100.0), Some("NETD".to_string()));
+    }
+
+    /// The graph attaches at the index's tolerance instead of a hardcoded 0.01,
+    /// so a label 0.03 mm off a wire joins that wire's net when the caller asked
+    /// for 0.05 and stays an island when it asked for 0.01.
     #[tokio::test]
     async fn the_graph_attaches_at_the_index_tolerance() {
         let sch = schematic(

@@ -180,16 +180,26 @@ pub fn points_coincident(x1: f64, y1: f64, x2: f64, y2: f64, tol: f64) -> bool {
 /// Check whether point (px, py) lies on line segment (x1,y1)→(x2,y2)
 /// within a tolerance. Used for T-junction detection.
 pub fn point_on_segment(px: f64, py: f64, x1: f64, y1: f64, x2: f64, y2: f64, tol: f64) -> bool {
-    // Segment must be axis-aligned (KiCAD wires are always H or V)
-    if (x1 - x2).abs() < tol {
-        // Vertical segment
-        (px - x1).abs() <= tol && py >= y1.min(y2) - tol && py <= y1.max(y2) + tol
-    } else if (y1 - y2).abs() < tol {
-        // Horizontal segment
-        (py - y1).abs() <= tol && px >= x1.min(x2) - tol && px <= x1.max(x2) + tol
-    } else {
-        false // Diagonal — should never occur for KiCAD wires
+    // KiCad permits 90°, 45°, and arbitrary-angle schematic wires. Treat the
+    // tolerance as a perpendicular distance from the finite segment.
+    let dx = x2 - x1;
+    let dy = y2 - y1;
+    let len_sq = dx * dx + dy * dy;
+    if len_sq <= tol * tol {
+        return points_coincident(px, py, x1, y1, tol);
     }
+
+    let len = len_sq.sqrt();
+    let rel_x = px - x1;
+    let rel_y = py - y1;
+    let cross = rel_x * dy - rel_y * dx;
+    if cross.abs() > tol * len {
+        return false;
+    }
+
+    let dot = rel_x * dx + rel_y * dy;
+    let endpoint_margin = tol * len;
+    dot >= -endpoint_margin && dot <= len_sq + endpoint_margin
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -488,5 +498,11 @@ mod tests {
         assert!(point_on_segment(0.0, 0.0, 0.0, 0.0, 10.0, 0.0, 0.01));
         // Off segment
         assert!(!point_on_segment(5.0, 1.0, 0.0, 0.0, 10.0, 0.0, 0.01));
+        // Arbitrary-angle KiCad wire.
+        assert!(point_on_segment(5.0, 5.0, 0.0, 0.0, 10.0, 10.0, 0.01));
+        assert!(point_on_segment(10.0, 10.0, 0.0, 0.0, 10.0, 10.0, 0.01));
+        assert!(!point_on_segment(5.0, 5.1, 0.0, 0.0, 10.0, 10.0, 0.01));
+        // Point lies on the infinite line but beyond the finite segment.
+        assert!(!point_on_segment(11.0, 11.0, 0.0, 0.0, 10.0, 10.0, 0.01));
     }
 }

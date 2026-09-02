@@ -333,14 +333,17 @@ async fn handle_get_pin_connections(
         .map(|n| n.find_all("symbol"))
         .unwrap_or_default();
     let lib_sym = find_lib_symbol(&lib_syms, inst);
-    let pin_ep = lib_sym.and_then(|sym| {
+    let pin_info = lib_sym.and_then(|sym| {
         konnect_sexp::schematic::extract_lib_pins(sym)
-            .iter()
+            .into_iter()
             .find(|p| p.number == pin_number)
-            .map(|p| konnect_sexp::schematic::pin_endpoint(p, inst.pin_transform()))
+            .map(|p| {
+                let (px, py) = konnect_sexp::schematic::pin_endpoint(&p, inst.pin_transform());
+                (p, px, py)
+            })
     });
-    let (px, py) = match pin_ep {
-        Some(ep) => ep,
+    let (pin, px, py) = match pin_info {
+        Some(info) => info,
         None => {
             return Ok(CallToolResult::error(format!(
                 "Pin '{}' not found on '{}'",
@@ -348,9 +351,16 @@ async fn handle_get_pin_connections(
             )))
         }
     };
+    let index = ConnectivityIndex::build(
+        &tree,
+        &wires,
+        &labels,
+        crate::tools::sch_connectivity::COINCIDENT_TOLERANCE,
+    );
     let mut g = net_graph_for(&tree, &wires, &labels);
+    let net = index.net_for_pin_at(&mut g, &pin.electrical_type, px, py);
     Ok(CallToolResult::json(
-        &json!({ "reference": reference, "pin": pin_number, "pin_x": px, "pin_y": py, "net": g.net_at(px, py) }),
+        &json!({ "reference": reference, "pin": pin_number, "pin_x": px, "pin_y": py, "net": net }),
     ))
 }
 
@@ -376,12 +386,18 @@ async fn handle_get_component_nets(
         .map(|n| n.find_all("symbol"))
         .unwrap_or_default();
     let lib_sym = find_lib_symbol(&lib_syms, inst);
+    let index = ConnectivityIndex::build(
+        &tree,
+        &wires,
+        &labels,
+        crate::tools::sch_connectivity::COINCIDENT_TOLERANCE,
+    );
     let mut g = net_graph_for(&tree, &wires, &labels);
     let pins: Vec<serde_json::Value> = if let Some(sym) = lib_sym {
         let t = inst.pin_transform();
         konnect_sexp::schematic::extract_lib_pins(sym).iter().map(|p| {
             let (px, py) = konnect_sexp::schematic::pin_endpoint(p, t);
-            json!({ "pin": p.number, "name": p.name, "x": px, "y": py, "net": g.net_at(px, py) })
+            json!({ "pin": p.number, "name": p.name, "x": px, "y": py, "net": index.net_for_pin_at(&mut g, &p.electrical_type, px, py) })
         }).collect()
     } else {
         Vec::new()
@@ -408,8 +424,13 @@ async fn handle_get_net_components(
         .find("lib_symbols")
         .map(|n| n.find_all("symbol"))
         .unwrap_or_default();
+    let index = ConnectivityIndex::build(
+        &tree,
+        &wires,
+        &labels,
+        crate::tools::sch_connectivity::COINCIDENT_TOLERANCE,
+    );
     let mut g = net_graph_for(&tree, &wires, &labels);
-    let net_pts: HashSet<(i64, i64)> = g.points_on_net(&net).into_iter().collect();
     let result: Vec<serde_json::Value> = instances
         .iter()
         .filter_map(|inst| {
@@ -419,7 +440,7 @@ async fn handle_get_net_components(
                 .iter()
                 .filter_map(|p| {
                     let (px, py) = konnect_sexp::schematic::pin_endpoint(p, t);
-                    if net_pts.contains(&pt_key(px, py)) {
+                    if index.net_for_pin_at(&mut g, &p.electrical_type, px, py).as_deref() == Some(net.as_str()) {
                         Some(json!({ "pin": p.number, "name": p.name }))
                     } else {
                         None
@@ -638,6 +659,12 @@ async fn handle_get_connected_items(
     };
 
     let lib_sym = find_lib_symbol(&lib_syms, inst);
+    let index = ConnectivityIndex::build(
+        &tree,
+        &wires,
+        &labels,
+        crate::tools::sch_connectivity::COINCIDENT_TOLERANCE,
+    );
     let mut g = net_graph_for(&tree, &wires, &labels);
 
     // Get nets for each pin
@@ -646,7 +673,7 @@ async fn handle_get_connected_items(
         let t = inst.pin_transform();
         for p in konnect_sexp::schematic::extract_lib_pins(sym) {
             let (px, py) = konnect_sexp::schematic::pin_endpoint(&p, t);
-            if let Some(net) = g.net_at(px, py) {
+            if let Some(net) = index.net_for_pin_at(&mut g, &p.electrical_type, px, py) {
                 connected_nets.insert(net);
             }
         }
@@ -683,7 +710,7 @@ async fn handle_get_connected_items(
             let matching_pins: Vec<_> = konnect_sexp::schematic::extract_lib_pins(ls).iter()
                 .filter_map(|p| {
                     let (px, py) = konnect_sexp::schematic::pin_endpoint(p, t);
-                    if all_net_pts.contains(&pt_key(px, py)) {
+                    if index.net_for_pin_at(&mut g, &p.electrical_type, px, py).is_some_and(|net| connected_nets.contains(&net)) {
                         Some(json!({ "pin": p.number, "name": p.name }))
                     } else { None }
                 }).collect();

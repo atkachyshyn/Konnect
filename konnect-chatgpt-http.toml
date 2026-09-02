@@ -1,0 +1,5 @@
+transport = "http"
+http_address = "127.0.0.1:8000"
+log_level = "info"
+dispatcher_tools = true
+eager_toolsets = false

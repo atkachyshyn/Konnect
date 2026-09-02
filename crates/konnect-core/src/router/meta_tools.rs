@@ -1,4 +1,4 @@
-//! The 6 always-visible meta-tools.
+//! The always-visible meta-tools.
 //!
 //! Discovery / routing:
 //!   list_toolboxes()          — show every toolset with descriptions and load state
@@ -133,6 +133,31 @@ pub fn meta_tool_descriptions() -> Vec<McpToolDescription> {
                 "required": []
             }),
         },
+        // Deliberately boring diagnostic tools. Their schemas mirror the
+        // simplest fs-mcp-rs shapes so we can distinguish transport/session
+        // failures from client-side schema/tool-binding failures.
+        McpToolDescription {
+            name: "konnect_ping".to_string(),
+            description: "Diagnostic tool that returns pong and has no arguments.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+        },
+        McpToolDescription {
+            name: "konnect_echo".to_string(),
+            description: "Diagnostic tool that returns the supplied message.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "Text to return unchanged"
+                    }
+                },
+                "required": ["message"]
+            }),
+        },
     ]
 }
 
@@ -143,6 +168,17 @@ pub fn meta_tool_descriptions() -> Vec<McpToolDescription> {
 /// Kept separate from [`meta_tool_descriptions`] so a client that does not need
 /// them does not pay for them: they are pure overhead for a client whose tool
 /// list refreshes normally.
+/// Tiny tool surface used only to diagnose strict MCP clients. Keeping this
+/// behind an environment switch lets us prove whether a failure is caused by
+/// Konnect's full tool catalogue/schema surface without changing production
+/// discovery behavior.
+pub fn diagnostic_tool_descriptions() -> Vec<McpToolDescription> {
+    meta_tool_descriptions()
+        .into_iter()
+        .filter(|tool| matches!(tool.name.as_str(), "konnect_ping" | "konnect_echo"))
+        .collect()
+}
+
 pub fn dispatcher_tool_descriptions() -> Vec<McpToolDescription> {
     vec![
         McpToolDescription {
@@ -250,6 +286,17 @@ pub async fn handle_meta_tool(
         "get_active_toolsets" => Some(handle_get_active_toolsets(ctx).await),
         "get_recent_calls" => Some(handle_get_recent_calls(args, ctx).await),
         "server_stats" => Some(handle_server_stats(ctx).await),
+        "konnect_ping" => Some(CallToolResult::text("pong")),
+        "konnect_echo" => Some(match args.get("message").and_then(Value::as_str) {
+            Some(message) => CallToolResult::text(message),
+            None => CallToolResult::error_kind(
+                ToolErrorKind::InvalidArgument {
+                    field: "message".to_string(),
+                    reason: "missing or not a string".to_string(),
+                },
+                "Argument 'message' is invalid: missing or not a string",
+            ),
+        }),
         "list_available_tools" => Some(handle_list_available_tools(args, ctx).await),
         "get_tool_schema" => Some(handle_get_tool_schema(args, ctx).await),
         // `execute_konnect_tool` is deliberately absent: the handler unwraps it

@@ -15,10 +15,10 @@ use konnect_sexp::{
     geometry::{points_coincident, snap_point},
     parser::parse_sexp,
     schematic::{
-        extract_sheet_pins, extract_symbol_instances, extract_wires, find_lib_symbol,
-        find_t_junctions, format_junction, format_wire, parse_at, pin_endpoint,
-        pin_outward_direction, read_schematic, symbol_bounds_for_instance, Label, LabelKind,
-        SymbolBounds, Wire,
+        extract_junctions, extract_no_connects, extract_sheet_pins, extract_symbol_instances,
+        extract_wires, find_lib_symbol, find_t_junctions, format_junction, format_wire, parse_at,
+        pin_endpoint, pin_outward_direction, read_schematic, symbol_bounds_for_instance, Label,
+        LabelKind, SymbolBounds, Wire,
     },
     writer::{
         apply_edits, find_balanced_block, find_block_starts, find_block_with_leading_whitespace,
@@ -628,9 +628,14 @@ pub(crate) fn insert_wire_with_junctions(
     x2: f64,
     y2: f64,
 ) -> String {
-    // Parse existing wires to detect new T-junctions
+    // Parse existing wires to detect only T-junctions involving the new wire.
+    // A proper interior/interior crossing is a normal non-connecting schematic
+    // crossover and must NOT acquire a junction dot. Older code ran
+    // `find_t_junctions` over the whole sheet after appending the new segment,
+    // which also re-discovered unrelated historical T's and made serializer
+    // behaviour depend on whatever geometry happened to already exist.
     let tree = konnect_sexp::parse_sexp(&content).ok();
-    let mut existing_wires = tree.as_ref().map(extract_wires).unwrap_or_default();
+    let existing_wires = tree.as_ref().map(extract_wires).unwrap_or_default();
 
     // Existing junction positions, so a hit already marked isn't re-inserted
     // (L-bends, and any loop calling this repeatedly, would otherwise double it).
@@ -639,17 +644,30 @@ pub(crate) fn insert_wire_with_junctions(
         .map(konnect_sexp::schematic::extract_junctions)
         .unwrap_or_default();
 
-    // Add the new wire to the set before checking junctions (it may form T's too)
-    let new_wire = konnect_sexp::schematic::Wire {
+    let new_segment = Segment {
         x1,
         y1,
         x2,
         y2,
-        uuid: None,
     };
-    existing_wires.push(new_wire);
-
-    let mut junctions = find_t_junctions(&existing_wires, 0.01);
+    let mut junctions = existing_wires
+        .iter()
+        .filter_map(|wire| {
+            let existing = Segment {
+                x1: wire.x1,
+                y1: wire.y1,
+                x2: wire.x2,
+                y2: wire.y2,
+            };
+            match schematic_wire_relationship(new_segment, existing) {
+                SchematicWireRelationship::EndpointOnInterior { x, y } => Some((x, y)),
+                SchematicWireRelationship::Disjoint
+                | SchematicWireRelationship::ProperCrossing { .. }
+                | SchematicWireRelationship::SharedEndpoint { .. }
+                | SchematicWireRelationship::CollinearOverlap => None,
+            }
+        })
+        .collect::<Vec<_>>();
     // Existing pins the new wire passes over also need junction dots.
     let pins = tree
         .as_ref()
@@ -858,7 +876,125 @@ impl SheetPinChange {
 struct SemanticSnapshot {
     pin_nets: BTreeMap<String, Option<String>>,
     shorts: Vec<Vec<String>>,
+    net_scopes: BTreeMap<String, BTreeSet<String>>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct KicadNetIdentity {
+    name: String,
+    pins: Vec<String>,
+}
+
+fn node_bool(node: &konnect_sexp::SexpNode, tag: &str) -> Option<bool> {
+    match node.find_str(tag)? {
+        "yes" => Some(true),
+        "no" => Some(false),
+        _ => None,
+    }
+}
+
+fn node_has_hidden_power_pin(node: &konnect_sexp::SexpNode) -> bool {
+    if node.head() == Some("pin")
+        && node.get(1).and_then(|value| value.as_str()) == Some("power_in")
+        && node_bool(node, "hide") == Some(true)
+    {
+        return true;
+    }
+    node.children()
+        .unwrap_or(&[])
+        .iter()
+        .any(node_has_hidden_power_pin)
+}
+
+fn label_has_net_class_property(node: &konnect_sexp::SexpNode) -> bool {
+    matches!(
+        node.head(),
+        Some("label" | "global_label" | "hierarchical_label" | "directive_label")
+    ) && node.find_all("property").iter().any(|property| {
+        property.get(1).and_then(|value| value.as_str()) == Some("Net Class")
+    })
+}
+
+fn unsupported_schematic_semantic_features(
+    tree: &konnect_sexp::SexpNode,
+) -> BTreeSet<String> {
+    let mut features = BTreeSet::new();
+
+    if !tree.find_all("rule_area").is_empty() {
+        features.insert("rule_area".to_string());
+    }
+    if !tree.find_all("directive_label").is_empty() {
+        features.insert("directive_label".to_string());
+    }
+    if tree
+        .children()
+        .unwrap_or(&[])
+        .iter()
+        .any(label_has_net_class_property)
+    {
+        features.insert("label_net_class_property".to_string());
+    }
+
+    let lib_syms = tree
+        .find("lib_symbols")
+        .map(|node| node.find_all("symbol"))
+        .unwrap_or_default();
+    for instance in extract_symbol_instances(tree) {
+        let Some(lib_sym) = find_lib_symbol(&lib_syms, &instance) else {
+            continue;
+        };
+        let power_scope = lib_sym
+            .find("power")
+            .and_then(|power| power.get(1))
+            .and_then(|value| value.as_str());
+        if power_scope == Some("local") {
+            features.insert(format!(
+                "local_power_symbol:{}:{}",
+                instance.reference, instance.value
+            ));
+        }
+
+        // Power-symbol definitions intentionally use hidden power_in pins as
+        // their label anchor. The unsupported case is an ordinary component
+        // whose hidden power input participates in KiCad's implicit global-net
+        // connectivity, which Konnect does not yet model internally.
+        if lib_sym.find("power").is_none() && node_has_hidden_power_pin(lib_sym) {
+            features.insert(format!("hidden_power_pin:{}", instance.reference));
+        }
+
+        if node_bool(lib_sym, "duplicate_pin_numbers_are_jumpers") == Some(true) {
+            features.insert(format!(
+                "duplicate_pin_numbers_are_jumpers:{}",
+                instance.reference
+            ));
+        }
+        if lib_sym.find("jumper_pin_groups").is_some() {
+            features.insert(format!("jumper_pin_groups:{}", instance.reference));
+        }
+    }
+
+    features
+}
+
+fn reject_unsupported_schematic_semantics(
+    tree: &konnect_sexp::SexpNode,
+    operation: &str,
+) -> Result<(), CallToolResult> {
+    let features = unsupported_schematic_semantic_features(tree);
+    if features.is_empty() {
+        return Ok(());
+    }
+    Err(CallToolResult::error(
+        json!({
+            "code": "unsupported_schematic_semantics",
+            "message": "automatic semantic wiring/refactoring is fail-closed because this schematic uses KiCad constructs Konnect does not yet model completely",
+            "operation": operation,
+            "features": features.into_iter().collect::<Vec<_>>()
+        })
+        .to_string(),
+    ))
+}
+
 
 #[derive(Debug, Clone)]
 struct MaterializeNetPlan {
@@ -955,7 +1091,7 @@ async fn handle_materialize_schematic_net(
         &plan.final_content,
         "final transaction",
     )?;
-    validate_kicad_netlist_if_configured(ctx, &plan.schematic, &plan.before, &plan.final_content)
+    validate_kicad_netlist_if_configured(ctx, &plan.schematic, &plan.before, &plan.final_content, None)
         .await?;
     let labels_removed = if plan.remove_redundant_local_labels {
         plan.removable_local_labels.len()
@@ -984,7 +1120,7 @@ impl OptimizeLayoutPlan {
         json!({
             "dry_run": dry_run,
             "applied": applied,
-            "safe_to_apply": true,
+            "safe_to_apply": self.candidates.iter().any(|candidate| candidate.validation.hard_constraints_pass),
             "schematic": self.schematic.display().to_string(),
             "plan_revision": self.plan_revision,
             "candidate_count": self.candidates.len(),
@@ -1053,26 +1189,20 @@ pub(crate) async fn handle_optimize_schematic_layout(
         )));
     };
 
-    let base_content = apply_sheet_pin_changes_to_content(
-        &plan.schematic,
-        &plan.before,
-        &candidate.sheet_pin_changes,
-    )?;
-    let all_segments = candidate
-        .routes_by_net
-        .values()
-        .flatten()
-        .copied()
-        .collect::<Vec<_>>();
-    let final_content = apply_segments(base_content, &all_segments)?;
+    if !candidate.validation.hard_constraints_pass {
+        return Ok(CallToolResult::error(
+            "selected layout candidate failed final staged validation; rerun dry_run",
+        ));
+    }
+    let final_content = &candidate.final_content;
     validate_semantic_snapshot(
         &plan.before_snapshot,
-        &final_content,
+        final_content,
         "layout optimization final transaction",
     )?;
-    validate_kicad_netlist_if_configured(ctx, &plan.schematic, &plan.before, &final_content)
+    validate_kicad_netlist_if_configured(ctx, &plan.schematic, &plan.before, final_content, None)
         .await?;
-    write_atomic_if_unchanged(&plan.schematic, &plan.before, &final_content)?;
+    write_atomic_if_unchanged(&plan.schematic, &plan.before, final_content)?;
     Ok(CallToolResult::json(&plan.response(false, true)))
 }
 
@@ -1082,6 +1212,7 @@ fn build_optimize_layout_plan(
 ) -> Result<OptimizeLayoutPlan, CallToolResult> {
     let (before, tree) =
         read_schematic(schematic).map_err(|error| CallToolResult::error(error.to_string()))?;
+    reject_unsupported_schematic_semantics(&tree, "optimize_schematic_layout")?;
     let wires = extract_wires(&tree);
     let labels = konnect_sexp::schematic::extract_all_net_labels(&tree);
     let grid = args["grid"].as_f64().unwrap_or(1.27);
@@ -1143,6 +1274,9 @@ fn build_optimize_layout_plan(
     }
     let before_snapshot =
         semantic_snapshot(&before).map_err(|error| CallToolResult::error(error.to_string()))?;
+    for candidate in &mut all_candidates {
+        stage_and_validate_layout_candidate(schematic, &before, &before_snapshot, candidate)?;
+    }
     let plan_revision = optimize_layout_plan_revision(
         &before,
         &item_uuids,
@@ -1157,6 +1291,92 @@ fn build_optimize_layout_plan(
         plan_revision,
         before_snapshot,
     })
+}
+
+fn route_foreign_contact_count(routes_by_net: &BTreeMap<String, Vec<Segment>>) -> usize {
+    let routes = routes_by_net.iter().collect::<Vec<_>>();
+    let mut contacts = 0usize;
+    for left_index in 0..routes.len() {
+        for right_index in (left_index + 1)..routes.len() {
+            let (_, left_segments) = routes[left_index];
+            let (_, right_segments) = routes[right_index];
+            for left in left_segments {
+                for right in right_segments {
+                    if conductive_segments_contact(*left, *right) {
+                        contacts += 1;
+                    }
+                }
+            }
+        }
+    }
+    contacts
+}
+
+fn stage_and_validate_layout_candidate(
+    schematic: &Path,
+    before: &str,
+    before_snapshot: &SemanticSnapshot,
+    candidate: &mut LocalLayoutCandidate,
+) -> Result<(), CallToolResult> {
+    let (without_old_anchor_wires, removed) =
+        remove_wires_at_moved_sheet_pin_anchors(before, &candidate.sheet_pin_changes)
+            .map_err(|error| CallToolResult::error(error.to_string()))?;
+    let moved = apply_sheet_pin_changes_to_content(
+        schematic,
+        &without_old_anchor_wires,
+        &candidate.sheet_pin_changes,
+    )
+    .map_err(|error| CallToolResult::error(error.to_string()))?;
+    let all_segments = candidate
+        .routes_by_net
+        .values()
+        .flatten()
+        .copied()
+        .collect::<Vec<_>>();
+    let final_content = apply_segments(moved, &all_segments)
+        .map_err(|error| CallToolResult::error(error.to_string()))?;
+
+    let comparison = semantic_comparison(before_snapshot, &final_content)
+        .map_err(|error| CallToolResult::error(error.to_string()))?;
+    let semantic_connectivity_preserved = comparison["preserved"].as_bool().unwrap_or(false);
+    let component_pin_group_changes = comparison["component_pin_group_changes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let net_name_or_scope_changes = comparison["net_name_or_scope_changes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+
+    let final_tree = parse_sexp(&final_content)
+        .map_err(|error| CallToolResult::error(error.to_string()))?;
+    let bodies = sheet_body_obstacles(&final_tree);
+    let body_crossings = all_segments
+        .iter()
+        .filter(|segment| {
+            bodies
+                .iter()
+                .any(|body| segment_crosses_rect_interior(**segment, *body))
+        })
+        .count();
+    let foreign_conductive_contacts = route_foreign_contact_count(&candidate.routes_by_net);
+    let hard_constraints_pass = semantic_connectivity_preserved
+        && component_pin_group_changes.is_empty()
+        && net_name_or_scope_changes.is_empty()
+        && body_crossings == 0
+        && foreign_conductive_contacts == 0;
+
+    candidate.wires_to_remove = removed;
+    candidate.validation = LayoutCandidateValidation {
+        hard_constraints_pass,
+        component_pin_group_changes,
+        net_name_or_scope_changes,
+        body_crossings,
+        foreign_conductive_contacts,
+        semantic_connectivity_preserved,
+    };
+    candidate.final_content = final_content;
+    Ok(())
 }
 
 fn string_array_arg(args: &serde_json::Value, field: &str) -> Result<Vec<String>, CallToolResult> {
@@ -1234,7 +1454,7 @@ fn nets_for_item_uuids(
             .iter()
             .filter(|pin| pin.reference == instance.reference && pin.unit == instance.unit)
         {
-            if let Some(net) = graph.net_at(pin.at.0, pin.at.1) {
+            if let Some(net) = index.net_for_pin(&mut graph, pin) {
                 nets.push(net);
             }
         }
@@ -1283,6 +1503,7 @@ fn build_materialize_net_plan(
 ) -> Result<MaterializeNetPlan, CallToolResult> {
     let (before, tree) =
         read_schematic(schematic).map_err(|error| CallToolResult::error(error.to_string()))?;
+    reject_unsupported_schematic_semantics(&tree, "materialize_schematic_net")?;
     let wires = extract_wires(&tree);
     let labels = konnect_sexp::schematic::extract_all_net_labels(&tree);
     let grid = args["grid"].as_f64().unwrap_or(1.27);
@@ -1309,7 +1530,7 @@ fn build_materialize_net_plan(
         {
             continue;
         }
-        if graph.net_at(placed.at.0, placed.at.1).as_deref() == Some(net) {
+        if index.net_for_pin(&mut graph, placed).as_deref() == Some(net) {
             endpoints.push(NetEndpoint {
                 kind: NetEndpointKind::ComponentPin,
                 reference: placed.reference.clone(),
@@ -1433,6 +1654,7 @@ fn requested_materialize_pin_keys(
         .map(|n| n.find_all("symbol"))
         .unwrap_or_default();
     let mut keys = HashSet::new();
+    let no_connects = extract_no_connects(tree);
     for (index, pin) in pins.iter().enumerate() {
         let Some(reference) = pin["reference"].as_str() else {
             return Err(CallToolResult::error(format!(
@@ -1447,7 +1669,15 @@ fn requested_materialize_pin_keys(
         let (lib_pin, transform) = resolve_placed_pin(&instances, &lib_syms, reference, pin_number)
             .map_err(|error| CallToolResult::error(error.to_string()))?;
         let (x, y) = pin_endpoint(&lib_pin, transform);
-        let actual = graph.net_at(x, y);
+        let actual = if lib_pin.electrical_type == "no_connect"
+            || no_connects
+                .iter()
+                .any(|(nc_x, nc_y)| points_coincident(x, y, *nc_x, *nc_y, 0.01))
+        {
+            None
+        } else {
+            graph.net_at(x, y)
+        };
         if actual.as_deref() != Some(net) {
             return Err(CallToolResult::error(format!(
                 "refusing to materialize net '{net}' through {reference}.{pin_number}: endpoint is on {}",
@@ -1526,7 +1756,9 @@ impl RectObstacle {
 
 struct MaterializeObstacles {
     bodies: Vec<RectObstacle>,
+    approximate_bodies: Vec<RectObstacle>,
     foreign_pins: Vec<(f64, f64)>,
+    semantic_anchors: Vec<(f64, f64)>,
     foreign_wires: Vec<Segment>,
 }
 
@@ -1559,18 +1791,21 @@ impl MaterializeObstacles {
             .map(|n| n.find_all("symbol"))
             .unwrap_or_default();
 
-        let mut bodies = Vec::new();
+        let mut approximate_bodies = Vec::new();
         for instance in &instances {
             if endpoint_refs.contains(instance.reference.as_str()) {
                 continue;
             }
             if let Some(lib_sym) = find_lib_symbol(&lib_syms, instance) {
                 if let Some(bounds) = symbol_bounds_for_instance(lib_sym, instance) {
-                    bodies.push(RectObstacle::from_bounds(bounds).padded(0.01));
+                    approximate_bodies.push(RectObstacle::from_bounds(bounds).padded(0.01));
                 }
             }
         }
-        bodies.extend(sheet_body_obstacles(tree));
+        // Hierarchical sheet rectangles are exact solid occupancy. Ordinary
+        // symbol bounds are coarse transformed extents, so crossing them is a
+        // readability cost rather than a hard-invalid route.
+        let bodies = sheet_body_obstacles(tree);
 
         let foreign_pins = index
             .placed_pins()
@@ -1584,9 +1819,51 @@ impl MaterializeObstacles {
             .filter(|&(x, y)| graph.net_at(x, y).as_deref() != Some(net))
             .collect();
 
+        // A parent-sheet hierarchical connection may be electrically real but
+        // locally unnamed: the sheet-pin interface names identify the selected
+        // endpoints while NetGraph has no ordinary/global label to name that
+        // connected wire component. Treat the connected component containing a
+        // selected endpoint as target geometry rather than a foreign obstacle.
+        let target_roots = endpoints
+            .iter()
+            .map(|endpoint| {
+                graph.find(crate::tools::sch_connectivity::pt_key(
+                    endpoint.x, endpoint.y,
+                ))
+            })
+            .collect::<HashSet<_>>();
+        let mut semantic_anchors = labels
+            .iter()
+            .filter(|label| label.net != net)
+            .map(|label| (label.x, label.y))
+            .collect::<Vec<_>>();
+        for (x, y) in extract_junctions(tree) {
+            let root = graph.find(crate::tools::sch_connectivity::pt_key(x, y));
+            if !target_roots.contains(&root) && graph.net_at(x, y).as_deref() != Some(net) {
+                semantic_anchors.push((x, y));
+            }
+        }
+        semantic_anchors.extend(extract_no_connects(tree));
+        for (x, y) in extract_sheet_pins(tree) {
+            if endpoint_points
+                .iter()
+                .any(|&(ex, ey)| points_coincident(x, y, ex, ey, 0.01))
+            {
+                continue;
+            }
+            let root = graph.find(crate::tools::sch_connectivity::pt_key(x, y));
+            if !target_roots.contains(&root) && graph.net_at(x, y).as_deref() != Some(net) {
+                semantic_anchors.push((x, y));
+            }
+        }
         let foreign_wires = wires
             .iter()
             .filter(|wire| {
+                let a_root = graph.find(crate::tools::sch_connectivity::pt_key(wire.x1, wire.y1));
+                let b_root = graph.find(crate::tools::sch_connectivity::pt_key(wire.x2, wire.y2));
+                if target_roots.contains(&a_root) || target_roots.contains(&b_root) {
+                    return false;
+                }
                 graph.net_at(wire.x1, wire.y1).as_deref() != Some(net)
                     && graph.net_at(wire.x2, wire.y2).as_deref() != Some(net)
             })
@@ -1600,7 +1877,9 @@ impl MaterializeObstacles {
 
         Self {
             bodies,
+            approximate_bodies,
             foreign_pins,
+            semantic_anchors,
             foreign_wires,
         }
     }
@@ -1618,9 +1897,21 @@ impl MaterializeObstacles {
                 .iter()
                 .any(|&(x, y)| point_on_segment_inclusive(x, y, segment))
             && !self
+                .semantic_anchors
+                .iter()
+                .any(|&(x, y)| point_on_segment_inclusive(x, y, segment))
+            && !self
                 .foreign_wires
                 .iter()
                 .any(|wire| conductive_segments_contact(segment, *wire))
+    }
+
+    fn approximate_body_penalty(&self, segment: Segment) -> u32 {
+        self.approximate_bodies
+            .iter()
+            .filter(|body| segment_crosses_rect_interior(segment, **body))
+            .count() as u32
+            * APPROXIMATE_BODY_PENALTY
     }
 }
 
@@ -1670,6 +1961,19 @@ struct LocalLayoutCandidate {
     sheet_pin_changes: Vec<SheetPinChange>,
     score: LocalLayoutScore,
     structural_signature: String,
+    wires_to_remove: Vec<Wire>,
+    validation: LayoutCandidateValidation,
+    final_content: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct LayoutCandidateValidation {
+    hard_constraints_pass: bool,
+    component_pin_group_changes: Vec<serde_json::Value>,
+    net_name_or_scope_changes: Vec<serde_json::Value>,
+    body_crossings: usize,
+    foreign_conductive_contacts: usize,
+    semantic_connectivity_preserved: bool,
 }
 
 impl LocalLayoutCandidate {
@@ -1684,16 +1988,25 @@ impl LocalLayoutCandidate {
             "total_cost": self.score.total_cost(),
             "score_breakdown": self.score.json(),
             "validation": {
-                "hard_constraints_pass": true,
-                "component_pin_group_changes": [],
-                "body_crossings": 0,
-                "foreign_conductive_contacts": 0
+                "hard_constraints_pass": self.validation.hard_constraints_pass,
+                "component_pin_group_changes": self.validation.component_pin_group_changes,
+                "net_name_or_scope_changes": self.validation.net_name_or_scope_changes,
+                "body_crossings": self.validation.body_crossings,
+                "foreign_conductive_contacts": self.validation.foreign_conductive_contacts,
+                "semantic_connectivity_preserved": self.validation.semantic_connectivity_preserved
             },
             "planned_changes": {
                 "moved_item_uuids": [],
                 "rotated_or_mirrored_item_uuids": [],
                 "changed_sheet_pin_uuids": self.sheet_pin_changes.iter().map(|change| change.pin_uuid.clone()).collect::<Vec<_>>(),
-                "changed_or_routed_nets": self.routes_by_net.keys().cloned().collect::<Vec<_>>()
+                "changed_or_routed_nets": self.routes_by_net.keys().cloned().collect::<Vec<_>>(),
+                "wires_to_remove": self.wires_to_remove.iter().map(|wire| json!({
+                    "x1": wire.x1,
+                    "y1": wire.y1,
+                    "x2": wire.x2,
+                    "y2": wire.y2,
+                    "uuid": wire.uuid
+                })).collect::<Vec<_>>()
             },
             "sheet_pin_changes": self.sheet_pin_changes.iter().map(SheetPinChange::json).collect::<Vec<_>>(),
             "routes_by_net": self.routes_by_net.iter().map(|(net, segments)| {
@@ -1761,7 +2074,7 @@ impl<'a> LocalLayoutPlanner<'a> {
         }
 
         let mut by_signature: BTreeMap<String, LocalLayoutCandidate> = BTreeMap::new();
-        let mut obstacle_counts = (0usize, 0usize, 0usize);
+        let mut obstacle_counts = (0usize, 0usize, 0usize, 0usize);
         for sheet_pin_changes in self.sheet_pin_layout_states()? {
             if self.states_evaluated >= MAX_LAYOUT_STATES_EVALUATED {
                 break;
@@ -1785,7 +2098,7 @@ impl<'a> LocalLayoutPlanner<'a> {
                         .flatten()
                         .copied()
                         .collect::<Vec<_>>();
-                    let route_candidates = self.route_candidates_for_net(
+                    let (route_candidates, current_obstacle_counts) = self.route_candidates_for_net(
                         &state_tree,
                         &state_wires,
                         &state_labels,
@@ -1795,6 +2108,12 @@ impl<'a> LocalLayoutPlanner<'a> {
                         &prior_routes,
                         retain,
                         orientation,
+                    );
+                    obstacle_counts = (
+                        obstacle_counts.0.max(current_obstacle_counts.0),
+                        obstacle_counts.1.max(current_obstacle_counts.1),
+                        obstacle_counts.2.max(current_obstacle_counts.2),
+                        obstacle_counts.3.max(current_obstacle_counts.3),
                     );
                     for route_candidate in route_candidates {
                         let mut candidate = partial.clone();
@@ -1816,11 +2135,6 @@ impl<'a> LocalLayoutPlanner<'a> {
                 if partial.routes_by_net.len() != self.endpoints_by_net.len() {
                     continue;
                 }
-                obstacle_counts = (
-                    obstacle_counts.0.max(partial.obstacle_counts.0),
-                    obstacle_counts.1.max(partial.obstacle_counts.1),
-                    obstacle_counts.2.max(partial.obstacle_counts.2),
-                );
                 let signature =
                     route_structural_signature(&partial.routes_by_net, &sheet_pin_changes);
                 let candidate_id = format!(
@@ -1834,6 +2148,9 @@ impl<'a> LocalLayoutPlanner<'a> {
                     sheet_pin_changes: sheet_pin_changes.clone(),
                     score: partial.score,
                     structural_signature: signature.clone(),
+                    wires_to_remove: Vec::new(),
+                    validation: LayoutCandidateValidation::default(),
+                    final_content: String::new(),
                 };
                 match by_signature.get(&signature) {
                     Some(existing) if local_layout_candidate_cmp(&entry, existing).is_ge() => {}
@@ -1861,7 +2178,8 @@ impl<'a> LocalLayoutPlanner<'a> {
                     "obstacles": {
                         "symbol_bodies": obstacle_counts.0,
                         "foreign_pins": obstacle_counts.1,
-                        "foreign_wires": obstacle_counts.2
+                        "foreign_wires": obstacle_counts.2,
+                        "semantic_anchors": obstacle_counts.3
                     }
                 })
                 .to_string(),
@@ -1896,10 +2214,16 @@ impl<'a> LocalLayoutPlanner<'a> {
         prior_routes: &[Segment],
         retain: usize,
         orientation: &str,
-    ) -> Vec<NetRouteCandidate> {
+    ) -> (Vec<NetRouteCandidate>, (usize, usize, usize, usize)) {
         let state_endpoints = endpoints_with_sheet_pin_changes(endpoints, sheet_pin_changes);
         let mut obstacles = MaterializeObstacles::build(tree, wires, labels, net, &state_endpoints);
         obstacles.foreign_wires.extend_from_slice(prior_routes);
+        let obstacle_counts = (
+            obstacles.bodies.len(),
+            obstacles.foreign_pins.len(),
+            obstacles.foreign_wires.len(),
+            obstacles.semantic_anchors.len(),
+        );
         let escaped_points = state_endpoints
             .iter()
             .map(|endpoint| escaped_endpoint(endpoint, self.escape, &obstacles))
@@ -1956,7 +2280,7 @@ impl<'a> LocalLayoutPlanner<'a> {
         let mut candidates = by_signature.into_values().collect::<Vec<_>>();
         candidates.sort_by(net_route_candidate_cmp);
         candidates.truncate(retain);
-        candidates
+        (candidates, obstacle_counts)
     }
 }
 
@@ -1965,7 +2289,6 @@ struct PartialLayoutCandidate {
     routes_by_net: BTreeMap<String, Vec<Segment>>,
     score: LocalLayoutScore,
     route_signature_material: Vec<String>,
-    obstacle_counts: (usize, usize, usize),
 }
 
 impl PartialLayoutCandidate {
@@ -1976,7 +2299,6 @@ impl PartialLayoutCandidate {
             routes_by_net: BTreeMap::new(),
             score,
             route_signature_material: Vec::new(),
-            obstacle_counts: (0, 0, 0),
         }
     }
 
@@ -2040,10 +2362,15 @@ fn local_layout_route_score(
                 * CLEARANCE_PENALTY
         })
         .sum();
+    let approximate_body_penalty = segments
+        .iter()
+        .map(|segment| obstacles.approximate_body_penalty(*segment))
+        .sum();
     LocalLayoutScore {
         wire_grid_steps,
         wire_bends: route_bends(segments) as u32,
         clearance_penalty,
+        approximate_body_penalty,
         ..Default::default()
     }
 }
@@ -2079,7 +2406,8 @@ fn apply_sheet_pin_changes_to_content(
     if changes.is_empty() {
         return Ok(content.to_string());
     }
-    let mut sch = write_temp_and_load(schematic, content)?;
+    let (content, _) = remove_wires_at_moved_sheet_pin_anchors(content, changes)?;
+    let mut sch = write_temp_and_load(schematic, &content)?;
     for change in changes {
         let sheet = sch
             .sheets
@@ -2101,6 +2429,66 @@ fn apply_sheet_pin_changes_to_content(
         pin.at.rotation = Some(change.rotation);
     }
     Ok(sch.to_source())
+}
+
+/// Remove only the existing wire segments that are directly attached to the
+/// *old* anchor of a hierarchical sheet pin that is about to move. Leaving
+/// those segments behind creates stranded/duplicate geometry after the new
+/// route is materialized. This deliberately does not walk or delete the rest
+/// of the connected net: branches beyond the moved anchor are preserved.
+fn remove_wires_at_moved_sheet_pin_anchors(
+    content: &str,
+    changes: &[SheetPinChange],
+) -> anyhow::Result<(String, Vec<Wire>)> {
+    if changes.is_empty() {
+        return Ok((content.to_string(), Vec::new()));
+    }
+    let tree = parse_sexp(content)?;
+    let wires = extract_wires(&tree);
+    let attached = wires
+        .iter()
+        .filter(|wire| {
+            changes.iter().any(|change| {
+                points_coincident(wire.x1, wire.y1, change.from_x, change.from_y, 0.01)
+                    || points_coincident(wire.x2, wire.y2, change.from_x, change.from_y, 0.01)
+            })
+        })
+        .collect::<Vec<_>>();
+    if attached.is_empty() {
+        return Ok((content.to_string(), Vec::new()));
+    }
+
+    let mut ranges = Vec::new();
+    for wire in attached {
+        let range = match &wire.uuid {
+            Some(uuid) => content
+                .find(&format!(r#"(uuid "{uuid}")"#))
+                .and_then(|offset| wire_block_with_leading_whitespace(content, offset)),
+            None => find_wire_block_by_endpoints(content, wire.x1, wire.y1, wire.x2, wire.y2),
+        };
+        let Some(range) = range else {
+            anyhow::bail!(
+                "cannot locate wire attached to moved sheet pin anchor ({}, {})-({}, {})",
+                wire.x1,
+                wire.y1,
+                wire.x2,
+                wire.y2
+            );
+        };
+        ranges.push(range);
+    }
+    ranges.sort_unstable();
+    ranges.dedup();
+    let removed = wires_in_ranges(content, &ranges);
+    let content = apply_edits(
+        content.to_string(),
+        ranges
+            .into_iter()
+            .map(|(start, end)| SexpEdit::delete(start, end))
+            .collect(),
+    );
+    let (content, _) = prune_orphaned_junctions(content, &removed);
+    Ok((content, removed))
 }
 
 fn composite_peer_facing_sheet_pin_changes(
@@ -2663,7 +3051,8 @@ fn grid_search_route_in_bounds(
                     BEND_COST
                 } else {
                     0
-                };
+                }
+                + obstacles.approximate_body_penalty(segment);
             let distance = ((goal.0 - nx).abs() + (goal.1 - ny).abs()) as u32;
             let key = (nx, ny, next_dir);
             if best.get(&key).map(|old| next_cost < *old).unwrap_or(true) {
@@ -3001,16 +3390,71 @@ fn trunk_candidates(
     out
 }
 
+fn merge_collinear_segments(a: Segment, b: Segment) -> Option<Segment> {
+    let a = a.normalized();
+    let b = b.normalized();
+    let a_h = (a.y1 - a.y2).abs() < 0.01;
+    let b_h = (b.y1 - b.y2).abs() < 0.01;
+
+    if a_h && b_h && (a.y1 - b.y1).abs() < 0.01 {
+        if !ranges_overlap_inclusive(a.x1, a.x2, b.x1, b.x2) {
+            return None;
+        }
+        return Some(Segment {
+            x1: a.x1.min(b.x1),
+            y1: a.y1,
+            x2: a.x2.max(b.x2),
+            y2: a.y1,
+        });
+    }
+
+    let a_v = (a.x1 - a.x2).abs() < 0.01;
+    let b_v = (b.x1 - b.x2).abs() < 0.01;
+    if a_v && b_v && (a.x1 - b.x1).abs() < 0.01 {
+        if !ranges_overlap_inclusive(a.y1, a.y2, b.y1, b.y2) {
+            return None;
+        }
+        return Some(Segment {
+            x1: a.x1,
+            y1: a.y1.min(b.y1),
+            x2: a.x1,
+            y2: a.y2.max(b.y2),
+        });
+    }
+
+    None
+}
+
 fn normalize_segments(mut segments: Vec<Segment>) -> Vec<Segment> {
     segments.retain(|segment| !segment.is_zero());
-    segments.sort_by(|a, b| {
+    let mut normalized = Vec::<Segment>::new();
+
+    // Planner output often contains a trunk plus branch fragments that are
+    // collinear, touching, or partially overlapping. Serialize their union,
+    // not their construction history: intermediate endpoints otherwise look
+    // like T-junctions to KiCad and produce meaningless junction dots.
+    for mut segment in segments.into_iter().map(Segment::normalized) {
+        loop {
+            let Some(index) = normalized
+                .iter()
+                .position(|existing| merge_collinear_segments(*existing, segment).is_some())
+            else {
+                normalized.push(segment);
+                break;
+            };
+            segment = merge_collinear_segments(normalized.remove(index), segment)
+                .expect("merge candidate was just classified as mergeable");
+        }
+    }
+
+    normalized.sort_by(|a, b| {
         a.normalized()
             .json()
             .to_string()
             .cmp(&b.normalized().json().to_string())
     });
-    segments.dedup_by(|a, b| a.normalized() == b.normalized());
-    segments
+    normalized.dedup_by(|a, b| a.normalized() == b.normalized());
+    normalized
 }
 
 fn detour_rows_between(a: (f64, f64), b: (f64, f64), obstacles: &MaterializeObstacles) -> Vec<f64> {
@@ -3150,23 +3594,153 @@ fn point_near_segment(x: f64, y: f64, segment: Segment, grid: f64) -> bool {
     }
 }
 
-fn conductive_segments_contact(a: Segment, b: Segment) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SchematicWireRelationship {
+    Disjoint,
+    ProperCrossing { x: f64, y: f64 },
+    SharedEndpoint { x: f64, y: f64 },
+    EndpointOnInterior { x: f64, y: f64 },
+    CollinearOverlap,
+}
+
+fn segment_endpoint_at(segment: Segment, x: f64, y: f64) -> bool {
+    points_coincident(x, y, segment.x1, segment.y1, 0.01)
+        || points_coincident(x, y, segment.x2, segment.y2, 0.01)
+}
+
+fn cross_2d(ax: f64, ay: f64, bx: f64, by: f64) -> f64 {
+    ax * by - ay * bx
+}
+
+fn arbitrary_segment_relationship(a: Segment, b: Segment) -> SchematicWireRelationship {
+    const TOL: f64 = 0.01;
+    let px = a.x1;
+    let py = a.y1;
+    let rx = a.x2 - a.x1;
+    let ry = a.y2 - a.y1;
+    let qx = b.x1;
+    let qy = b.y1;
+    let sx = b.x2 - b.x1;
+    let sy = b.y2 - b.y1;
+    let r_len = (rx * rx + ry * ry).sqrt();
+    let s_len = (sx * sx + sy * sy).sqrt();
+    if r_len <= TOL || s_len <= TOL {
+        return SchematicWireRelationship::Disjoint;
+    }
+    let qmp_x = qx - px;
+    let qmp_y = qy - py;
+    let rxs = cross_2d(rx, ry, sx, sy);
+    let parallel_tol = TOL * r_len.max(s_len);
+    if rxs.abs() <= parallel_tol {
+        if cross_2d(qmp_x, qmp_y, rx, ry).abs() > TOL * r_len {
+            return SchematicWireRelationship::Disjoint;
+        }
+        let ux = rx / r_len;
+        let uy = ry / r_len;
+        let b1 = qmp_x * ux + qmp_y * uy;
+        let b2 = b1 + sx * ux + sy * uy;
+        let overlap_min = 0.0_f64.max(b1.min(b2));
+        let overlap_max = r_len.min(b1.max(b2));
+        if overlap_max < overlap_min - TOL {
+            return SchematicWireRelationship::Disjoint;
+        }
+        if overlap_max - overlap_min > TOL {
+            return SchematicWireRelationship::CollinearOverlap;
+        }
+        let t = (overlap_min + overlap_max) / 2.0;
+        return SchematicWireRelationship::SharedEndpoint { x: px + ux * t, y: py + uy * t };
+    }
+    let t = cross_2d(qmp_x, qmp_y, sx, sy) / rxs;
+    let u = cross_2d(qmp_x, qmp_y, rx, ry) / rxs;
+    let t_tol = TOL / r_len;
+    let u_tol = TOL / s_len;
+    if t < -t_tol || t > 1.0 + t_tol || u < -u_tol || u > 1.0 + u_tol {
+        return SchematicWireRelationship::Disjoint;
+    }
+    let t = t.clamp(0.0, 1.0);
+    let x = px + t * rx;
+    let y = py + t * ry;
+    if !point_on_segment_inclusive(x, y, a) || !point_on_segment_inclusive(x, y, b) {
+        return SchematicWireRelationship::Disjoint;
+    }
+    match (segment_endpoint_at(a, x, y), segment_endpoint_at(b, x, y)) {
+        (false, false) => SchematicWireRelationship::ProperCrossing { x, y },
+        (true, true) => SchematicWireRelationship::SharedEndpoint { x, y },
+        _ => SchematicWireRelationship::EndpointOnInterior { x, y },
+    }
+}
+
+fn schematic_wire_relationship(a: Segment, b: Segment) -> SchematicWireRelationship {
     if a.is_zero() || b.is_zero() {
-        return false;
+        return SchematicWireRelationship::Disjoint;
     }
+
     let a_h = (a.y1 - a.y2).abs() < 0.01;
+    let a_v = (a.x1 - a.x2).abs() < 0.01;
     let b_h = (b.y1 - b.y2).abs() < 0.01;
-    if a_h && b_h && (a.y1 - b.y1).abs() < 0.01 {
-        return ranges_overlap_inclusive(a.x1, a.x2, b.x1, b.x2);
+    let b_v = (b.x1 - b.x2).abs() < 0.01;
+
+    // Generated routes remain orthogonal, but existing KiCad wires may be
+    // arbitrary-angle and must still participate in electrical contact checks.
+    if !(a_h || a_v) || !(b_h || b_v) {
+        return arbitrary_segment_relationship(a, b);
     }
-    if !a_h && !b_h && (a.x1 - b.x1).abs() < 0.01 {
-        return ranges_overlap_inclusive(a.y1, a.y2, b.y1, b.y2);
+
+    if a_h && b_h {
+        if (a.y1 - b.y1).abs() >= 0.01
+            || !ranges_overlap_inclusive(a.x1, a.x2, b.x1, b.x2)
+        {
+            return SchematicWireRelationship::Disjoint;
+        }
+        let overlap_min = a.x1.min(a.x2).max(b.x1.min(b.x2));
+        let overlap_max = a.x1.max(a.x2).min(b.x1.max(b.x2));
+        if overlap_max - overlap_min > 0.01 {
+            return SchematicWireRelationship::CollinearOverlap;
+        }
+        return SchematicWireRelationship::SharedEndpoint {
+            x: (overlap_min + overlap_max) / 2.0,
+            y: a.y1,
+        };
     }
-    if a_h == b_h {
-        return false;
+
+    if a_v && b_v {
+        if (a.x1 - b.x1).abs() >= 0.01
+            || !ranges_overlap_inclusive(a.y1, a.y2, b.y1, b.y2)
+        {
+            return SchematicWireRelationship::Disjoint;
+        }
+        let overlap_min = a.y1.min(a.y2).max(b.y1.min(b.y2));
+        let overlap_max = a.y1.max(a.y2).min(b.y1.max(b.y2));
+        if overlap_max - overlap_min > 0.01 {
+            return SchematicWireRelationship::CollinearOverlap;
+        }
+        return SchematicWireRelationship::SharedEndpoint {
+            x: a.x1,
+            y: (overlap_min + overlap_max) / 2.0,
+        };
     }
+
     let (h, v) = if a_h { (a, b) } else { (b, a) };
-    point_on_segment_inclusive(v.x1, h.y1, h) && point_on_segment_inclusive(v.x1, h.y1, v)
+    let x = v.x1;
+    let y = h.y1;
+    if !point_on_segment_inclusive(x, y, h) || !point_on_segment_inclusive(x, y, v) {
+        return SchematicWireRelationship::Disjoint;
+    }
+
+    match (segment_endpoint_at(a, x, y), segment_endpoint_at(b, x, y)) {
+        (false, false) => SchematicWireRelationship::ProperCrossing { x, y },
+        (true, true) => SchematicWireRelationship::SharedEndpoint { x, y },
+        _ => SchematicWireRelationship::EndpointOnInterior { x, y },
+    }
+}
+
+fn conductive_segments_contact(a: Segment, b: Segment) -> bool {
+    matches!(
+        schematic_wire_relationship(a, b),
+        SchematicWireRelationship::SharedEndpoint { .. }
+            | SchematicWireRelationship::EndpointOnInterior { .. }
+            | SchematicWireRelationship::CollinearOverlap
+    )
 }
 
 fn segments_intersect(a: Segment, b: Segment) -> bool {
@@ -3225,13 +3799,27 @@ fn semantic_snapshot(content: &str) -> anyhow::Result<SemanticSnapshot> {
         .map(|pin| {
             (
                 format!("{}:{}:{}", pin.reference, pin.unit, pin.pin.number),
-                graph.net_at(pin.at.0, pin.at.1),
+                index.net_for_pin(&mut graph, pin),
             )
         })
         .collect();
+    let mut net_scopes: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for label in &labels {
+        let scope = match &label.kind {
+            LabelKind::NetLabel => "local",
+            LabelKind::GlobalLabel => "global",
+            LabelKind::HierarchicalLabel => "hierarchical",
+            LabelKind::PowerSymbol => "power_symbol",
+        };
+        net_scopes
+            .entry(label.net.clone())
+            .or_default()
+            .insert(scope.to_string());
+    }
     Ok(SemanticSnapshot {
         pin_nets,
         shorts: shorted_label_sets(&tree),
+        net_scopes,
     })
 }
 
@@ -3434,6 +4022,44 @@ fn semantic_comparison(
     let after = semantic_snapshot(after_content)?;
     let pin_membership_preserved = after.pin_nets == before.pin_nets;
     let shorts_preserved = after.shorts == before.shorts;
+    let scope_preserved = after.net_scopes == before.net_scopes;
+    let scope_keys = before
+        .net_scopes
+        .keys()
+        .chain(after.net_scopes.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut net_name_or_scope_changes = scope_keys
+        .into_iter()
+        .filter_map(|net| {
+            let before_scopes = before.net_scopes.get(&net).cloned().unwrap_or_default();
+            let after_scopes = after.net_scopes.get(&net).cloned().unwrap_or_default();
+            (before_scopes != after_scopes).then(|| {
+                json!({
+                    "kind": "scope",
+                    "net": net,
+                    "before": before_scopes,
+                    "after": after_scopes
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    let resolved_name_changes = before
+        .pin_nets
+        .iter()
+        .filter_map(|(pin, before_net)| {
+            let after_net = after.pin_nets.get(pin).cloned().unwrap_or(None);
+            match (before_net.as_deref(), after_net.as_deref()) {
+                (Some(before_name), Some(after_name)) if before_name != after_name => {
+                    Some((before_name.to_string(), after_name.to_string()))
+                }
+                _ => None,
+            }
+        })
+        .collect::<BTreeSet<_>>();
+    net_name_or_scope_changes.extend(resolved_name_changes.into_iter().map(|(before, after)| {
+        json!({"kind": "resolved_net_name", "before": before, "after": after})
+    }));
     let pin_net_differences = before
         .pin_nets
         .iter()
@@ -3453,8 +4079,9 @@ fn semantic_comparison(
         "pin_membership_preserved": pin_membership_preserved,
         "component_pin_groups_preserved": pin_membership_preserved,
         "shorted_net_sets_preserved": shorts_preserved,
+        "scope_preserved": scope_preserved,
         "component_pin_group_changes": pin_net_differences,
-        "net_name_or_scope_changes": [],
+        "net_name_or_scope_changes": net_name_or_scope_changes,
         "pin_net_differences": pin_net_differences,
         "shorts_before": before.shorts,
         "shorts_after": after.shorts
@@ -3466,27 +4093,25 @@ async fn validate_kicad_netlist_if_configured(
     schematic: &std::path::Path,
     before: &str,
     after: &str,
+    allowed_target_scope_change: Option<&str>,
 ) -> anyhow::Result<()> {
     if ctx.config.kicad_cli.trim().is_empty() {
         return Ok(());
     }
-    let before_snapshot = kicad_netlist_component_groups(&ctx.config.kicad_cli, schematic, before)
+    let before_snapshot = kicad_netlist_identities(&ctx.config.kicad_cli, schematic, before)
         .await
         .map_err(|error| anyhow::anyhow!("KiCad netlist BEFORE export failed: {error}"))?;
-    let after_snapshot = kicad_netlist_component_groups(&ctx.config.kicad_cli, schematic, after)
+    let after_snapshot = kicad_netlist_identities(&ctx.config.kicad_cli, schematic, after)
         .await
         .map_err(|error| anyhow::anyhow!("KiCad netlist AFTER export failed: {error}"))?;
-    if before_snapshot != after_snapshot {
-        anyhow::bail!("KiCad netlist component-pin membership changed final transaction");
-    }
-    Ok(())
+    validate_kicad_identity_sets(&before_snapshot, &after_snapshot, allowed_target_scope_change)
 }
 
-async fn kicad_netlist_component_groups(
+async fn kicad_netlist_identities(
     kicad_cli: &str,
     schematic: &std::path::Path,
     content: &str,
-) -> anyhow::Result<BTreeSet<Vec<String>>> {
+) -> anyhow::Result<BTreeSet<KicadNetIdentity>> {
     let temp = tempfile::tempdir()?;
     let source_dir = schematic
         .parent()
@@ -3514,16 +4139,22 @@ async fn kicad_netlist_component_groups(
     crate::tools::cli::export_netlist(kicad_cli, &temp_schematic, &netlist_path, "kicadsexpr")
         .await?;
     let netlist = std::fs::read_to_string(&netlist_path)?;
-    normalized_kicad_netlist_groups(&netlist)
+    normalized_kicad_netlist_identities(&netlist)
 }
 
-fn normalized_kicad_netlist_groups(netlist: &str) -> anyhow::Result<BTreeSet<Vec<String>>> {
+fn normalized_kicad_netlist_identities(
+    netlist: &str,
+) -> anyhow::Result<BTreeSet<KicadNetIdentity>> {
     let tree = parse_sexp(netlist)?;
-    let mut groups = BTreeSet::new();
+    let mut identities = BTreeSet::new();
     let Some(nets) = tree.find("nets") else {
-        return Ok(groups);
+        return Ok(identities);
     };
     for net in nets.find_all("net") {
+        let name = net
+            .find_str("name")
+            .ok_or_else(|| anyhow::anyhow!("KiCad netlist net is missing its canonical name"))?
+            .to_string();
         let mut pins = net
             .find_all("node")
             .into_iter()
@@ -3535,11 +4166,71 @@ fn normalized_kicad_netlist_groups(netlist: &str) -> anyhow::Result<BTreeSet<Vec
             .collect::<Vec<_>>();
         pins.sort();
         pins.dedup();
-        if !pins.is_empty() {
-            groups.insert(pins);
+        identities.insert(KicadNetIdentity { name, pins });
+    }
+    Ok(identities)
+}
+
+fn exported_kicad_net_matches_target(name: &str, target: &str) -> bool {
+    name == target
+        || name
+            .strip_suffix(target)
+            .is_some_and(|prefix| prefix.ends_with('/'))
+}
+
+fn partition_kicad_identities(
+    identities: &BTreeSet<KicadNetIdentity>,
+    target: &str,
+) -> (BTreeSet<KicadNetIdentity>, BTreeSet<String>) {
+    let mut other = BTreeSet::new();
+    let mut target_pins = BTreeSet::new();
+    for identity in identities {
+        if exported_kicad_net_matches_target(&identity.name, target) {
+            target_pins.extend(identity.pins.iter().cloned());
+        } else {
+            other.insert(identity.clone());
         }
     }
-    Ok(groups)
+    (other, target_pins)
+}
+
+fn validate_kicad_identity_sets(
+    before: &BTreeSet<KicadNetIdentity>,
+    after: &BTreeSet<KicadNetIdentity>,
+    allowed_target_scope_change: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some(target) = allowed_target_scope_change else {
+        if before != after {
+            let removed = before.difference(after).cloned().collect::<Vec<_>>();
+            let added = after.difference(before).cloned().collect::<Vec<_>>();
+            anyhow::bail!(
+                "KiCad netlist identity or component-pin membership changed final transaction; removed={removed:?}; added={added:?}"
+            );
+        }
+        return Ok(());
+    };
+
+    let (before_other, before_target_pins) = partition_kicad_identities(before, target);
+    let (after_other, after_target_pins) = partition_kicad_identities(after, target);
+    if before_other != after_other {
+        let removed = before_other
+            .difference(&after_other)
+            .cloned()
+            .collect::<Vec<_>>();
+        let added = after_other
+            .difference(&before_other)
+            .cloned()
+            .collect::<Vec<_>>();
+        anyhow::bail!(
+            "KiCad non-target net identity changed while changing scope for '{target}'; removed={removed:?}; added={added:?}"
+        );
+    }
+    if before_target_pins != after_target_pins {
+        anyhow::bail!(
+            "KiCad target-net component-pin membership changed while changing scope for '{target}'; before={before_target_pins:?}; after={after_target_pins:?}"
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -3563,6 +4254,7 @@ struct RefactorNetPlan {
 #[derive(Debug, Clone)]
 struct ProjectSheet {
     path: PathBuf,
+    instance_path: String,
     parent_path: Option<PathBuf>,
     parent_sheet_uuid: Option<String>,
 }
@@ -3608,6 +4300,7 @@ struct ProjectRefactorPlan {
     net: String,
     representation: String,
     participating_sheets: Vec<PathBuf>,
+    participating_instances: Vec<ProjectSheet>,
     files: Vec<ProjectFilePlan>,
     before_semantic: BTreeMap<String, SemanticSnapshot>,
     final_semantic: BTreeMap<String, SemanticSnapshot>,
@@ -3627,6 +4320,12 @@ impl ProjectRefactorPlan {
             "target_net": self.net,
             "representation": self.representation,
             "participating_sheets": self.participating_sheets.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+            "participating_instances": self.participating_instances.iter().map(|sheet| json!({
+                "schematic": sheet.path.display().to_string(),
+                "instance_path": sheet.instance_path,
+                "parent_schematic": sheet.parent_path.as_ref().map(|path| path.display().to_string()),
+                "parent_sheet_uuid": sheet.parent_sheet_uuid
+            })).collect::<Vec<_>>(),
             "touched_files": self.files.iter().map(|file| file.path.display().to_string()).collect::<Vec<_>>(),
             "power_symbols_to_add": self.files.iter().flat_map(|file| file.power_symbols_added.clone()).collect::<Vec<_>>(),
             "ordinary_labels_to_remove": self.files.iter().map(|file| json!({"schematic": file.path.display().to_string(), "count": file.ordinary_labels_removed})).collect::<Vec<_>>(),
@@ -3753,11 +4452,17 @@ fn build_project_power_symbol_refactor_plan(
     let mut final_semantic = BTreeMap::new();
     let mut removed_sheet_pin_positions: HashMap<PathBuf, Vec<(f64, f64)>> = HashMap::new();
 
+    let mut physical_instances: BTreeMap<PathBuf, Vec<&ProjectSheet>> = BTreeMap::new();
     for sheet in &sheets {
-        let before = read_consistent(&sheet.path)
+        physical_instances.entry(sheet.path.clone()).or_default().push(sheet);
+    }
+
+    for (sheet_path, instances) in &physical_instances {
+        let before = read_consistent(sheet_path)
             .map_err(|error| CallToolResult::error(error.to_string()))?;
         let tree = parse_sexp(&before).map_err(|error| CallToolResult::error(error.to_string()))?;
-        let mut sch = cse::Schematic::load(&sheet.path)
+        reject_unsupported_schematic_semantics(&tree, "project_power_symbol_refactor")?;
+        let mut sch = cse::Schematic::load(sheet_path)
             .map_err(|error| CallToolResult::error(error.to_string()))?;
         let labels = konnect_sexp::schematic::extract_labels(&tree)
             .into_iter()
@@ -3776,13 +4481,15 @@ fn build_project_power_symbol_refactor_plan(
             .filter(|label| label.kind == LabelKind::HierarchicalLabel)
             .count();
         if hierarchical > 0 {
-            if let (Some(parent), Some(uuid)) = (&sheet.parent_path, &sheet.parent_sheet_uuid) {
-                child_hier_removed.insert((parent.clone(), uuid.clone()));
+            for instance in instances {
+                if let (Some(parent), Some(uuid)) = (&instance.parent_path, &instance.parent_sheet_uuid) {
+                    child_hier_removed.insert((parent.clone(), uuid.clone()));
+                }
             }
         }
         let endpoints = net_endpoints_for(&tree, net, args, grid)?;
         let (power_normalization, mut attachment_segments) =
-            normalize_existing_power_symbols(&mut sch, &sheet.path, &tree, net, grid)?;
+            normalize_existing_power_symbols(&mut sch, sheet_path, &tree, net, grid)?;
         let existing_power = konnect_sexp::schematic::extract_all_net_labels(&tree)
             .into_iter()
             .filter(|label| label.net == net && label.kind == LabelKind::PowerSymbol)
@@ -3797,7 +4504,7 @@ fn build_project_power_symbol_refactor_plan(
             .collect::<Vec<_>>();
         let mut power_symbols_added = Vec::new();
         for label in &labels {
-            if sheet.path == *root && endpoints.is_empty() {
+            if sheet_path.as_path() == root.as_path() && endpoints.is_empty() {
                 continue;
             }
             if existing_power
@@ -3814,7 +4521,7 @@ fn build_project_power_symbol_refactor_plan(
                 .map_err(|error| CallToolResult::error(error.to_string()))?;
             let placed = place_power_symbol_instance(
                 &mut sch,
-                &sheet.path,
+                sheet_path,
                 net,
                 attachment.x,
                 attachment.y,
@@ -3841,17 +4548,17 @@ fn build_project_power_symbol_refactor_plan(
             .map_err(|error| CallToolResult::error(error.to_string()))?;
         if after != before {
             before_semantic.insert(
-                sheet.path.display().to_string(),
+                sheet_path.display().to_string(),
                 semantic_snapshot(&before)
                     .map_err(|error| CallToolResult::error(error.to_string()))?,
             );
             final_semantic.insert(
-                sheet.path.display().to_string(),
+                sheet_path.display().to_string(),
                 semantic_snapshot(&after)
                     .map_err(|error| CallToolResult::error(error.to_string()))?,
             );
             touched.push(ProjectFilePlan {
-                path: sheet.path.clone(),
+                path: sheet_path.clone(),
                 before,
                 after,
                 power_symbols_added,
@@ -3952,16 +4659,15 @@ fn build_project_power_symbol_refactor_plan(
         )));
     }
     touched.sort_by(|a, b| a.path.cmp(&b.path));
-    let participating_sheets = sheets
-        .iter()
-        .map(|sheet| sheet.path.clone())
-        .collect::<Vec<_>>();
+    let participating_sheets = physical_instances.keys().cloned().collect::<Vec<_>>();
+    let participating_instances = sheets.clone();
     let plan_revision = project_plan_revision(net, scope_policy, &touched);
     Ok(ProjectRefactorPlan {
         root: root.clone(),
         net: net.to_string(),
         representation: "power_symbol".to_string(),
         participating_sheets,
+        participating_instances,
         files: touched,
         before_semantic,
         final_semantic,
@@ -3984,17 +4690,23 @@ fn discover_project_sheets(root: &PathBuf) -> Result<Vec<ProjectSheet>, CallTool
         path: PathBuf,
         parent_path: Option<PathBuf>,
         parent_sheet_uuid: Option<String>,
+        instance_path: String,
         out: &mut Vec<ProjectSheet>,
-        seen: &mut HashSet<PathBuf>,
+        active_files: &mut HashSet<PathBuf>,
     ) -> Result<(), CallToolResult> {
         let canonical = path
             .canonicalize()
             .map_err(|error| CallToolResult::error(error.to_string()))?;
-        if !seen.insert(canonical.clone()) {
-            return Ok(());
+        if !active_files.insert(canonical.clone()) {
+            return Err(CallToolResult::error(format!(
+                "recursive hierarchical sheet inclusion detected at '{}' while visiting instance '{}'",
+                canonical.display(),
+                instance_path
+            )));
         }
         out.push(ProjectSheet {
             path: canonical.clone(),
+            instance_path: instance_path.clone(),
             parent_path,
             parent_sheet_uuid,
         });
@@ -4003,20 +4715,34 @@ fn discover_project_sheets(root: &PathBuf) -> Result<Vec<ProjectSheet>, CallTool
         let base = parent_dir(&canonical);
         for sheet in sch.sheets.iter() {
             let child = resolve_sheet_path(&base, sheet.file());
+            let child_instance_path = if instance_path == "/" {
+                format!("/{}", sheet.uuid)
+            } else {
+                format!("{}/{}", instance_path.trim_end_matches('/'), sheet.uuid)
+            };
             visit(
                 child,
                 Some(canonical.clone()),
                 Some(sheet.uuid.clone()),
+                child_instance_path,
                 out,
-                seen,
+                active_files,
             )?;
         }
+        active_files.remove(&canonical);
         Ok(())
     }
 
     let mut sheets = Vec::new();
-    let mut seen = HashSet::new();
-    visit(root.clone(), None, None, &mut sheets, &mut seen)?;
+    let mut active_files = HashSet::new();
+    visit(
+        root.clone(),
+        None,
+        None,
+        "/".to_string(),
+        &mut sheets,
+        &mut active_files,
+    )?;
     Ok(sheets)
 }
 
@@ -4080,7 +4806,7 @@ async fn validate_project_kicad_netlist(
     ctx: &ToolContext,
     plan: &ProjectRefactorPlan,
 ) -> anyhow::Result<()> {
-    let before = kicad_netlist_component_groups_for_project(&ctx.config.kicad_cli, &plan.root, &[])
+    let before = kicad_netlist_identities_for_project(&ctx.config.kicad_cli, &plan.root, &[])
         .await
         .map_err(|error| anyhow::anyhow!("KiCad project netlist BEFORE export failed: {error}"))?;
     let overrides = plan
@@ -4089,22 +4815,19 @@ async fn validate_project_kicad_netlist(
         .map(|file| (file.path.clone(), file.after.clone()))
         .collect::<Vec<_>>();
     let after =
-        kicad_netlist_component_groups_for_project(&ctx.config.kicad_cli, &plan.root, &overrides)
+        kicad_netlist_identities_for_project(&ctx.config.kicad_cli, &plan.root, &overrides)
             .await
             .map_err(|error| {
                 anyhow::anyhow!("KiCad project netlist AFTER export failed: {error}")
             })?;
-    if before != after {
-        anyhow::bail!("KiCad project netlist component-pin membership changed final transaction");
-    }
-    Ok(())
+    validate_kicad_identity_sets(&before, &after, Some(plan.net.as_str()))
 }
 
-async fn kicad_netlist_component_groups_for_project(
+async fn kicad_netlist_identities_for_project(
     kicad_cli: &str,
     root: &Path,
     overrides: &[(PathBuf, String)],
-) -> anyhow::Result<BTreeSet<Vec<String>>> {
+) -> anyhow::Result<BTreeSet<KicadNetIdentity>> {
     let temp = tempfile::tempdir()?;
     let source_dir = parent_dir(root);
     for entry in std::fs::read_dir(&source_dir)? {
@@ -4133,7 +4856,7 @@ async fn kicad_netlist_component_groups_for_project(
     let netlist_path = temp.path().join("project-snapshot.net");
     crate::tools::cli::export_netlist(kicad_cli, &temp_root, &netlist_path, "kicadsexpr").await?;
     let netlist = std::fs::read_to_string(&netlist_path)?;
-    normalized_kicad_netlist_groups(&netlist)
+    normalized_kicad_netlist_identities(&netlist)
 }
 
 async fn handle_refactor_schematic_net_representation(
@@ -4182,8 +4905,11 @@ async fn handle_refactor_schematic_net_representation(
         &plan.final_content,
         "final transaction",
     )?;
-    validate_kicad_netlist_if_configured(ctx, &plan.schematic, &plan.before, &plan.final_content)
-        .await?;
+    let allowed_target_scope_change =
+        (representation == "power_symbol").then_some(net.as_str());
+    validate_kicad_netlist_if_configured(
+        ctx, &plan.schematic, &plan.before, &plan.final_content, allowed_target_scope_change,
+    ).await?;
     write_atomic_if_unchanged(&plan.schematic, &plan.before, &plan.final_content)?;
     Ok(CallToolResult::json(&plan.response(false, true)))
 }
@@ -4238,6 +4964,7 @@ fn build_expand_coincident_net_plan(
 ) -> Result<RefactorNetPlan, CallToolResult> {
     let (before, tree) =
         read_schematic(schematic).map_err(|error| CallToolResult::error(error.to_string()))?;
+    reject_unsupported_schematic_semantics(&tree, "refactor_schematic_net_representation")?;
     let before_snapshot =
         semantic_snapshot(&before).map_err(|error| CallToolResult::error(error.to_string()))?;
     let grid = args["grid"].as_f64().unwrap_or(1.27);
@@ -4356,6 +5083,7 @@ fn build_power_symbol_refactor_plan(
 ) -> Result<RefactorNetPlan, CallToolResult> {
     let (before, tree) =
         read_schematic(schematic).map_err(|error| CallToolResult::error(error.to_string()))?;
+    reject_unsupported_schematic_semantics(&tree, "refactor_schematic_net_representation")?;
     let before_snapshot =
         semantic_snapshot(&before).map_err(|error| CallToolResult::error(error.to_string()))?;
     let diagnostic = net_scope_diagnostic(&tree, schematic, net);
@@ -4503,6 +5231,36 @@ fn inspect_net_representation_scope(
     )))
 }
 
+fn project_netclass_matches(
+    schematic: &std::path::Path,
+    net: &str,
+) -> (Option<String>, Vec<serde_json::Value>) {
+    let Some(project) = crate::tools::nearest_kicad_pro(schematic) else {
+        return (None, Vec::new());
+    };
+    let project_display = project.display().to_string();
+    let matches = std::fs::read_to_string(&project)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|settings| settings["net_settings"]["netclass_patterns"].as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|entry| {
+            let pattern = entry["pattern"].as_str()?.to_string();
+            let netclass = entry["netclass"].as_str().unwrap_or_default().to_string();
+            let exact = pattern == net;
+            crate::tools::pcb_routing::wildcard_matches(&pattern, net).then(|| {
+                json!({
+                    "pattern": pattern,
+                    "netclass": netclass,
+                    "exact": exact
+                })
+            })
+        })
+        .collect();
+    (Some(project_display), matches)
+}
+
 fn net_scope_diagnostic(
     tree: &konnect_sexp::SexpNode,
     schematic: &std::path::Path,
@@ -4528,23 +5286,39 @@ fn net_scope_diagnostic(
         .iter()
         .filter(|label| label.kind == LabelKind::PowerSymbol)
         .count();
-    let mechanisms = [ordinary, global, hierarchical, power]
+    let hierarchical_sheet_pins = tree
+        .find_all("sheet")
+        .into_iter()
+        .flat_map(|sheet| sheet.find_all("pin"))
+        .filter(|pin| pin.get(1).and_then(|node| node.as_str()) == Some(net))
+        .count();
+    let mechanisms = [ordinary, global, hierarchical, power, hierarchical_sheet_pins]
         .into_iter()
         .filter(|count| *count > 0)
         .count();
+    let naming_primitive_present = mechanisms > 0;
+    let (project_file, project_netclass_matches) = project_netclass_matches(schematic, net);
+    let project_name_required = !project_netclass_matches.is_empty();
+    let project_name_requirement_unmet = project_name_required && !naming_primitive_present;
     json!({
         "net": net,
         "sheets": [schematic.file_stem().and_then(|name| name.to_str()).unwrap_or("<sheet>")],
         "ordinary_label_scope": ordinary > 0,
-        "hierarchical_connectivity": hierarchical > 0,
+        "hierarchical_connectivity": hierarchical > 0 || hierarchical_sheet_pins > 0,
         "global_label_connectivity": global > 0,
         "power_symbol_connectivity": power > 0,
         "ordinary_labels": ordinary,
         "hierarchical_labels": hierarchical,
+        "hierarchical_sheet_pins": hierarchical_sheet_pins,
         "global_labels": global,
         "power_symbols": power,
+        "naming_primitive_present": naming_primitive_present,
+        "project_file": project_file,
+        "project_netclass_matches": project_netclass_matches,
+        "project_name_required": project_name_required,
+        "project_name_requirement_unmet": project_name_requirement_unmet,
         "mixed_connection_mechanisms": mechanisms > 1,
-        "power_scope_conversion_requires_policy": (ordinary > 0 || hierarchical > 0 || global > 0) && power == 0
+        "power_scope_conversion_requires_policy": (ordinary > 0 || hierarchical > 0 || hierarchical_sheet_pins > 0 || global > 0) && power == 0
     })
 }
 
@@ -4573,7 +5347,7 @@ fn net_endpoints_for(
         {
             continue;
         }
-        if graph.net_at(placed.at.0, placed.at.1).as_deref() == Some(net) {
+        if index.net_for_pin(&mut graph, placed).as_deref() == Some(net) {
             endpoints.push(NetEndpoint {
                 kind: NetEndpointKind::ComponentPin,
                 reference: placed.reference.clone(),
@@ -4641,8 +5415,16 @@ fn sheet_pin_endpoints_for(
             {
                 continue;
             }
-            if graph.net_at(pin_x, pin_y).as_deref() != Some(net) {
-                continue;
+            let local_net = graph.net_at(pin_x, pin_y);
+            // A parent-sheet wire between hierarchical sheet pins can be valid
+            // without carrying an ordinary/global label of its own. In that
+            // case the sheet-pin interface name is the available local net
+            // identity. Never override an explicitly different named net.
+            match local_net.as_deref() {
+                Some(existing) if existing == net => {}
+                Some(_) => continue,
+                None if pin_name == net => {}
+                None => continue,
             }
             endpoints.push(NetEndpoint {
                 kind: NetEndpointKind::SheetPin {
@@ -4829,7 +5611,9 @@ fn power_symbol_anchor_for_label(
             (label.x, label.y),
             &MaterializeObstacles {
                 bodies: Vec::new(),
+                approximate_bodies: Vec::new(),
                 foreign_pins: Vec::new(),
+                semantic_anchors: Vec::new(),
                 foreign_wires: Vec::new(),
             },
         );
@@ -5152,11 +5936,11 @@ pub(crate) fn reconcile_junctions_at(
             .iter()
             .filter(|d| konnect_sexp::geometry::points_coincident(px, py, d.at.0, d.at.1, TOL))
             .collect();
-        let attached = idx.has_pin(px, py) || idx.has_sheet_pin(px, py);
+        let attached = idx.has_connectable_pin(px, py) || idx.has_sheet_pin(px, py);
         if here.is_empty() {
             if idx.wires_at(px, py) == 1
                 && idx.on_wire_interior(px, py)
-                && idx.has_pin(px, py)
+                && idx.has_connectable_pin(px, py)
                 && !idx.has_no_connect(px, py)
             {
                 to_add.push((px, py));
@@ -8938,6 +9722,97 @@ mod materialize_net_tests {
         (dir, root, power, core)
     }
 
+    fn add_repeated_core_instance(root: &std::path::Path, rail: &str) {
+        let other_rail = if rail == "+5V_MAIN" {
+            "VCC_3V3_S0"
+        } else {
+            "+5V_MAIN"
+        };
+        let text = std::fs::read_to_string(root).unwrap();
+        let duplicate = format!(
+            r#"  (sheet (at 120 20) (size 30 20) (uuid "sheet-core-repeat")
+    (property "Sheetname" "CoreRepeat" (at 120 19.2 0))
+    (property "Sheetfile" "core.kicad_sch" (at 120 40.4 0))
+    (pin "{rail}" input (at 120 25 180) (uuid "pin-core-repeat-rail"))
+    (pin "{other_rail}" input (at 120 27.5 180) (uuid "pin-core-repeat-other"))
+    (pin "USB_SIGNAL" passive (at 120 30 180) (uuid "pin-core-repeat-usb"))
+  )"#
+        );
+        let text = text.replacen(
+            "  (sheet_instances",
+            &format!("{duplicate}\n  (sheet_instances"),
+            1,
+        );
+        std::fs::write(root, text).unwrap();
+    }
+
+    #[test]
+    fn project_sheet_discovery_retains_repeated_instances_and_unique_files() {
+        let (_dir, root, _power, core) = project_power_fixture("+5V_MAIN");
+        add_repeated_core_instance(&root, "+5V_MAIN");
+
+        let instances = discover_project_sheets(&root).unwrap();
+        let core = core.canonicalize().unwrap();
+        let core_instances = instances
+            .iter()
+            .filter(|sheet| sheet.path == core)
+            .collect::<Vec<_>>();
+        assert_eq!(core_instances.len(), 2);
+        assert_ne!(core_instances[0].instance_path, core_instances[1].instance_path);
+        assert!(core_instances
+            .iter()
+            .all(|sheet| sheet.parent_sheet_uuid.as_deref().is_some()));
+
+        let unique_files = instances
+            .iter()
+            .map(|sheet| sheet.path.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(unique_files.len(), 3);
+        assert_eq!(instances.len(), 4);
+    }
+
+    #[test]
+    fn repeated_child_project_refactor_mutates_file_once_and_cleans_all_interfaces() {
+        let (_dir, root, _power, core) = project_power_fixture("+5V_MAIN");
+        add_repeated_core_instance(&root, "+5V_MAIN");
+        let plan = build_project_power_symbol_refactor_plan(
+            &root,
+            "+5V_MAIN",
+            &json!({
+                "scope_policy": "allow_global_power_scope",
+                "dry_run": true
+            }),
+            &test_ctx(),
+        )
+        .unwrap();
+
+        let core = core.canonicalize().unwrap();
+        let root = root.canonicalize().unwrap();
+        assert_eq!(plan.participating_instances.iter().filter(|sheet| sheet.path == core).count(), 2);
+        assert_eq!(plan.participating_sheets.len(), 3);
+        assert_eq!(plan.files.iter().filter(|file| file.path == core).count(), 1);
+        let root_plan = plan.files.iter().find(|file| file.path == root).unwrap();
+        assert_eq!(root_plan.sheet_pins_removed, 3);
+        assert_eq!(root_plan.wires_removed, 1);
+    }
+
+    #[test]
+    fn project_sheet_discovery_rejects_recursive_file_inclusion() {
+        let (_dir, root, _power, core) = project_power_fixture("+5V_MAIN");
+        let cycle = r#"  (sheet (at 10 10) (size 20 20) (uuid "cycle-to-root")
+    (property "Sheetname" "Cycle" (at 10 9 0))
+    (property "Sheetfile" "fixture.kicad_sch" (at 10 31 0))
+  )"#;
+        let core_text = insert_before_schematic_close(
+            std::fs::read_to_string(&core).unwrap(),
+            &format!("\n{cycle}\n"),
+        );
+        std::fs::write(&core, core_text).unwrap();
+
+        let error = discover_project_sheets(&root).unwrap_err();
+        assert!(result_text(&error).contains("recursive hierarchical sheet inclusion"));
+    }
+
     #[tokio::test]
     async fn noncanonical_legacy_power_symbol_is_replaced_with_canonical_template() {
         let net = "+5V_MAIN";
@@ -9261,7 +10136,7 @@ mod materialize_net_tests {
     }
 
     #[test]
-    fn normalized_kicad_netlist_groups_preserves_singletons() {
+    fn normalized_kicad_netlist_identities_preserve_names_and_singletons() {
         let netlist = r#"(export
   (nets
     (net (code "1") (name "GROUP_A")
@@ -9271,11 +10146,87 @@ mod materialize_net_tests {
     (net (code "2") (name "GROUP_B")
       (node (ref "U1") (pin "6"))
     )
+    (net (code "3") (name "GROUP_EMPTY"))
   )
 )"#;
-        let groups = normalized_kicad_netlist_groups(netlist).unwrap();
-        assert!(groups.contains(&vec!["R1.1".to_string(), "R2.1".to_string()]));
-        assert!(groups.contains(&vec!["U1.6".to_string()]));
+        let identities = normalized_kicad_netlist_identities(netlist).unwrap();
+        assert!(identities.contains(&KicadNetIdentity {
+            name: "GROUP_A".to_string(),
+            pins: vec!["R1.1".to_string(), "R2.1".to_string()],
+        }));
+        assert!(identities.contains(&KicadNetIdentity {
+            name: "GROUP_B".to_string(),
+            pins: vec!["U1.6".to_string()],
+        }));
+        assert!(identities.contains(&KicadNetIdentity {
+            name: "GROUP_EMPTY".to_string(),
+            pins: Vec::new(),
+        }));
+    }
+
+    #[test]
+    fn kicad_identity_validation_rejects_rename_with_same_pins() {
+        let before = normalized_kicad_netlist_identities(
+            r#"(export (nets
+  (net (code "1") (name "/Sheet/NODE") (node (ref "U1") (pin "1")))
+))"#,
+        )
+        .unwrap();
+        let after = normalized_kicad_netlist_identities(
+            r#"(export (nets
+  (net (code "1") (name "/Sheet/RENAMED") (node (ref "U1") (pin "1")))
+))"#,
+        )
+        .unwrap();
+
+        let error = validate_kicad_identity_sets(&before, &after, None).unwrap_err();
+        assert!(error.to_string().contains("netlist identity"));
+    }
+
+    #[test]
+    fn kicad_identity_validation_allows_only_explicit_target_scope_change() {
+        let before = normalized_kicad_netlist_identities(
+            r#"(export (nets
+  (net (code "1") (name "/Power/+5V_MAIN")
+    (node (ref "J1") (pin "1"))
+    (node (ref "U1") (pin "1")))
+  (net (code "2") (name "/Power/SIG") (node (ref "U2") (pin "1")))
+))"#,
+        )
+        .unwrap();
+        let allowed = normalized_kicad_netlist_identities(
+            r#"(export (nets
+  (net (code "1") (name "+5V_MAIN")
+    (node (ref "J1") (pin "1"))
+    (node (ref "U1") (pin "1")))
+  (net (code "2") (name "/Power/SIG") (node (ref "U2") (pin "1")))
+))"#,
+        )
+        .unwrap();
+        validate_kicad_identity_sets(&before, &allowed, Some("+5V_MAIN")).unwrap();
+
+        let wrong_other = normalized_kicad_netlist_identities(
+            r#"(export (nets
+  (net (code "1") (name "+5V_MAIN")
+    (node (ref "J1") (pin "1"))
+    (node (ref "U1") (pin "1")))
+  (net (code "2") (name "/Power/SIG_RENAMED") (node (ref "U2") (pin "1")))
+))"#,
+        )
+        .unwrap();
+        assert!(validate_kicad_identity_sets(&before, &wrong_other, Some("+5V_MAIN")).is_err());
+
+        let wrong_target_membership = normalized_kicad_netlist_identities(
+            r#"(export (nets
+  (net (code "1") (name "+5V_MAIN") (node (ref "U1") (pin "1")))
+  (net (code "2") (name "/Power/SIG") (node (ref "U2") (pin "1")))
+))"#,
+        )
+        .unwrap();
+        assert!(
+            validate_kicad_identity_sets(&before, &wrong_target_membership, Some("+5V_MAIN"))
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -9733,6 +10684,34 @@ mod materialize_net_tests {
     }
 
     #[test]
+    fn approximate_symbol_bounds_are_penalized_not_hard_blocked() {
+        let approximate = RectObstacle {
+            min_x: 65.0,
+            min_y: 45.0,
+            max_x: 85.0,
+            max_y: 55.0,
+        };
+        let obstacles = MaterializeObstacles {
+            bodies: Vec::new(),
+            approximate_bodies: vec![approximate],
+            foreign_pins: Vec::new(),
+            semantic_anchors: Vec::new(),
+            foreign_wires: Vec::new(),
+        };
+        let crossing = Segment {
+            x1: 50.0,
+            y1: 50.0,
+            x2: 100.0,
+            y2: 50.0,
+        };
+        assert!(obstacles.allows(crossing));
+        assert_eq!(
+            obstacles.approximate_body_penalty(crossing),
+            APPROXIMATE_BODY_PENALTY
+        );
+    }
+
+    #[test]
     fn materialize_routes_around_foreign_pin() {
         let body = r#"  (label "OTHER" (at 75 50 0) (effects (font (size 1.27 1.27)) (justify left bottom)) (uuid "other"))
   (symbol (lib_id "Test:P") (at 75 50 0) (unit 1) (property "Reference" "F1" (at 75 48 0)) (property "Value" "P" (at 75 52 0)) (uuid "f1"))"#;
@@ -9769,16 +10748,291 @@ mod materialize_net_tests {
     }
 
     #[test]
+    fn proper_crossing_is_non_conductive_and_allowed() {
+        let target = Segment {
+            x1: 50.0,
+            y1: 55.0,
+            x2: 100.0,
+            y2: 55.0,
+        };
+        let foreign = Segment {
+            x1: 75.0,
+            y1: 45.0,
+            x2: 75.0,
+            y2: 65.0,
+        };
+        assert_eq!(
+            schematic_wire_relationship(target, foreign),
+            SchematicWireRelationship::ProperCrossing { x: 75.0, y: 55.0 }
+        );
+        assert!(!conductive_segments_contact(target, foreign));
+
+        let obstacles = MaterializeObstacles {
+            bodies: Vec::new(),
+            approximate_bodies: Vec::new(),
+            foreign_pins: Vec::new(),
+            semantic_anchors: Vec::new(),
+            foreign_wires: vec![foreign],
+        };
+        assert!(obstacles.allows(target));
+    }
+
+    #[test]
+    fn diagonal_proper_crossing_is_non_conductive_and_allowed() {
+        let target = Segment {
+            x1: 0.0,
+            y1: 5.0,
+            x2: 10.0,
+            y2: 5.0,
+        };
+        let foreign = Segment {
+            x1: 0.0,
+            y1: 0.0,
+            x2: 10.0,
+            y2: 10.0,
+        };
+        assert_eq!(
+            schematic_wire_relationship(target, foreign),
+            SchematicWireRelationship::ProperCrossing { x: 5.0, y: 5.0 }
+        );
+        assert!(!conductive_segments_contact(target, foreign));
+        let obstacles = MaterializeObstacles {
+            bodies: Vec::new(),
+            approximate_bodies: Vec::new(),
+            foreign_pins: Vec::new(),
+            semantic_anchors: Vec::new(),
+            foreign_wires: vec![foreign],
+        };
+        assert!(obstacles.allows(target));
+    }
+
+    #[test]
+    fn diagonal_endpoint_on_interior_is_conductive_and_blocked() {
+        let target = Segment {
+            x1: 0.0,
+            y1: 5.0,
+            x2: 5.0,
+            y2: 5.0,
+        };
+        let foreign = Segment {
+            x1: 0.0,
+            y1: 0.0,
+            x2: 10.0,
+            y2: 10.0,
+        };
+        assert!(matches!(
+            schematic_wire_relationship(target, foreign),
+            SchematicWireRelationship::EndpointOnInterior { .. }
+        ));
+        assert!(conductive_segments_contact(target, foreign));
+        let obstacles = MaterializeObstacles {
+            bodies: Vec::new(),
+            approximate_bodies: Vec::new(),
+            foreign_pins: Vec::new(),
+            semantic_anchors: Vec::new(),
+            foreign_wires: vec![foreign],
+        };
+        assert!(!obstacles.allows(target));
+    }
+
+    #[test]
+    fn diagonal_collinear_overlap_is_conductive_and_blocked() {
+        let target = Segment {
+            x1: 0.0,
+            y1: 0.0,
+            x2: 10.0,
+            y2: 10.0,
+        };
+        let foreign = Segment {
+            x1: 5.0,
+            y1: 5.0,
+            x2: 15.0,
+            y2: 15.0,
+        };
+        assert_eq!(
+            schematic_wire_relationship(target, foreign),
+            SchematicWireRelationship::CollinearOverlap
+        );
+        assert!(conductive_segments_contact(target, foreign));
+    }
+
+    #[test]
+    fn wire_writer_adds_junction_for_endpoint_on_diagonal_wire_interior() {
+        let content = r#"(kicad_sch
+  (wire (pts (xy 0 0) (xy 10 10)) (uuid "existing-diagonal"))
+)"#
+        .to_string();
+        let after = insert_wire_with_junctions(content, 0.0, 5.0, 5.0, 5.0);
+        assert_eq!(after.matches("(junction").count(), 1);
+        assert!(after.contains("(at 5 5)"));
+    }
+
+    #[test]
+    fn foreign_label_anchor_is_hard_invalid() {
+        let body = r#"  (label "OTHER" (at 75 50 0) (effects (font (size 1.27 1.27)) (justify left bottom)) (uuid "other"))"#;
+        let (_dir, path) = materialize_obstacle_fixture(body);
+        let (_, tree) = read_schematic(&path).unwrap();
+        let wires = extract_wires(&tree);
+        let labels = konnect_sexp::schematic::extract_all_net_labels(&tree);
+        let endpoints = net_endpoints_for(&tree, "NODE", &json!({}), 1.27).unwrap();
+        let obstacles = MaterializeObstacles::build(&tree, &wires, &labels, "NODE", &endpoints);
+        let crossing = Segment {
+            x1: 50.0,
+            y1: 50.0,
+            x2: 100.0,
+            y2: 50.0,
+        };
+        assert!(!obstacles.allows(crossing));
+    }
+
+    #[test]
+    fn existing_foreign_junction_blocks_otherwise_legal_crossing() {
+        let body = r#"  (label "OTHER" (at 75 45 0) (effects (font (size 1.27 1.27)) (justify left bottom)) (uuid "other"))
+  (wire (pts (xy 75 45) (xy 75 55)) (uuid "foreign-wire"))
+  (junction (at 75 50) (diameter 0) (uuid "foreign-junction"))"#;
+        let (_dir, path) = materialize_obstacle_fixture(body);
+        let (_, tree) = read_schematic(&path).unwrap();
+        let wires = extract_wires(&tree);
+        let labels = konnect_sexp::schematic::extract_all_net_labels(&tree);
+        let endpoints = net_endpoints_for(&tree, "NODE", &json!({}), 1.27).unwrap();
+        let obstacles = MaterializeObstacles::build(&tree, &wires, &labels, "NODE", &endpoints);
+        let crossing = Segment {
+            x1: 50.0,
+            y1: 50.0,
+            x2: 100.0,
+            y2: 50.0,
+        };
+        let foreign = Segment {
+            x1: 75.0,
+            y1: 45.0,
+            x2: 75.0,
+            y2: 55.0,
+        };
+        assert!(matches!(schematic_wire_relationship(crossing, foreign), SchematicWireRelationship::ProperCrossing { .. }));
+        assert!(!obstacles.allows(crossing));
+    }
+
+    #[test]
+    fn no_connect_anchor_is_hard_invalid() {
+        let body = r#"  (no_connect (at 75 50) (uuid "nc"))"#;
+        let (_dir, path) = materialize_obstacle_fixture(body);
+        let (_, tree) = read_schematic(&path).unwrap();
+        let wires = extract_wires(&tree);
+        let labels = konnect_sexp::schematic::extract_all_net_labels(&tree);
+        let endpoints = net_endpoints_for(&tree, "NODE", &json!({}), 1.27).unwrap();
+        let obstacles = MaterializeObstacles::build(&tree, &wires, &labels, "NODE", &endpoints);
+        let crossing = Segment {
+            x1: 50.0,
+            y1: 50.0,
+            x2: 100.0,
+            y2: 50.0,
+        };
+        assert!(!obstacles.allows(crossing));
+    }
+
+    #[test]
+    fn foreign_sheet_pin_anchor_is_hard_invalid() {
+        let body = r#"  (sheet (at 75 50) (size 0 0) (uuid "foreign-sheet")
+    (property "Sheetname" "FOREIGN" (at 75 49 0))
+    (property "Sheetfile" "foreign.kicad_sch" (at 75 51 0))
+    (pin "OTHER" passive (at 75 50 0) (uuid "foreign-sheet-pin"))
+  )"#;
+        let (_dir, path) = materialize_obstacle_fixture(body);
+        let (_, tree) = read_schematic(&path).unwrap();
+        let wires = extract_wires(&tree);
+        let labels = konnect_sexp::schematic::extract_all_net_labels(&tree);
+        let endpoints = net_endpoints_for(&tree, "NODE", &json!({}), 1.27).unwrap();
+        let obstacles = MaterializeObstacles::build(&tree, &wires, &labels, "NODE", &endpoints);
+        let crossing = Segment {
+            x1: 50.0,
+            y1: 50.0,
+            x2: 100.0,
+            y2: 50.0,
+        };
+        assert!(!obstacles.allows(crossing));
+    }
+
+    #[test]
+    fn wire_writer_does_not_add_junction_for_proper_crossing() {
+        let content = r#"(kicad_sch
+  (wire (pts (xy 75 45) (xy 75 65)) (uuid "foreign"))
+)"#
+        .to_string();
+        let after = insert_wire_with_junctions(content, 50.0, 55.0, 100.0, 55.0);
+        assert!(!after.contains("(junction"));
+    }
+
+    #[test]
+    fn wire_writer_adds_junction_for_endpoint_on_wire_interior() {
+        let content = r#"(kicad_sch
+  (wire (pts (xy 75 45) (xy 75 65)) (uuid "existing"))
+)"#
+        .to_string();
+        let after = insert_wire_with_junctions(content, 50.0, 55.0, 75.0, 55.0);
+        assert_eq!(after.matches("(junction").count(), 1);
+        assert!(after.contains("(at 75 55)"));
+    }
+
+    #[test]
+    fn normalize_segments_merges_touching_and_overlapping_collinear_fragments() {
+        let normalized = normalize_segments(vec![
+            Segment {
+                x1: 0.0,
+                y1: 10.0,
+                x2: 2.0,
+                y2: 10.0,
+            },
+            Segment {
+                x1: 2.0,
+                y1: 10.0,
+                x2: 4.0,
+                y2: 10.0,
+            },
+            Segment {
+                x1: 3.0,
+                y1: 10.0,
+                x2: 6.0,
+                y2: 10.0,
+            },
+            Segment {
+                x1: 6.0,
+                y1: 10.0,
+                x2: 6.0,
+                y2: 10.0,
+            },
+            Segment {
+                x1: 4.0,
+                y1: 8.0,
+                x2: 4.0,
+                y2: 10.0,
+            },
+        ]);
+        assert_eq!(normalized.len(), 2, "{normalized:?}");
+        assert!(normalized.contains(&Segment {
+            x1: 0.0,
+            y1: 10.0,
+            x2: 6.0,
+            y2: 10.0,
+        }));
+        assert!(normalized.contains(&Segment {
+            x1: 4.0,
+            y1: 8.0,
+            x2: 4.0,
+            y2: 10.0,
+        }));
+    }
+
+    #[test]
     fn foreign_conductive_endpoint_and_t_contacts_are_hard_invalid() {
         let target_endpoint_touch = Segment {
             x1: 50.0,
-            y1: 50.0,
+            y1: 55.0,
             x2: 75.0,
-            y2: 50.0,
+            y2: 55.0,
         };
         let foreign_endpoint = Segment {
             x1: 75.0,
-            y1: 50.0,
+            y1: 55.0,
             x2: 75.0,
             y2: 60.0,
         };
@@ -9795,7 +11049,9 @@ mod materialize_net_tests {
         assert!(conductive_segments_contact(target_t, foreign_endpoint));
         let obstacles = MaterializeObstacles {
             bodies: Vec::new(),
+            approximate_bodies: Vec::new(),
             foreign_pins: Vec::new(),
+            semantic_anchors: Vec::new(),
             foreign_wires: vec![foreign_endpoint],
         };
         assert!(!obstacles.allows(target_endpoint_touch));
@@ -9899,7 +11155,15 @@ mod materialize_net_tests {
             .await
             .unwrap();
         assert!(result.is_error);
-        assert!(!result_text(&result).contains("routes_by_net"));
+        let error_text = result_text(&result);
+        assert!(!error_text.contains("routes_by_net"));
+        let diagnostic: serde_json::Value =
+            serde_json::from_str(&error_text).expect("no-route error should be structured JSON");
+        assert_eq!(diagnostic["reason"], json!("no_obstacle_free_route"));
+        assert!(
+            diagnostic["obstacles"]["symbol_bodies"].as_u64().unwrap() > 0,
+            "actual blocking sheet must be reported: {diagnostic}"
+        );
     }
 
     #[tokio::test]
@@ -10073,6 +11337,48 @@ mod materialize_net_tests {
             .as_str()
             .unwrap()
             .starts_with("materialize-schematic-net:"));
+    }
+
+    #[tokio::test]
+    async fn optimize_schematic_layout_resolves_unlabelled_parent_sheet_pin_net() {
+        let (_dir, path) = horizontal_sheet_fixture("sheet_unlabelled_parent", false);
+        let content = std::fs::read_to_string(&path).unwrap();
+        let without_plain_labels = content
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("(label \"SIG_"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, without_plain_labels).unwrap();
+
+        let (_, tree) = read_schematic(&path).unwrap();
+        let endpoints = net_endpoints_for(&tree, "SIG_A", &json!({}), 1.27).unwrap();
+        assert_eq!(endpoints.len(), 2);
+        assert!(endpoints
+            .iter()
+            .all(|endpoint| matches!(endpoint.kind, NetEndpointKind::SheetPin { .. })));
+
+        let result = handle_optimize_schematic_layout(
+            &json!({
+                "schematic": path.display().to_string(),
+                "net_names": ["SIG_A"],
+                "candidate_count": 5,
+                "dry_run": true
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{}", result_text(&result));
+        let body = result_json(&result);
+        assert!(body["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate["sheet_pin_changes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|change| change["pin_uuid"] == "right-a" && change["to_side"] == "LEFT")));
     }
 
     #[tokio::test]
@@ -10301,7 +11607,9 @@ mod materialize_net_tests {
                     max_y: 1.0,
                 },
             ],
+            approximate_bodies: Vec::new(),
             foreign_pins: Vec::new(),
+            semantic_anchors: Vec::new(),
             foreign_wires: Vec::new(),
         };
         let route = obstacle_free_manhattan_route(&[(0.0, 0.0), (6.0, 0.0)], 1.0, &obstacles)
@@ -10345,7 +11653,9 @@ mod materialize_net_tests {
                     max_y: -0.4,
                 },
             ],
+            approximate_bodies: Vec::new(),
             foreign_pins: Vec::new(),
+            semantic_anchors: Vec::new(),
             foreign_wires: Vec::new(),
         };
         assert!(
@@ -10770,6 +12080,276 @@ mod materialize_net_tests {
         assert_eq!(before.shorts, after.shorts);
     }
 
+    #[test]
+    fn scope_diagnostic_reports_missing_project_netclass_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let schematic = dir.path().join("02_Power.kicad_sch");
+        std::fs::write(&schematic, "(kicad_sch)\n").unwrap();
+        std::fs::write(
+            dir.path().join("board.kicad_pro"),
+            r#"{"net_settings":{"netclass_patterns":[{"netclass":"POWER_5V","pattern":"AUX_*"}]}}"#,
+        )
+        .unwrap();
+        let tree = parse_sexp("(kicad_sch)").unwrap();
+        let diagnostic = net_scope_diagnostic(&tree, &schematic, "AUX_5V");
+        assert_eq!(diagnostic["naming_primitive_present"], json!(false));
+        assert_eq!(diagnostic["project_name_required"], json!(true));
+        assert_eq!(diagnostic["project_name_requirement_unmet"], json!(true));
+        assert_eq!(diagnostic["project_netclass_matches"][0]["pattern"], json!("AUX_*"));
+        assert_eq!(diagnostic["project_netclass_matches"][0]["netclass"], json!("POWER_5V"));
+    }
+
+    #[test]
+    fn scope_diagnostic_accepts_hierarchical_sheet_pin_as_name_mechanism() {
+        let dir = tempfile::tempdir().unwrap();
+        let schematic = dir.path().join("root.kicad_sch");
+        std::fs::write(&schematic, "(kicad_sch)\n").unwrap();
+        std::fs::write(
+            dir.path().join("board.kicad_pro"),
+            r#"{"net_settings":{"netclass_patterns":[{"netclass":"POWER_5V","pattern":"AUX_5V"}]}}"#,
+        )
+        .unwrap();
+        let tree = parse_sexp(
+            r#"(kicad_sch
+  (sheet
+    (at 10 10)
+    (size 20 20)
+    (uuid "sheet")
+    (pin "AUX_5V" input (at 10 15 180) (uuid "pin"))))"#,
+        )
+        .unwrap();
+        let diagnostic = net_scope_diagnostic(&tree, &schematic, "AUX_5V");
+        assert_eq!(diagnostic["hierarchical_sheet_pins"], json!(1));
+        assert_eq!(diagnostic["naming_primitive_present"], json!(true));
+        assert_eq!(diagnostic["project_name_required"], json!(true));
+        assert_eq!(diagnostic["project_name_requirement_unmet"], json!(false));
+    }
+
+    #[test]
+    fn unsupported_semantics_detect_rule_area_directive_and_net_class_metadata() {
+        let tree = parse_sexp(
+            r#"(kicad_sch
+  (lib_symbols)
+  (rule_area (polyline (pts (xy 0 0) (xy 1 0) (xy 1 1))))
+  (directive_label "FAST" (at 0 0 0) (uuid "directive"))
+  (label "SIG" (at 10 10 0)
+    (property "Net Class" "USB2")
+    (uuid "label"))
+)"#,
+        )
+        .unwrap();
+        let features = unsupported_schematic_semantic_features(&tree);
+        assert!(features.contains("rule_area"));
+        assert!(features.contains("directive_label"));
+        assert!(features.contains("label_net_class_property"));
+    }
+
+    #[test]
+    fn unsupported_semantics_detect_local_power_hidden_power_and_jumpers() {
+        let tree = parse_sexp(
+            r##"(kicad_sch
+  (lib_symbols
+    (symbol "Test:LOCAL"
+      (power local)
+      (duplicate_pin_numbers_are_jumpers no)
+      (symbol "LOCAL_1_1"
+        (pin power_in line (at 0 0 270) (length 0) (hide yes)
+          (name "~") (number "1"))))
+    (symbol "Test:HIDDEN_PWR"
+      (duplicate_pin_numbers_are_jumpers no)
+      (symbol "HIDDEN_PWR_1_1"
+        (pin power_in line (at 0 0 0) (length 2.54) (hide yes)
+          (name "VCC") (number "1"))))
+    (symbol "Test:JUMPER"
+      (duplicate_pin_numbers_are_jumpers yes)
+      (jumper_pin_groups ("1" "2"))
+      (symbol "JUMPER_1_1"
+        (pin passive line (at 0 0 0) (length 0) (name "~") (number "1"))
+        (pin passive line (at 2.54 0 180) (length 0) (name "~") (number "2"))))
+  )
+  (symbol (lib_id "Test:LOCAL") (at 10 10 0) (unit 1)
+    (property "Reference" "#PWR01" (at 10 10 0))
+    (property "Value" "+7V" (at 10 10 0))
+    (uuid "local"))
+  (symbol (lib_id "Test:HIDDEN_PWR") (at 20 20 0) (unit 1)
+    (property "Reference" "U1" (at 20 20 0))
+    (property "Value" "MCU" (at 20 20 0))
+    (uuid "hidden"))
+  (symbol (lib_id "Test:JUMPER") (at 30 30 0) (unit 1)
+    (property "Reference" "SW1" (at 30 30 0))
+    (property "Value" "SW" (at 30 30 0))
+    (uuid "jumper"))
+)"##,
+        )
+        .unwrap();
+        let features = unsupported_schematic_semantic_features(&tree);
+        assert!(features.contains("local_power_symbol:#PWR01:+7V"));
+        assert!(features.contains("hidden_power_pin:U1"));
+        assert!(features.contains("duplicate_pin_numbers_are_jumpers:SW1"));
+        assert!(features.contains("jumper_pin_groups:SW1"));
+        assert!(!features.contains("hidden_power_pin:#PWR01"));
+    }
+
+    #[tokio::test]
+    async fn materialize_fails_closed_on_rule_area_metadata() {
+        let body = [
+            label("NODE", 50.0, 50.0, "l1"),
+            label("NODE", 100.0, 50.0, "l2"),
+            one_pin("J1", "CONN", 50.0, 50.0, "j1"),
+            one_pin("U1", "IC", 100.0, 50.0, "u1"),
+            r#"  (rule_area
+    (polyline (pts (xy 60 40) (xy 90 40) (xy 90 60) (xy 60 60)))
+  )"#
+            .to_string(),
+        ]
+        .join("\n");
+        let (_dir, path) = one_pin_net_fixture("unsupported_rule_area", &body);
+        let result = handle_materialize_schematic_net(
+            &json!({
+                "schematic": path.display().to_string(),
+                "net": "NODE",
+                "dry_run": true
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert!(result_text(&result).contains("unsupported_schematic_semantics"));
+        assert!(result_text(&result).contains("rule_area"));
+    }
+
+    #[tokio::test]
+    async fn optimizer_fails_closed_on_directive_label_metadata() {
+        let body = [
+            label("NODE", 50.0, 50.0, "l1"),
+            label("NODE", 100.0, 50.0, "l2"),
+            one_pin("J1", "CONN", 50.0, 50.0, "j1"),
+            one_pin("U1", "IC", 100.0, 50.0, "u1"),
+            r#"  (directive_label "FAST"
+    (at 75 50 0)
+    (uuid "directive"))
+  "#
+            .to_string(),
+        ]
+        .join("\n");
+        let (_dir, path) = one_pin_net_fixture("unsupported_directive", &body);
+        let result = handle_optimize_schematic_layout(
+            &json!({
+                "schematic": path.display().to_string(),
+                "net_names": ["NODE"],
+                "dry_run": true
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert!(result_text(&result).contains("unsupported_schematic_semantics"));
+        assert!(result_text(&result).contains("directive_label"));
+    }
+
+    #[test]
+    fn semantic_snapshot_keeps_intrinsic_nc_stack_member_unconnected() {
+        let content = r#"(kicad_sch
+  (version 20250610)
+  (generator "konnect-test")
+  (uuid "root")
+  (lib_symbols
+    (symbol "Test:STACK"
+      (symbol "STACK_1_1"
+        (pin passive line (at 0 0 0) (length 0)
+          (name "SIG") (number "1"))
+        (pin no_connect line (at 0 0 0) (length 0)
+          (name "NC") (number "2"))
+      )
+    )
+  )
+  (label "NODE" (at 50 50 0) (uuid "node"))
+  (symbol
+    (lib_id "Test:STACK")
+    (at 50 50 0)
+    (unit 1)
+    (property "Reference" "U1" (at 50 48 0))
+    (property "Value" "STACK" (at 50 52 0))
+    (uuid "u1")
+  )
+)"#;
+        let snapshot = semantic_snapshot(content).unwrap();
+        assert_eq!(
+            snapshot.pin_nets.get("U1:1:1"),
+            Some(&Some("NODE".to_string()))
+        );
+        assert_eq!(snapshot.pin_nets.get("U1:1:2"), Some(&None));
+    }
+
+    #[test]
+    fn semantic_snapshot_expands_multi_number_pin_membership() {
+        let content = r#"(kicad_sch
+  (version 20250610)
+  (generator "konnect-test")
+  (uuid "root")
+  (lib_symbols
+    (symbol "Test:MULTI"
+      (symbol "MULTI_1_1"
+        (pin passive line (at 0 0 0) (length 0)
+          (name "STACK") (number "[1-3]"))
+      )
+    )
+  )
+  (label "NODE" (at 50 50 0) (uuid "node"))
+  (symbol
+    (lib_id "Test:MULTI")
+    (at 50 50 0)
+    (unit 1)
+    (property "Reference" "U1" (at 50 48 0))
+    (property "Value" "MULTI" (at 50 52 0))
+    (uuid "u1")
+  )
+)"#;
+        let snapshot = semantic_snapshot(content).unwrap();
+        assert_eq!(snapshot.pin_nets.len(), 3);
+        for pin in ["1", "2", "3"] {
+            assert_eq!(
+                snapshot.pin_nets.get(&format!("U1:1:{pin}")),
+                Some(&Some("NODE".to_string())),
+                "pin {pin}"
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_comparison_detects_scope_change_with_same_pin_membership() {
+        let local = label("NODE", 50.0, 50.0, "scope-label");
+        let body = [
+            local.clone(),
+            one_pin("U1", "IC", 50.0, 50.0, "u1"),
+        ]
+        .join("\n");
+        let (_dir, path) = one_pin_net_fixture("scope_change", &body);
+        let before_text = std::fs::read_to_string(&path).unwrap();
+        let before = semantic_snapshot(&before_text).unwrap();
+        let after_text = before_text.replace(
+            &local,
+            &global_label("NODE", 50.0, 50.0, "scope-label"),
+        );
+        let comparison = semantic_comparison(&before, &after_text).unwrap();
+
+        assert_eq!(comparison["preserved"], json!(true));
+        assert_eq!(comparison["pin_membership_preserved"], json!(true));
+        assert_eq!(comparison["scope_preserved"], json!(false));
+        assert!(comparison["component_pin_group_changes"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let changes = comparison["net_name_or_scope_changes"].as_array().unwrap();
+        assert_eq!(changes.len(), 1, "{comparison}");
+        assert_eq!(changes[0]["kind"], json!("scope"));
+        assert_eq!(changes[0]["net"], json!("NODE"));
+        assert_eq!(changes[0]["before"], json!(["local"]));
+        assert_eq!(changes[0]["after"], json!(["global"]));
+    }
+
     #[tokio::test]
     async fn scope_diagnostic_reports_mixed_label_and_power_mechanisms() {
         let body = [
@@ -10833,6 +12413,38 @@ mod materialize_net_tests {
         .unwrap();
         assert!(applied.is_error);
         assert_eq!(changed, std::fs::read_to_string(&path).unwrap());
+    }
+
+    #[test]
+    fn moved_sheet_pin_anchor_removes_only_directly_attached_wire() {
+        let content = r#"(kicad_sch
+  (wire (pts (xy 10 10) (xy 20 10)) (uuid "attached"))
+  (wire (pts (xy 20 10) (xy 30 10)) (uuid "branch"))
+  (wire (pts (xy 40 10) (xy 50 10)) (uuid "unrelated"))
+)"#;
+        let change = SheetPinChange {
+            sheet_uuid: "sheet-1".to_string(),
+            sheet_name: "S".to_string(),
+            pin_uuid: "pin-1".to_string(),
+            pin_name: "SIG".to_string(),
+            from_side: SheetPinSide::Right,
+            to_side: SheetPinSide::Left,
+            from_x: 10.0,
+            from_y: 10.0,
+            to_x: 5.0,
+            to_y: 10.0,
+            rotation: 180.0,
+        };
+        let (after, removed) =
+            remove_wires_at_moved_sheet_pin_anchors(content, &[change]).unwrap();
+        assert_eq!(removed.len(), 1);
+        assert!(removed.iter().any(|wire| {
+            points_coincident(wire.x1, wire.y1, 10.0, 10.0, 0.01)
+                || points_coincident(wire.x2, wire.y2, 10.0, 10.0, 0.01)
+        }));
+        assert!(!after.contains("(uuid \"attached\")"));
+        assert!(after.contains("(uuid \"branch\")"));
+        assert!(after.contains("(uuid \"unrelated\")"));
     }
 
     #[test]

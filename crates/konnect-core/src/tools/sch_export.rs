@@ -22,7 +22,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use super::cli;
-use super::sch_connectivity::net_graph_for;
+use super::sch_connectivity::{net_graph_for, ConnectivityIndex, COINCIDENT_TOLERANCE};
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
@@ -236,6 +236,12 @@ async fn handle_export_netlist_summary(
         .map(|n| n.find_all("symbol"))
         .unwrap_or_default();
 
+    let index = ConnectivityIndex::build(
+        &tree,
+        &wires,
+        &labels,
+        COINCIDENT_TOLERANCE,
+    );
     let mut g = net_graph_for(&tree, &wires, &labels);
 
     // Collect distinct net names
@@ -255,7 +261,7 @@ async fn handle_export_netlist_summary(
                     .iter()
                     .map(|p| {
                         let (px, py) = pin_endpoint(p, t);
-                        let net = g.net_at(px, py).unwrap_or_else(|| "~".to_string());
+                        let net = index.net_for_pin_at(&mut g, &p.electrical_type, px, py).unwrap_or_else(|| "~".to_string());
                         json!({
                             "number": p.number,
                             "name": p.name,
