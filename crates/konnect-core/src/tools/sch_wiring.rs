@@ -15,9 +15,10 @@ use konnect_sexp::{
     geometry::{points_coincident, snap_point},
     parser::parse_sexp,
     schematic::{
-        extract_symbol_instances, extract_wires, find_lib_symbol, find_t_junctions,
-        format_junction, format_wire, parse_at, pin_endpoint, pin_outward_direction,
-        read_schematic, symbol_bounds_for_instance, Label, LabelKind, SymbolBounds, Wire,
+        extract_sheet_pins, extract_symbol_instances, extract_wires, find_lib_symbol,
+        find_t_junctions, format_junction, format_wire, parse_at, pin_endpoint,
+        pin_outward_direction, read_schematic, symbol_bounds_for_instance, Label, LabelKind,
+        SymbolBounds, Wire,
     },
     writer::{
         apply_edits, find_balanced_block, find_block_starts, find_block_with_leading_whitespace,
@@ -3552,6 +3553,7 @@ struct RefactorNetPlan {
     moved_symbols: Vec<serde_json::Value>,
     removable_local_labels: Vec<(f64, f64)>,
     inserted_power_symbols: Vec<serde_json::Value>,
+    power_normalization: PowerNormalizationReport,
     before_snapshot: SemanticSnapshot,
     final_content: String,
     plan_revision: String,
@@ -3577,6 +3579,27 @@ struct ProjectFilePlan {
     sheet_pins_removed: usize,
     wires_removed: usize,
     endpoints_before: Vec<NetEndpoint>,
+    power_normalization: PowerNormalizationReport,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PowerNormalizationReport {
+    canonical_unchanged: Vec<serde_json::Value>,
+    geometry_normalizations: Vec<serde_json::Value>,
+    noncanonical_replacements: Vec<serde_json::Value>,
+    redundant_duplicates_removed: Vec<serde_json::Value>,
+    obsolete_symbols_removed: Vec<serde_json::Value>,
+    obsolete_stub_wires_removed: Vec<serde_json::Value>,
+}
+
+impl PowerNormalizationReport {
+    fn changed(&self) -> bool {
+        !self.geometry_normalizations.is_empty()
+            || !self.noncanonical_replacements.is_empty()
+            || !self.redundant_duplicates_removed.is_empty()
+            || !self.obsolete_symbols_removed.is_empty()
+            || !self.obsolete_stub_wires_removed.is_empty()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3611,7 +3634,12 @@ impl ProjectRefactorPlan {
             "global_labels_to_remove": self.files.iter().map(|file| json!({"schematic": file.path.display().to_string(), "count": file.global_labels_removed})).collect::<Vec<_>>(),
             "sheet_pins_to_remove": self.files.iter().map(|file| json!({"schematic": file.path.display().to_string(), "count": file.sheet_pins_removed})).collect::<Vec<_>>(),
             "obsolete_parent_root_wires_to_remove": self.files.iter().map(|file| json!({"schematic": file.path.display().to_string(), "count": file.wires_removed})).collect::<Vec<_>>(),
-            "geometry_normalizations": [],
+            "canonical_unchanged": self.files.iter().flat_map(|file| file.power_normalization.canonical_unchanged.clone()).collect::<Vec<_>>(),
+            "geometry_normalizations": self.files.iter().flat_map(|file| file.power_normalization.geometry_normalizations.clone()).collect::<Vec<_>>(),
+            "noncanonical_replacements": self.files.iter().flat_map(|file| file.power_normalization.noncanonical_replacements.clone()).collect::<Vec<_>>(),
+            "redundant_duplicates_removed": self.files.iter().flat_map(|file| file.power_normalization.redundant_duplicates_removed.clone()).collect::<Vec<_>>(),
+            "obsolete_symbols_removed": self.files.iter().flat_map(|file| file.power_normalization.obsolete_symbols_removed.clone()).collect::<Vec<_>>(),
+            "obsolete_stub_wires_removed": self.files.iter().flat_map(|file| file.power_normalization.obsolete_stub_wires_removed.clone()).collect::<Vec<_>>(),
             "before_endpoint_summary": self.files.iter().map(|file| json!({"schematic": file.path.display().to_string(), "component_pins": file.endpoints_before.iter().map(NetEndpoint::json).collect::<Vec<_>>() })).collect::<Vec<_>>(),
             "before_konnect_component_pin_membership": self.before_semantic.keys().collect::<Vec<_>>(),
             "predicted_final_component_pin_membership": self.final_semantic.keys().collect::<Vec<_>>(),
@@ -3638,6 +3666,12 @@ impl RefactorNetPlan {
             "proposed_wires": self.segments.iter().map(|segment| segment.json()).collect::<Vec<_>>(),
             "proposed_removed_labels": self.removable_local_labels.iter().map(|(x, y)| json!({"x": x, "y": y})).collect::<Vec<_>>(),
             "proposed_power_symbols": self.inserted_power_symbols,
+            "canonical_unchanged": self.power_normalization.canonical_unchanged,
+            "geometry_normalizations": self.power_normalization.geometry_normalizations,
+            "noncanonical_replacements": self.power_normalization.noncanonical_replacements,
+            "redundant_duplicates_removed": self.power_normalization.redundant_duplicates_removed,
+            "obsolete_symbols_removed": self.power_normalization.obsolete_symbols_removed,
+            "obsolete_stub_wires_removed": self.power_normalization.obsolete_stub_wires_removed,
             "semantic_connectivity_comparison": semantic_comparison(&self.before_snapshot, &self.final_content).unwrap_or_else(|error| json!({
                 "preserved": false,
                 "error": error.to_string()
@@ -3747,13 +3781,21 @@ fn build_project_power_symbol_refactor_plan(
             }
         }
         let endpoints = net_endpoints_for(&tree, net, args, grid)?;
+        let (power_normalization, mut attachment_segments) =
+            normalize_existing_power_symbols(&mut sch, &sheet.path, &tree, net, grid)?;
         let existing_power = konnect_sexp::schematic::extract_all_net_labels(&tree)
             .into_iter()
             .filter(|label| label.net == net && label.kind == LabelKind::PowerSymbol)
             .map(|label| (label.x, label.y))
+            .chain(
+                power_normalization
+                    .noncanonical_replacements
+                    .iter()
+                    .chain(power_normalization.geometry_normalizations.iter())
+                    .filter_map(|symbol| Some((symbol["x"].as_f64()?, symbol["y"].as_f64()?))),
+            )
             .collect::<Vec<_>>();
         let mut power_symbols_added = Vec::new();
-        let mut attachment_segments = Vec::new();
         for label in &labels {
             if sheet.path == *root && endpoints.is_empty() {
                 continue;
@@ -3819,6 +3861,7 @@ fn build_project_power_symbol_refactor_plan(
                 sheet_pins_removed: 0,
                 wires_removed: 0,
                 endpoints_before: endpoints,
+                power_normalization,
             });
         }
     }
@@ -3840,6 +3883,7 @@ fn build_project_power_symbol_refactor_plan(
                     sheet_pins_removed: 0,
                     wires_removed: 0,
                     endpoints_before: Vec::new(),
+                    power_normalization: PowerNormalizationReport::default(),
                 });
                 touched.len() - 1
             }
@@ -4005,6 +4049,8 @@ fn project_plan_revision(net: &str, scope_policy: &str, files: &[ProjectFilePlan
         material.push('\n');
         material.push_str(&file.power_symbols_added.len().to_string());
         material.push(':');
+        material.push_str(&file.power_normalization.changed().to_string());
+        material.push(':');
         material.push_str(&file.ordinary_labels_removed.to_string());
         material.push(':');
         material.push_str(&file.hierarchical_labels_removed.to_string());
@@ -4168,6 +4214,7 @@ fn build_refactor_net_plan(
                 moved_symbols: Vec::new(),
                 removable_local_labels: materialize.removable_local_labels,
                 inserted_power_symbols: Vec::new(),
+                power_normalization: PowerNormalizationReport::default(),
                 before_snapshot: materialize.before_snapshot,
                 final_content: materialize.final_content,
                 plan_revision: materialize
@@ -4294,6 +4341,7 @@ fn build_expand_coincident_net_plan(
         })],
         removable_local_labels,
         inserted_power_symbols: Vec::new(),
+        power_normalization: PowerNormalizationReport::default(),
         before_snapshot,
         final_content,
         plan_revision,
@@ -4324,24 +4372,43 @@ fn build_power_symbol_refactor_plan(
             "converting net '{net}' to power symbols changes to KiCad global power-symbol scope; rerun with scope_policy='allow_global_power_scope'. Diagnostic: {diagnostic}"
         )));
     }
+    let mut staged_schematic = cse::Schematic::load(schematic)
+        .map_err(|error| CallToolResult::error(error.to_string()))?;
+    let grid = args["grid"].as_f64().unwrap_or(1.27);
+    let (power_normalization, mut attachment_segments) =
+        normalize_existing_power_symbols(&mut staged_schematic, schematic, &tree, net, grid)?;
     let labels = konnect_sexp::schematic::extract_labels(&tree)
         .into_iter()
         .filter(|label| label.net == net && label.kind == LabelKind::NetLabel)
         .collect::<Vec<_>>();
-    if labels.is_empty() {
+    if labels.is_empty() && !power_normalization.changed() {
         return Err(CallToolResult::error(format!(
-            "net '{net}' has no ordinary labels to convert"
+            "net '{net}' has no ordinary labels or legacy power symbols to convert"
         )));
     }
-    let mut staged_schematic = cse::Schematic::load(schematic)
-        .map_err(|error| CallToolResult::error(error.to_string()))?;
-    let grid = args["grid"].as_f64().unwrap_or(1.27);
     let wires = extract_wires(&tree);
     let all_labels = konnect_sexp::schematic::extract_all_net_labels(&tree);
     let mut graph = crate::tools::sch_connectivity::net_graph_for(&tree, &wires, &all_labels);
+    let existing_power = all_labels
+        .iter()
+        .filter(|label| label.net == net && label.kind == LabelKind::PowerSymbol)
+        .map(|label| (label.x, label.y))
+        .chain(
+            power_normalization
+                .noncanonical_replacements
+                .iter()
+                .chain(power_normalization.geometry_normalizations.iter())
+                .filter_map(|symbol| Some((symbol["x"].as_f64()?, symbol["y"].as_f64()?))),
+        )
+        .collect::<Vec<_>>();
     let mut inserted = Vec::new();
-    let mut attachment_segments = Vec::new();
     for label in &labels {
+        if existing_power
+            .iter()
+            .any(|(x, y)| points_coincident(*x, *y, label.x, label.y, 0.01))
+        {
+            continue;
+        }
         let attachment =
             power_symbol_anchor_for_label(label, net, grid, &mut graph).map_err(|error| {
                 CallToolResult::error(format!(
@@ -4394,6 +4461,11 @@ fn build_power_symbol_refactor_plan(
         "{}\n{net}\npower_symbol\n{scope_policy}\n{}",
         DocumentRevision::of(&before),
         inserted.len()
+            + power_normalization.noncanonical_replacements.len()
+            + power_normalization.geometry_normalizations.len()
+            + power_normalization.redundant_duplicates_removed.len()
+            + power_normalization.obsolete_symbols_removed.len()
+            + power_normalization.obsolete_stub_wires_removed.len()
     );
     let plan_revision = format!("refactor-schematic-net:{}", DocumentRevision::of(&material));
     let endpoints = net_endpoints_for(&tree, net, args, args["grid"].as_f64().unwrap_or(1.27))?;
@@ -4413,6 +4485,7 @@ fn build_power_symbol_refactor_plan(
         moved_symbols: Vec::new(),
         removable_local_labels,
         inserted_power_symbols: inserted,
+        power_normalization,
         before_snapshot,
         final_content,
         plan_revision,
@@ -5810,6 +5883,305 @@ impl PlacedPowerSymbol {
             "rotation": self.rotation
         })
     }
+}
+
+#[derive(Debug, Clone)]
+struct ExistingPowerCandidate {
+    uuid: String,
+    reference: String,
+    lib_id: String,
+    value: String,
+    x: f64,
+    y: f64,
+    rotation: f64,
+    canonical: bool,
+    on_grid: bool,
+    attachment_key: (i64, i64),
+}
+
+impl ExistingPowerCandidate {
+    fn json(&self, classification: &str) -> serde_json::Value {
+        json!({
+            "classification": classification,
+            "uuid": self.uuid,
+            "reference": self.reference,
+            "lib_id": self.lib_id,
+            "net": self.value,
+            "x": self.x,
+            "y": self.y,
+            "rotation": self.rotation
+        })
+    }
+}
+
+fn symbol_is_target_power_candidate(symbol: &cse::Symbol, net: &str) -> bool {
+    if symbol.value_str() != Some(net) {
+        return false;
+    }
+    let reference_power = symbol.reference().is_some_and(|r| r.starts_with("#PWR"));
+    reference_power
+        || symbol.lib_id.starts_with("power:")
+        || symbol.lib_symbol_name().starts_with("power:")
+}
+
+fn canonical_power_symbol_instance(symbol: &cse::Symbol, net: &str) -> bool {
+    let template = power_symbol_template_lib_id(net);
+    symbol.lib_id == template && symbol.lib_symbol_name() == template
+}
+
+fn endpoint_meaningful_for_power_stub(
+    tree: &konnect_sexp::SexpNode,
+    graph: &mut crate::tools::sch_connectivity::NetGraph,
+    point: (f64, f64),
+    symbol_uuid: &str,
+) -> bool {
+    let key = graph.find(crate::tools::sch_connectivity::pt_key(point.0, point.1));
+    let wires = extract_wires(tree);
+    let labels = konnect_sexp::schematic::extract_all_net_labels(tree);
+    let index = crate::tools::sch_connectivity::ConnectivityIndex::build(
+        tree,
+        &wires,
+        &labels,
+        crate::tools::sch_connectivity::COINCIDENT_TOLERANCE,
+    );
+    if index.placed_pins().iter().any(|pin| {
+        !pin.reference.starts_with("#PWR")
+            && graph.find(crate::tools::sch_connectivity::pt_key(pin.at.0, pin.at.1)) == key
+    }) {
+        return true;
+    }
+    if extract_sheet_pins(tree)
+        .into_iter()
+        .any(|(x, y)| graph.find(crate::tools::sch_connectivity::pt_key(x, y)) == key)
+    {
+        return true;
+    }
+    if labels
+        .iter()
+        .filter(|label| label.kind != LabelKind::PowerSymbol)
+        .any(|label| graph.find(crate::tools::sch_connectivity::pt_key(label.x, label.y)) == key)
+    {
+        return true;
+    }
+    extract_symbol_instances(tree).into_iter().any(|instance| {
+        instance.uuid.as_deref() != Some(symbol_uuid)
+            && instance.reference.starts_with("#PWR")
+            && graph.find(crate::tools::sch_connectivity::pt_key(
+                instance.x, instance.y,
+            )) == key
+    })
+}
+
+fn obsolete_stub_wire_uuids(
+    sch: &cse::Schematic,
+    tree: &konnect_sexp::SexpNode,
+    graph: &mut crate::tools::sch_connectivity::NetGraph,
+    symbol: &cse::Symbol,
+) -> Option<Vec<String>> {
+    let start = crate::tools::sch_connectivity::pt_key(symbol.at.x, symbol.at.y);
+    let mut adjacency: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
+    let wires = sch.wires.iter().cloned().collect::<Vec<_>>();
+    for (idx, wire) in wires.iter().enumerate() {
+        adjacency
+            .entry(crate::tools::sch_connectivity::pt_key(
+                wire.start.0,
+                wire.start.1,
+            ))
+            .or_default()
+            .push(idx);
+        adjacency
+            .entry(crate::tools::sch_connectivity::pt_key(
+                wire.end.0, wire.end.1,
+            ))
+            .or_default()
+            .push(idx);
+    }
+
+    let mut stack = vec![start];
+    let mut seen_points = HashSet::new();
+    let mut seen_wires = HashSet::new();
+    while let Some(point_key) = stack.pop() {
+        if !seen_points.insert(point_key) {
+            continue;
+        }
+        let degree = adjacency.get(&point_key).map_or(0, Vec::len);
+        if degree > 2 {
+            return None;
+        }
+        let point = (point_key.0 as f64 / 1000.0, point_key.1 as f64 / 1000.0);
+        if point_key != start
+            && endpoint_meaningful_for_power_stub(tree, graph, point, &symbol.uuid)
+        {
+            return None;
+        }
+        if let Some(wire_indices) = adjacency.get(&point_key) {
+            for &wire_idx in wire_indices {
+                if !seen_wires.insert(wire_idx) {
+                    continue;
+                }
+                let wire = &wires[wire_idx];
+                let a = crate::tools::sch_connectivity::pt_key(wire.start.0, wire.start.1);
+                let b = crate::tools::sch_connectivity::pt_key(wire.end.0, wire.end.1);
+                stack.push(if a == point_key { b } else { a });
+            }
+        }
+    }
+    if seen_wires.is_empty()
+        && endpoint_meaningful_for_power_stub(tree, graph, (symbol.at.x, symbol.at.y), &symbol.uuid)
+    {
+        return None;
+    }
+    Some(
+        seen_wires
+            .into_iter()
+            .map(|idx| wires[idx].uuid.clone())
+            .collect(),
+    )
+}
+
+fn normalize_existing_power_symbols(
+    sch: &mut cse::Schematic,
+    schematic: &Path,
+    tree: &konnect_sexp::SexpNode,
+    net: &str,
+    grid: f64,
+) -> Result<(PowerNormalizationReport, Vec<Segment>), CallToolResult> {
+    let wires = extract_wires(tree);
+    let all_labels = konnect_sexp::schematic::extract_all_net_labels(tree);
+    let mut graph = crate::tools::sch_connectivity::net_graph_for(tree, &wires, &all_labels);
+    let mut report = PowerNormalizationReport::default();
+    let mut attachment_segments = Vec::new();
+
+    let mut obsolete_symbol_uuids = HashSet::new();
+    let mut obsolete_wire_uuids = HashSet::new();
+    for symbol in sch.symbols.iter() {
+        if !symbol_is_target_power_candidate(symbol, net) {
+            continue;
+        }
+        if let Some(wire_uuids) = obsolete_stub_wire_uuids(sch, tree, &mut graph, symbol) {
+            obsolete_symbol_uuids.insert(symbol.uuid.clone());
+            report
+                .obsolete_symbols_removed
+                .push(json!({"uuid": symbol.uuid, "reference": symbol.reference().unwrap_or(""), "net": net, "x": symbol.at.x, "y": symbol.at.y}));
+            for uuid in wire_uuids {
+                obsolete_wire_uuids.insert(uuid.clone());
+                report
+                    .obsolete_stub_wires_removed
+                    .push(json!({"uuid": uuid, "net": net}));
+            }
+        }
+    }
+    for uuid in &obsolete_symbol_uuids {
+        sch.symbols.remove_by_uuid(uuid);
+    }
+    for uuid in &obsolete_wire_uuids {
+        sch.wires.remove_by_uuid(uuid);
+    }
+
+    let mut candidates = sch
+        .symbols
+        .iter()
+        .filter(|symbol| symbol_is_target_power_candidate(symbol, net))
+        .map(|symbol| {
+            let key = graph.find(crate::tools::sch_connectivity::pt_key(
+                symbol.at.x,
+                symbol.at.y,
+            ));
+            ExistingPowerCandidate {
+                uuid: symbol.uuid.clone(),
+                reference: symbol.reference().unwrap_or("").to_string(),
+                lib_id: symbol.lib_id.clone(),
+                value: net.to_string(),
+                x: symbol.at.x,
+                y: symbol.at.y,
+                rotation: symbol.at.rotation.unwrap_or(0.0),
+                canonical: canonical_power_symbol_instance(symbol, net),
+                on_grid: point_on_grid(symbol.at.x, symbol.at.y, grid),
+                attachment_key: key,
+            }
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|a, b| a.uuid.cmp(&b.uuid));
+
+    let mut grouped: BTreeMap<(i64, i64), Vec<ExistingPowerCandidate>> = BTreeMap::new();
+    for candidate in candidates {
+        grouped
+            .entry(candidate.attachment_key)
+            .or_default()
+            .push(candidate);
+    }
+
+    let mut delete_uuids = HashSet::new();
+    for mut group in grouped.into_values() {
+        group.sort_by(|a, b| {
+            b.canonical
+                .cmp(&a.canonical)
+                .then_with(|| b.on_grid.cmp(&a.on_grid))
+                .then_with(|| a.uuid.cmp(&b.uuid))
+        });
+        let survivor = group[0].clone();
+        let duplicates = group.iter().skip(1).cloned().collect::<Vec<_>>();
+        for duplicate in duplicates {
+            delete_uuids.insert(duplicate.uuid.clone());
+            report
+                .redundant_duplicates_removed
+                .push(duplicate.json("REDUNDANT_DUPLICATE"));
+        }
+
+        let needs_geometry = survivor.canonical && !survivor.on_grid;
+        if survivor.canonical && survivor.on_grid {
+            report
+                .canonical_unchanged
+                .push(survivor.json("REQUIRED_CANONICAL"));
+            continue;
+        }
+
+        let (target_x, target_y, normalized_from) = if needs_geometry {
+            let (sx, sy) = snap_point(survivor.x, survivor.y, grid);
+            attachment_segments.push(Segment {
+                x1: survivor.x,
+                y1: survivor.y,
+                x2: sx,
+                y2: sy,
+            });
+            (sx, sy, Some((survivor.x, survivor.y)))
+        } else {
+            (survivor.x, survivor.y, None)
+        };
+        let placed = place_power_symbol_instance(
+            sch,
+            schematic,
+            net,
+            target_x,
+            target_y,
+            survivor.rotation,
+        )?;
+        delete_uuids.insert(survivor.uuid.clone());
+        let mut entry = placed.json();
+        entry["replaced_uuid"] = json!(survivor.uuid);
+        entry["replaced_reference"] = json!(survivor.reference);
+        entry["replaced_lib_id"] = json!(survivor.lib_id);
+        if let Some((old_x, old_y)) = normalized_from {
+            entry["normalized_from"] = json!({"x": old_x, "y": old_y});
+            entry["attachment_wires"] = json!([Segment {
+                x1: old_x,
+                y1: old_y,
+                x2: target_x,
+                y2: target_y,
+            }
+            .json()]);
+            report.geometry_normalizations.push(entry);
+        } else {
+            entry["classification"] = json!("NONCANONICAL_INSTANCE");
+            report.noncanonical_replacements.push(entry);
+        }
+    }
+
+    for uuid in delete_uuids {
+        sch.symbols.remove_by_uuid(&uuid);
+    }
+
+    Ok((report, attachment_segments))
 }
 
 fn place_power_symbol_instance(
@@ -8316,6 +8688,72 @@ mod materialize_net_tests {
         )
     }
 
+    fn canonical_custom_power(net: &str, reference: &str, x: f64, y: f64, uuid: &str) -> String {
+        let template = power_symbol_template_lib_id(net);
+        format!(
+            r##"  (symbol
+    (lib_id "{template}")
+    (at {x} {y} 0)
+    (unit 1)
+    (property "Reference" "{reference}" (at {x} {y} 0) (hide yes))
+    (property "Value" "{net}" (at {x} {y} 0))
+    (uuid "{uuid}")
+  )"##
+        )
+    }
+
+    fn legacy_power(net: &str, reference: &str, x: f64, y: f64, uuid: &str) -> String {
+        placed_power(net, reference, x, y, uuid)
+    }
+
+    fn wire(x1: f64, y1: f64, x2: f64, y2: f64, uuid: &str) -> String {
+        format!(r#"  (wire (pts (xy {x1} {y1}) (xy {x2} {y2})) (uuid "{uuid}"))"#)
+    }
+
+    fn insert_before_schematic_close(mut content: String, addition: &str) -> String {
+        let close = content
+            .rfind(')')
+            .expect("test schematic must have closing paren");
+        content.insert_str(close, addition);
+        content
+    }
+
+    async fn power_symbol_preview(path: &std::path::Path, net: &str) -> serde_json::Value {
+        let dry = handle_refactor_schematic_net_representation(
+            &json!({
+                "schematic": path.display().to_string(),
+                "net": net,
+                "representation": "power_symbol",
+                "scope_policy": "allow_global_power_scope",
+                "dry_run": true
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!dry.is_error, "{}", result_text(&dry));
+        result_json(&dry)
+    }
+
+    async fn apply_power_symbol_preview(path: &std::path::Path, net: &str) -> String {
+        let preview = power_symbol_preview(path, net).await;
+        let applied = handle_refactor_schematic_net_representation(
+            &json!({
+                "schematic": path.display().to_string(),
+                "net": net,
+                "representation": "power_symbol",
+                "scope_policy": "allow_global_power_scope",
+                "dry_run": false,
+                "plan_revision": preview["plan_revision"].as_str().unwrap()
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!applied.is_error, "{}", result_text(&applied));
+        std::fs::read_to_string(path).unwrap()
+    }
+
     fn materialize_obstacle_fixture(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("obstacles.kicad_sch");
@@ -8498,6 +8936,328 @@ mod materialize_net_tests {
         std::fs::write(&power, child("power", "hierarchical_label", &["R14"])).unwrap();
         std::fs::write(&core, child("core", "hierarchical_label", &["U1", "U2"])).unwrap();
         (dir, root, power, core)
+    }
+
+    #[tokio::test]
+    async fn noncanonical_legacy_power_symbol_is_replaced_with_canonical_template() {
+        let net = "+5V_MAIN";
+        let body = [
+            label(net, 50.0, 50.0, "l1"),
+            one_pin("U1", "IC", 50.0, 50.0, "u1"),
+            legacy_power(net, "#PWR010", 50.0, 50.0, "legacy-pwr"),
+        ]
+        .join("\n");
+        let (_dir, path) = one_pin_net_fixture("legacy_replace", &body);
+        let preview = power_symbol_preview(&path, net).await;
+        assert_eq!(
+            preview["noncanonical_replacements"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "{preview}"
+        );
+        let after = apply_power_symbol_preview(&path, net).await;
+        assert!(!after.contains("legacy-pwr"));
+        assert!(after.contains("(lib_id \"power:+5V\")"));
+        assert!(after.contains("(property \"Value\" \"+5V_MAIN\""));
+    }
+
+    #[tokio::test]
+    async fn same_node_duplicate_power_symbols_remove_redundant_instance() {
+        let net = "+5V_MAIN";
+        let body = [
+            label(net, 50.0, 50.0, "l1"),
+            one_pin("U1", "IC", 50.0, 50.0, "u1"),
+            canonical_custom_power(net, "#PWR001", 50.0, 50.0, "canon-a"),
+            canonical_custom_power(net, "#PWR002", 50.0, 50.0, "canon-b"),
+        ]
+        .join("\n");
+        let (_dir, path) = one_pin_net_fixture("same_node_duplicate", &body);
+        let preview = power_symbol_preview(&path, net).await;
+        assert_eq!(
+            preview["redundant_duplicates_removed"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "{preview}"
+        );
+        let after = apply_power_symbol_preview(&path, net).await;
+        assert_eq!(after.matches("(property \"Value\" \"+5V_MAIN\"").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn duplicate_legacy_power_symbols_leave_one_canonical_replacement() {
+        let net = "+5V_MAIN";
+        let body = [
+            label(net, 50.0, 50.0, "l1"),
+            one_pin("U1", "IC", 50.0, 50.0, "u1"),
+            legacy_power(net, "#PWR010", 50.0, 50.0, "legacy-a"),
+            legacy_power(net, "#PWR011", 50.0, 50.0, "legacy-b"),
+        ]
+        .join("\n");
+        let (_dir, path) = one_pin_net_fixture("legacy_duplicates", &body);
+        let preview = power_symbol_preview(&path, net).await;
+        assert_eq!(
+            preview["noncanonical_replacements"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "{preview}"
+        );
+        assert_eq!(
+            preview["redundant_duplicates_removed"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "{preview}"
+        );
+        let after = apply_power_symbol_preview(&path, net).await;
+        assert!(!after.contains("legacy-a"));
+        assert!(!after.contains("legacy-b"));
+        assert_eq!(after.matches("(property \"Value\" \"+5V_MAIN\"").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn obsolete_single_segment_legacy_stub_is_removed() {
+        let net = "+5V_MAIN";
+        let body = [
+            legacy_power(net, "#PWR010", 20.0, 20.0, "obsolete-pwr"),
+            wire(20.0, 20.0, 25.0, 20.0, "stub-wire"),
+        ]
+        .join("\n");
+        let (_dir, path) = one_pin_net_fixture("single_stub", &body);
+        let preview = power_symbol_preview(&path, net).await;
+        assert_eq!(
+            preview["obsolete_symbols_removed"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "{preview}"
+        );
+        assert_eq!(
+            preview["obsolete_stub_wires_removed"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "{preview}"
+        );
+        let after = apply_power_symbol_preview(&path, net).await;
+        assert!(!after.contains("obsolete-pwr"));
+        assert!(!after.contains("stub-wire"));
+    }
+
+    #[tokio::test]
+    async fn obsolete_multi_segment_legacy_stub_is_removed() {
+        let net = "+5V_MAIN";
+        let body = [
+            legacy_power(net, "#PWR010", 20.0, 20.0, "obsolete-pwr"),
+            wire(20.0, 20.0, 25.0, 20.0, "stub-a"),
+            wire(25.0, 20.0, 25.0, 25.0, "stub-b"),
+        ]
+        .join("\n");
+        let (_dir, path) = one_pin_net_fixture("multi_stub", &body);
+        let preview = power_symbol_preview(&path, net).await;
+        assert_eq!(
+            preview["obsolete_stub_wires_removed"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2,
+            "{preview}"
+        );
+        let after = apply_power_symbol_preview(&path, net).await;
+        assert!(!after.contains("stub-a"));
+        assert!(!after.contains("stub-b"));
+    }
+
+    #[tokio::test]
+    async fn short_meaningful_power_wire_is_preserved() {
+        let net = "+5V_MAIN";
+        let body = [
+            label(net, 55.0, 20.0, "l1"),
+            one_pin("U1", "IC", 55.0, 20.0, "u1"),
+            legacy_power(net, "#PWR010", 20.0, 20.0, "legacy-pwr"),
+            wire(20.0, 20.0, 55.0, 20.0, "meaningful-wire"),
+        ]
+        .join("\n");
+        let (_dir, path) = one_pin_net_fixture("meaningful_wire", &body);
+        let preview = power_symbol_preview(&path, net).await;
+        assert!(preview["obsolete_stub_wires_removed"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let after = apply_power_symbol_preview(&path, net).await;
+        assert!(after.contains("meaningful-wire"));
+    }
+
+    #[tokio::test]
+    async fn branched_meaningful_power_wire_is_preserved() {
+        let net = "+5V_MAIN";
+        let body = [
+            label(net, 55.0, 20.0, "l1"),
+            one_pin("U1", "IC", 55.0, 20.0, "u1"),
+            legacy_power(net, "#PWR010", 20.0, 20.0, "legacy-pwr"),
+            wire(20.0, 20.0, 55.0, 20.0, "branch-a"),
+            wire(55.0, 20.0, 55.0, 25.0, "branch-b"),
+            wire(55.0, 20.0, 60.0, 20.0, "branch-c"),
+        ]
+        .join("\n");
+        let (_dir, path) = one_pin_net_fixture("branched_wire", &body);
+        let preview = power_symbol_preview(&path, net).await;
+        assert!(preview["obsolete_stub_wires_removed"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let after = apply_power_symbol_preview(&path, net).await;
+        assert!(after.contains("branch-a"));
+        assert!(after.contains("branch-b"));
+        assert!(after.contains("branch-c"));
+    }
+
+    #[tokio::test]
+    async fn legitimate_separate_power_symbols_are_preserved() {
+        let net = "+5V_MAIN";
+        let body = [
+            label(net, 50.8, 20.32, "l1"),
+            label(net, 76.2, 20.32, "l2"),
+            one_pin("U1", "IC", 50.8, 20.32, "u1"),
+            one_pin("U2", "IC", 76.2, 20.32, "u2"),
+            canonical_custom_power(net, "#PWR001", 50.8, 20.32, "canon-a"),
+            canonical_custom_power(net, "#PWR002", 76.2, 20.32, "canon-b"),
+        ]
+        .join("\n");
+        let (_dir, path) = one_pin_net_fixture("legitimate_repeats", &body);
+        let preview = power_symbol_preview(&path, net).await;
+        assert_eq!(
+            preview["canonical_unchanged"].as_array().unwrap().len(),
+            2,
+            "{preview}"
+        );
+        assert!(preview["redundant_duplicates_removed"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let after = apply_power_symbol_preview(&path, net).await;
+        assert_eq!(after.matches("(property \"Value\" \"+5V_MAIN\"").count(), 2);
+    }
+
+    #[tokio::test]
+    async fn combined_power_symbol_debt_is_classified_in_one_pass() {
+        let net = "+5V_MAIN";
+        let body = [
+            label(net, 50.0, 20.0, "l1"),
+            one_pin("U1", "IC", 50.0, 20.0, "u1"),
+            legacy_power(net, "#PWR010", 50.0, 20.0, "legacy-useful"),
+            legacy_power(net, "#PWR011", 50.0, 20.0, "legacy-dup"),
+            legacy_power(net, "#PWR012", 90.0, 20.0, "legacy-obsolete"),
+            wire(90.0, 20.0, 95.0, 20.0, "obsolete-wire"),
+        ]
+        .join("\n");
+        let (_dir, path) = one_pin_net_fixture("combined_debt", &body);
+        let preview = power_symbol_preview(&path, net).await;
+        assert_eq!(
+            preview["noncanonical_replacements"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "{preview}"
+        );
+        assert_eq!(
+            preview["redundant_duplicates_removed"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "{preview}"
+        );
+        assert_eq!(
+            preview["obsolete_symbols_removed"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "{preview}"
+        );
+        assert_eq!(
+            preview["obsolete_stub_wires_removed"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "{preview}"
+        );
+    }
+
+    #[tokio::test]
+    async fn project_scope_power_refactor_includes_legacy_cleanup_on_participating_sheets() {
+        let (_dir, root, power, core) = project_power_fixture("+5V_MAIN");
+        let mut power_text = std::fs::read_to_string(&power).unwrap();
+        power_text = insert_before_schematic_close(
+            power_text,
+            &format!(
+                "\n{}\n{}\n",
+                legacy_power("+5V_MAIN", "#PWR010", 40.0, 50.0, "power-legacy"),
+                legacy_power("+5V_MAIN", "#PWR011", 90.0, 20.0, "power-obsolete")
+            ),
+        );
+        power_text = insert_before_schematic_close(
+            power_text,
+            &format!(
+                "\n{}\n",
+                wire(90.0, 20.0, 95.0, 20.0, "power-obsolete-wire")
+            ),
+        );
+        std::fs::write(&power, power_text).unwrap();
+        let mut core_text = std::fs::read_to_string(&core).unwrap();
+        core_text = insert_before_schematic_close(
+            core_text,
+            &format!(
+                "\n{}\n",
+                legacy_power("+5V_MAIN", "#PWR012", 40.0, 50.0, "core-legacy")
+            ),
+        );
+        std::fs::write(&core, core_text).unwrap();
+
+        let dry = handle_refactor_schematic_net_representation(
+            &json!({
+                "schematic": root.display().to_string(),
+                "net": "+5V_MAIN",
+                "representation": "power_symbol",
+                "scope": "project",
+                "scope_policy": "allow_global_power_scope",
+                "dry_run": true
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!dry.is_error, "{}", result_text(&dry));
+        let body = result_json(&dry);
+        assert_eq!(
+            body["noncanonical_replacements"].as_array().unwrap().len(),
+            2,
+            "{body}"
+        );
+        assert_eq!(
+            body["obsolete_symbols_removed"].as_array().unwrap().len(),
+            1,
+            "{body}"
+        );
+        assert_eq!(
+            body["obsolete_stub_wires_removed"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "{body}"
+        );
     }
 
     #[test]
